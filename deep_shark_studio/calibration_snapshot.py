@@ -20,7 +20,7 @@ from .topology import (
 
 
 SNAPSHOT_FORMAT = "DeepSharkCalibrationSnapshot"
-SNAPSHOT_SCHEMA_VERSION = 1
+SNAPSHOT_SCHEMA_VERSION = 2
 
 
 def topology_diagnostics(config: dict[str, Any]) -> dict[str, Any]:
@@ -41,6 +41,18 @@ def topology_diagnostics(config: dict[str, Any]) -> dict[str, Any]:
     for key in active_topology_camera_keys(config):
         camera = profile.get("cameras", {}).get(key, {})
         cameras[key] = {
+            "source_coordinate_space": str(
+                camera.get(
+                    "source_coordinate_space",
+                    profile.get("source_coordinate_space", ""),
+                )
+            ),
+            "source_reference_size": deepcopy(
+                camera.get(
+                    "source_reference_size",
+                    profile.get("source_reference_size"),
+                )
+            ),
             "source_points": deepcopy(camera.get("source_points", [])),
             "target_points": deepcopy(camera.get("target_points", [])),
         }
@@ -49,6 +61,16 @@ def topology_diagnostics(config: dict[str, Any]) -> dict[str, Any]:
         "topology": selected_topology_name(config),
         "camera_order": active_topology_camera_keys(config),
         "canvas": deepcopy(profile.get("canvas", {})),
+        "source_coordinate_space": str(
+            profile.get("source_coordinate_space", "")
+        ),
+        "source_reference_size": deepcopy(
+            profile.get("source_reference_size")
+        ),
+        "source_contract_version": profile.get("source_contract_version"),
+        "source_coordinate_migration": deepcopy(
+            profile.get("source_coordinate_migration")
+        ),
         "cameras": cameras,
         "overlaps": overlaps,
         "seams": stitch_points,
@@ -73,6 +95,7 @@ def build_snapshot_metadata(
     frame_ages_seconds: dict[str, float | None],
     snapshot_time: str,
     processing_error: str = "",
+    frame_sizes: dict[str, tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
     """Build a portable, connection-secret-free snapshot description."""
     diagnostics = topology_diagnostics(calibration_config)
@@ -93,7 +116,18 @@ def build_snapshot_metadata(
             for key in camera_order
         },
         "canvas": diagnostics["canvas"],
+        "source_coordinate_space": diagnostics["source_coordinate_space"],
+        "source_reference_size": diagnostics["source_reference_size"],
+        "source_contract_version": diagnostics["source_contract_version"],
+        "source_coordinate_migration": diagnostics[
+            "source_coordinate_migration"
+        ],
         "cameras": diagnostics["cameras"],
+        "raw_frame_sizes": {
+            key: list(frame_sizes[key])
+            for key in camera_order
+            if frame_sizes and key in frame_sizes
+        },
         "overlaps": diagnostics["overlaps"],
         "seams": diagnostics["seams"],
         "composition": diagnostics["composition"],
@@ -144,6 +178,10 @@ def save_calibration_snapshot(
         frame_ages_seconds=frame_ages_seconds,
         snapshot_time=snapshot_time,
         processing_error=processing_error,
+        frame_sizes={
+            key: (int(frame.shape[1]), int(frame.shape[0]))
+            for key, frame in available_frames.items()
+        },
     )
     save_yaml(snapshot_dir / "metadata.yaml", metadata)
     return snapshot_dir

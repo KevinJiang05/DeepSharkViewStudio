@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from .calibration_candidate import CandidatePanoramaProcessor
 from .stitcher import SurroundStitcher
 
 
@@ -40,7 +41,9 @@ class StitchProcessingWorker:
         self._shutdown = False
         self._pending_request: StitchRequest | None = None
         self._latest_result: StitchResult | None = None
-        self._stitcher: SurroundStitcher | None = None
+        self._stitcher: (
+            SurroundStitcher | CandidatePanoramaProcessor | None
+        ) = None
         self._config: dict[str, Any] = {}
         self._max_input_width: int | None = None
         self._use_intrinsics = False
@@ -62,13 +65,28 @@ class StitchProcessingWorker:
         config: dict[str, Any],
         max_input_width: int | None,
         use_intrinsics: bool,
+        processor_mode: str = "template",
+        candidate_directory: str | None = None,
     ) -> None:
         with self._condition:
             self._active_session_id = session_id
             self._config = dict(config)
             self._max_input_width = max_input_width
             self._use_intrinsics = use_intrinsics
-            self._stitcher = SurroundStitcher(self._config, max_input_width=max_input_width, use_intrinsics=use_intrinsics)
+            if processor_mode == "candidate":
+                if not candidate_directory:
+                    raise ValueError(
+                        "Candidate processor requires a candidate directory."
+                    )
+                self._stitcher = CandidatePanoramaProcessor(
+                    candidate_directory
+                )
+            else:
+                self._stitcher = SurroundStitcher(
+                    self._config,
+                    max_input_width=max_input_width,
+                    use_intrinsics=use_intrinsics,
+                )
             self._pending_request = None
             self._latest_result = None
             self._condition.notify_all()
@@ -161,9 +179,18 @@ class StitchProcessingManager:
         config: dict[str, Any],
         max_input_width: int | None,
         use_intrinsics: bool,
+        processor_mode: str = "template",
+        candidate_directory: str | None = None,
     ) -> None:
         self.start()
-        self._worker.configure(session_id, config, max_input_width, use_intrinsics)
+        self._worker.configure(
+            session_id,
+            config,
+            max_input_width,
+            use_intrinsics,
+            processor_mode=processor_mode,
+            candidate_directory=candidate_directory,
+        )
 
     def submit_latest(self, session_id: int, frames: dict[str, np.ndarray]) -> int:
         self.start()

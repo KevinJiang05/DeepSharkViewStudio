@@ -77,14 +77,32 @@ topologies:
     - front_left
     - front
     - front_right
+    source_coordinate_space: raw_frame_pixels
+    source_reference_size:
+    - 1920
+    - 1080
+    source_contract_version: 1
     calibration_origin:
-      source_points: initial_template
+      source_points: migrated_normalized_template_to_raw_full_frame
       target_points: initial_template
       seams: field_adjusted
-      feather: initial_template
+      feather: field_adjusted
+    source_coordinate_migration:
+      applied: true
+      from_coordinate_space: normalized_input_pixels
+      from_reference_size:
+      - 960
+      - 540
+      to_coordinate_space: raw_frame_pixels
+      to_reference_size:
+      - 1920
+      - 1080
+      strategy: replace_with_full_raw_frame_quad
+      backup: projects/backups/backup_20260701_182713.dsvs.yaml
+      note: Coordinate-unit correction only; not a final geometric calibration.
     canvas:
-      width: 3200
-      height: 1080
+      width: 2200
+      height: 700
     cameras:
       front_left:
         display_name: Left
@@ -92,11 +110,11 @@ topologies:
         - - 0.0
           - 0.0
         - - 0.0
-          - 539.0
-        - - 959.0
+          - 1079.0
+        - - 1919.0
           - 0.0
-        - - 959.0
-          - 539.0
+        - - 1919.0
+          - 1079.0
         target_points:
         - - 0.0
           - 0.0
@@ -112,11 +130,11 @@ topologies:
         - - 0.0
           - 0.0
         - - 0.0
-          - 539.0
-        - - 959.0
+          - 1079.0
+        - - 1919.0
           - 0.0
-        - - 959.0
-          - 539.0
+        - - 1919.0
+          - 1079.0
         target_points:
         - - 650.0
           - 0.0
@@ -132,11 +150,11 @@ topologies:
         - - 0.0
           - 0.0
         - - 0.0
-          - 539.0
-        - - 959.0
+          - 1079.0
+        - - 1919.0
           - 0.0
-        - - 959.0
-          - 539.0
+        - - 1919.0
+          - 1079.0
         target_points:
         - - 1350.0
           - 0.0
@@ -148,15 +166,15 @@ topologies:
           - 700.0
     stitch_points:
       left_front:
-      - - 882.809
+      - - 750.0
         - 0.0
-      - - 880.456
-        - 717.059
+      - - 750.0
+        - 700.0
       front_right:
-      - - 1953.594
+      - - 1450.0
         - 0.0
-      - - 1948.888
-        - 721.765
+      - - 1450.0
+        - 700.0
     overlaps:
     - name: left_front
       cameras:
@@ -166,7 +184,7 @@ topologies:
       - 650.0
       - 850.0
       seam: left_front
-      feather_width: 160
+      feather_width: 400
     - name: front_right
       cameras:
       - front
@@ -175,10 +193,10 @@ topologies:
       - 1350.0
       - 1550.0
       seam: front_right
-      feather_width: 160
+      feather_width: 400
     composition:
       mode: horizontal_feather
-      feather_width: 160
+      feather_width: 400
   legacy_surround_5:
     legacy_root: true
 camera_order:

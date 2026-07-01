@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
@@ -19,7 +20,7 @@ from deep_shark_studio.stitcher import SurroundStitcher
 
 
 def solid_frame(bgr: tuple[int, int, int]) -> np.ndarray:
-    frame = np.empty((540, 960, 3), dtype=np.uint8)
+    frame = np.empty((1080, 1920, 3), dtype=np.uint8)
     frame[:] = bgr
     return frame
 
@@ -27,7 +28,15 @@ def solid_frame(bgr: tuple[int, int, int]) -> np.ndarray:
 class CalibrationSnapshotTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.config = load_config("calibration.yaml")
+        cls.config = deepcopy(load_config("calibration.yaml"))
+        profile = cls.config["topologies"]["triple_front_panorama"]
+        height = float(profile["canvas"]["height"])
+        for overlap in profile["overlaps"]:
+            center_x = sum(overlap["x_range"]) / 2.0
+            profile["stitch_points"][overlap["seam"]] = [
+                [center_x, 0.0],
+                [center_x, height],
+            ]
 
     def test_triple_diagnostics_expose_two_readable_overlaps(self) -> None:
         diagnostics = topology_diagnostics(self.config)
@@ -109,6 +118,31 @@ class CalibrationSnapshotTests(unittest.TestCase):
             self.assertEqual(
                 "initial_template",
                 metadata["calibration_origin"]["target_points"],
+            )
+            self.assertEqual(
+                "raw_frame_pixels",
+                metadata["source_coordinate_space"],
+            )
+            self.assertEqual(
+                [1920, 1080],
+                metadata["source_reference_size"],
+            )
+            self.assertEqual(1, metadata["source_contract_version"])
+            self.assertEqual(
+                [1920, 1080],
+                metadata["raw_frame_sizes"]["front_left"],
+            )
+            self.assertEqual(
+                "raw_frame_pixels",
+                metadata["cameras"]["front_left"][
+                    "source_coordinate_space"
+                ],
+            )
+            self.assertEqual(
+                [1920, 1080],
+                metadata["cameras"]["front_left"][
+                    "source_reference_size"
+                ],
             )
             serialized = (snapshot_dir / "metadata.yaml").read_text(
                 encoding="utf-8"

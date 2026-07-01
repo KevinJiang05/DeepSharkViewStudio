@@ -4,18 +4,32 @@ from __future__ import annotations
 
 import sys
 import time
+import traceback
+import shutil
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -27,7 +41,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QSplitter,
     QStatusBar,
     QTableWidget,
@@ -45,9 +62,25 @@ from deep_shark_studio.calibration import (
     undistort_image,
     write_calibration_report,
 )
+from deep_shark_studio.calibration_candidate import (
+    generate_calibration_candidate,
+    latest_calibration_candidate,
+    load_calibration_candidate,
+)
 from deep_shark_studio.calibration_snapshot import (
     save_calibration_snapshot,
     topology_diagnostics,
+)
+from deep_shark_studio.calibration_session import (
+    BoardDefinitionNotConfirmedError,
+    CalibrationSession,
+    MINIMUM_INTRINSIC_SAMPLES,
+    MINIMUM_PAIR_SAMPLES,
+    supported_aruco_dictionaries,
+)
+from deep_shark_studio.app_logging import (
+    create_application_logger,
+    redact_log_message,
 )
 from deep_shark_studio.config import (
     CONFIG_DIR,
@@ -57,7 +90,23 @@ from deep_shark_studio.config import (
     load_config,
     save_config,
 )
+from deep_shark_studio.geometry_diagnostics import (
+    ALPHA_50,
+    NO_FEATHER,
+    GeometryDiagnosticResult,
+    run_geometry_diagnostics as compute_geometry_diagnostics,
+)
 from deep_shark_studio.project import backup_configs, export_runtime_config, load_project, save_project
+from deep_shark_studio.pairwise_diagnostics import (
+    PairDefinition,
+    PairwiseCandidateResult,
+    estimate_pairwise_candidate,
+    latest_snapshot_directory,
+    load_snapshot_frames,
+    pair_definitions,
+    run_automatic_pairwise_candidates,
+    save_pairwise_results,
+)
 from deep_shark_studio.stream_manager import (
     CameraStreamConfig,
     CameraStreamManager,
@@ -65,12 +114,16 @@ from deep_shark_studio.stream_manager import (
     STREAM_FAILED,
     STREAM_IDLE,
     STREAM_LIVE,
+    STREAM_STOPPED,
+    STREAM_STOPPING,
 )
 from deep_shark_studio.stitch_processing import StitchProcessingManager
 from deep_shark_studio.stitcher import SurroundStitcher, load_images_from_directory, save_image
 from deep_shark_studio.topology import (
     active_stitch_profile,
     active_topology_camera_keys,
+    source_coordinate_diagnostics,
+    validate_overlap_seams,
 )
 
 
@@ -86,6 +139,11 @@ ZH_CN = {
     "Camera Config": "相机配置",
     "Calibration": "标定与调参",
     "Project": "项目管理",
+    "Logs": "日志",
+    "Copy Log": "复制日志",
+    "Clear View": "清空显示",
+    "Log file": "日志文件",
+    "Seam validation failed": "拼接缝校验失败",
     "Choose Image Directory": "选择图片目录",
     "Load Images": "加载图片",
     "Start Live": "开始实时预览",
@@ -93,6 +151,12 @@ ZH_CN = {
     "Save Results": "保存结果",
     "Multi-camera View": "多路视图",
     "Stitched View": "拼接视图",
+    "Candidate Stitch": "候选拼接",
+    "Template Stitch": "模板拼接",
+    "Experimental": "实验性",
+    "Advanced": "高级",
+    "Experimental candidate live view": "实验性候选实时画面",
+    "Template stitching": "模板拼接",
     "Back to Grid": "返回多路",
     "Multi-camera monitoring": "多路监看",
     "Single-camera view: {camera}": "单路查看：{camera}",
@@ -155,8 +219,60 @@ ZH_CN = {
     "Preview Warp": "预览透视变换",
     "Warp preview": "变换预览",
     "Seams & Image Set": "拼接缝与标定图集",
+    "Geometry Diagnostics": "三路几何诊断",
+    "Refresh Geometry Diagnostics": "刷新几何诊断",
+    "50% Alpha": "50% 透明叠加",
+    "No Feather": "关闭 Feather 硬切",
+    "Final Canvas": "最终拼接画布",
+    "Pairwise Candidates": "两两标定候选",
+    "Run Pairwise Auto Detection": "运行两两自动检测",
+    "Manual Correspondences": "人工对应点",
+    "Clear Points": "清空点位",
+    "Generate Candidate": "生成候选",
+    "Cancel": "取消",
+    "Fisheye Sample Session": "鱼眼标定样本",
+    "Create Session": "新建采集会话",
+    "Load Session": "加载采集会话",
+    "Capture Sample": "采集样本",
+    "Board type": "标定板类型",
+    "Board definition confirmed": "已确认标定板物理参数",
+    "Physical board ID": "物理标定板编号",
+    "Same physical board confirmed": "确认两路为同一块物理板",
+    "Quality gates": "质量门控",
+    "Minimum board area": "最小标定板面积",
+    "Minimum Laplacian variance": "最低清晰度（拉普拉斯方差）",
+    "Maximum pair time delta": "Pair 最大时间差",
+    "No active session": "当前没有采集会话",
+    "Sample capture": "样本采集",
+    "Inner corner columns": "内角点列数",
+    "Inner corner rows": "内角点行数",
+    "Marker columns": "Marker 列数",
+    "Marker rows": "Marker 行数",
+    "Charuco squares X": "Charuco 方格列数",
+    "Charuco squares Y": "Charuco 方格行数",
+    "Square size": "方格边长",
+    "Marker length": "Marker 边长",
+    "Charuco square length": "Charuco 方格边长",
+    "Charuco marker length": "Charuco Marker 边长",
+    "Marker separation": "Marker 间距",
+    "ArUco dictionary": "ArUco 字典",
+    "Target": "对象",
+    "Accepted": "已接受",
+    "Goal": "目标",
+    "Rejected": "已拒绝",
+    "Missing coverage": "覆盖不足区域",
+    "Last rejection": "最近拒绝原因",
+    "Intrinsic": "单目内参",
+    "Pair": "相邻 Pair",
+    "Calibration Wizard": "标定向导",
+    "Sample Session Details": "采集会话（详细）",
+    "Previous": "上一步",
+    "Next": "下一步",
+    "Check Current Pair": "检查当前两路画面",
+    "Continue Session": "继续已有会话",
     "Refresh Seam Canvas": "刷新拼接缝画布",
     "Save Seam Points": "保存拼接缝",
+    "Center Seams in Overlaps": "拼接缝置于重叠区中心",
     "Feather width": "羽化宽度",
     "Stitch seam endpoints": "拼接缝端点",
     "Seam": "拼接缝",
@@ -264,9 +380,54 @@ ZH_CN = {
     "Stopped": "已停止",
     "Stopping": "停止中",
 }
+
+
 def i18n(language: str, text: str, **kwargs: Any) -> str:
     translated = ZH_CN.get(text, text) if language == "zh_CN" else text
     return translated.format(**kwargs) if kwargs else translated
+
+
+def rejection_advice(reason: str) -> str:
+    """Translate a quality-gate reason into a concrete next action."""
+    text = str(reason or "").strip()
+    lowered = text.lower()
+    if not text:
+        return "暂无拒绝记录。"
+    if "blur" in lowered or "模糊" in text:
+        return "停稳标定板约 1 秒，避免手抖和运动模糊后再拍。"
+    if (
+        "area is too small" in lowered
+        or "board area" in lowered
+        or "面积太小" in text
+    ):
+        return "让标定板靠近相机一些，使它在画面中占据更大区域。"
+    if (
+        "duplicate" in lowered
+        or "too similar" in lowered
+        or "姿态重复" in text
+        or "重复姿态" in text
+    ):
+        return "把标定板移到尚未覆盖的边缘或角落，并改变距离和倾角。"
+    if (
+        "time delta" in lowered
+        or "timestamps unavailable" in lowered
+        or "时间差" in text
+    ):
+        return "停稳同一块标定板约 1 秒，再采集这一组 Pair。"
+    if (
+        "coverage" in lowered
+        or "覆盖不足" in text
+        or "位置或距离" in text
+    ):
+        return "补拍画面四角、边缘，以及近、中、远不同距离和倾角。"
+    if (
+        "not detected" in lowered
+        or "common confirmed board points" in lowered
+        or "无法识别" in text
+        or "共同点" in text
+    ):
+        return "确认整块标定板清晰可见、无遮挡，并核对行列数和板类型。"
+    return "查看详细拒绝原因，调整标定板位置、清晰度或可见范围后重拍。"
 
 
 def cv_to_pixmap(image: np.ndarray, max_width: int = 720, max_height: int = 480) -> QPixmap:
@@ -311,7 +472,11 @@ class ImageView(QLabel):
         self.camera_id = camera_id
         self.overlay_text = ""
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(220, 150)
+        self.setMinimumSize(160, 100)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.setWordWrap(True)
         self.setStyleSheet(
             "QLabel { background: #101820; color: #d7e0ea; border: 1px solid #334155; padding: 4px; }"
@@ -365,7 +530,11 @@ class PointEditorView(QLabel):
     def __init__(self):
         super().__init__("Load a calibration image, then drag source points.")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(560, 420)
+        self.setMinimumSize(320, 220)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.setMouseTracking(True)
         self.setStyleSheet(
             "QLabel { background: #101820; color: #d7e0ea; border: 1px solid #334155; padding: 4px; }"
@@ -375,12 +544,27 @@ class PointEditorView(QLabel):
         self._points: list[list[float]] = []
         self._drag_index: int | None = None
         self._display_rect = QRectF()
+        self.source_coordinate_space = ""
+        self.source_reference_size: list[int] | None = None
         self._colors = [
             QColor("#f97316"),
             QColor("#22c55e"),
             QColor("#38bdf8"),
             QColor("#f43f5e"),
         ]
+
+    def set_source_coordinate_contract(
+        self,
+        coordinate_space: str,
+        reference_size: list[int] | None,
+    ) -> None:
+        self.source_coordinate_space = str(coordinate_space)
+        self.source_reference_size = (
+            [int(reference_size[0]), int(reference_size[1])]
+            if isinstance(reference_size, (list, tuple))
+            and len(reference_size) == 2
+            else None
+        )
 
     def set_editor_image(self, image: np.ndarray | None) -> None:
         self._image = None if image is None else image.copy()
@@ -480,6 +664,458 @@ class PointEditorView(QLabel):
         return x, y
 
 
+class CorrespondenceImageView(QLabel):
+    """Clickable raw-frame view used only for temporary pair correspondences."""
+
+    pointRequested = Signal(float, float)
+
+    def __init__(self, title: str):
+        super().__init__(title)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(320, 220)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.setStyleSheet(
+            "QLabel { background: #101820; color: #d7e0ea; "
+            "border: 1px solid #334155; padding: 4px; }"
+        )
+        self._image: np.ndarray | None = None
+        self._pixmap: QPixmap | None = None
+        self._points: list[list[float]] = []
+        self._display_rect = QRectF()
+
+    def set_editor_image(self, image: np.ndarray) -> None:
+        self._image = image.copy()
+        self._rescale_pixmap()
+
+    def set_points(self, points: list[list[float]]) -> None:
+        self._points = [[float(x), float(y)] for x, y in points]
+        self.update()
+
+    def _rescale_pixmap(self) -> None:
+        if self._image is None:
+            self._pixmap = None
+        else:
+            self._pixmap = cv_to_pixmap(
+                self._image,
+                self.width() - 12,
+                self.height() - 12,
+            )
+        self.update()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._rescale_pixmap()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#101820"))
+        if self._pixmap is None or self._image is None:
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text())
+            painter.end()
+            return
+        x = (self.width() - self._pixmap.width()) / 2
+        y = (self.height() - self._pixmap.height()) / 2
+        self._display_rect = QRectF(
+            x,
+            y,
+            self._pixmap.width(),
+            self._pixmap.height(),
+        )
+        painter.drawPixmap(int(x), int(y), self._pixmap)
+        painter.setFont(QFont(self.font().family(), 9, QFont.Weight.Bold))
+        for index, (point_x, point_y) in enumerate(self._points):
+            image_height, image_width = self._image.shape[:2]
+            widget_point = QPointF(
+                self._display_rect.left()
+                + point_x / image_width * self._display_rect.width(),
+                self._display_rect.top()
+                + point_y / image_height * self._display_rect.height(),
+            )
+            painter.setBrush(QBrush(QColor("#facc15")))
+            painter.setPen(QPen(QColor("#111827"), 2))
+            painter.drawEllipse(widget_point, 8, 8)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(
+                QRectF(
+                    widget_point.x() - 8,
+                    widget_point.y() - 8,
+                    16,
+                    16,
+                ),
+                Qt.AlignmentFlag.AlignCenter,
+                str(index + 1),
+            )
+        painter.end()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if (
+            event.button() != Qt.MouseButton.LeftButton
+            or self._image is None
+            or self._display_rect.isNull()
+            or not self._display_rect.contains(event.position())
+        ):
+            return
+        image_height, image_width = self._image.shape[:2]
+        x = (
+            (event.position().x() - self._display_rect.left())
+            / self._display_rect.width()
+            * image_width
+        )
+        y = (
+            (event.position().y() - self._display_rect.top())
+            / self._display_rect.height()
+            * image_height
+        )
+        self.pointRequested.emit(
+            min(max(x, 0.0), float(image_width - 1)),
+            min(max(y, 0.0), float(image_height - 1)),
+        )
+
+
+class ManualCorrespondenceDialog(QDialog):
+    """Collect matched raw-frame points without touching calibration YAML."""
+
+    def __init__(
+        self,
+        pair: PairDefinition,
+        left_image: np.ndarray,
+        right_image: np.ndarray,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(
+            f"Manual correspondences: "
+            f"{pair.left_camera} <-> {pair.right_camera}"
+        )
+        self.left_points: list[list[float]] = []
+        self.right_points: list[list[float]] = []
+        root = QVBoxLayout(self)
+        instructions = QLabel(
+            "Select one point in the left image, then the matching point in "
+            "the right image. Repeat for at least four pairs. The candidate "
+            "is diagnostic only and will not update calibration.yaml."
+        )
+        instructions.setWordWrap(True)
+        root.addWidget(instructions)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.left_view = CorrespondenceImageView(pair.left_camera)
+        self.right_view = CorrespondenceImageView(pair.right_camera)
+        self.left_view.set_editor_image(left_image)
+        self.right_view.set_editor_image(right_image)
+        self.left_view.pointRequested.connect(self._add_left_point)
+        self.right_view.pointRequested.connect(self._add_right_point)
+        splitter.addWidget(self.left_view)
+        splitter.addWidget(self.right_view)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        root.addWidget(splitter, 1)
+        self.status_label = QLabel()
+        root.addWidget(self.status_label)
+        buttons = QHBoxLayout()
+        clear_button = QPushButton("Clear Points")
+        generate_button = QPushButton("Generate Candidate")
+        cancel_button = QPushButton("Cancel")
+        clear_button.clicked.connect(self.clear_points)
+        generate_button.clicked.connect(self.accept_candidate)
+        cancel_button.clicked.connect(self.reject)
+        buttons.addStretch(1)
+        buttons.addWidget(clear_button)
+        buttons.addWidget(generate_button)
+        buttons.addWidget(cancel_button)
+        root.addLayout(buttons)
+        parent_width = parent.width() if parent is not None else 1200
+        parent_height = parent.height() if parent is not None else 700
+        self.resize(min(1200, parent_width), min(700, parent_height))
+        self._refresh_status()
+
+    def _add_left_point(self, x: float, y: float) -> None:
+        if len(self.left_points) != len(self.right_points):
+            self.status_label.setText(
+                "Select the matching point in the right image first."
+            )
+            return
+        self.left_points.append([x, y])
+        self.left_view.set_points(self.left_points)
+        self._refresh_status()
+
+    def _add_right_point(self, x: float, y: float) -> None:
+        if len(self.left_points) != len(self.right_points) + 1:
+            self.status_label.setText(
+                "Select a point in the left image first."
+            )
+            return
+        self.right_points.append([x, y])
+        self.right_view.set_points(self.right_points)
+        self._refresh_status()
+
+    def clear_points(self) -> None:
+        self.left_points.clear()
+        self.right_points.clear()
+        self.left_view.set_points([])
+        self.right_view.set_points([])
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        self.status_label.setText(
+            f"Matched pairs: {len(self.right_points)}. "
+            "Minimum required: 4."
+        )
+
+    def accept_candidate(self) -> None:
+        if (
+            len(self.left_points) < 4
+            or len(self.left_points) != len(self.right_points)
+        ):
+            self.status_label.setText(
+                "At least four complete left/right point pairs are required."
+            )
+            return
+        self.accept()
+
+
+class CalibrationCandidateDialog(QDialog):
+    """Read-only B-2 candidate report and preview window."""
+
+    def __init__(
+        self,
+        candidate_directory: str | Path,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.candidate_directory = Path(candidate_directory)
+        self.candidate, self.report = load_calibration_candidate(
+            self.candidate_directory
+        )
+        experimental = bool(self.candidate.get("experimental"))
+        self.setWindowTitle(
+            "B-2 实验性候选标定"
+            if experimental
+            else "B-2 候选标定"
+        )
+        self.resize(1180, 760)
+        root = QVBoxLayout(self)
+
+        warning = QLabel(
+            "实验性候选，仅供诊断"
+            if experimental
+            else "候选求解结果，尚未应用"
+        )
+        warning.setStyleSheet(
+            "QLabel { color: #b45309; font-size: 17px; "
+            "font-weight: 700; padding: 8px; }"
+        )
+        root.addWidget(warning)
+        self.candidate_safety_notice = QLabel(self._safety_notice_text())
+        self.candidate_safety_notice.setWordWrap(True)
+        self.candidate_safety_notice.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.candidate_safety_notice.setStyleSheet(
+            "QLabel { color: #7c2d12; background: #fff7ed; "
+            "border: 1px solid #fdba74; padding: 8px; }"
+        )
+        root.addWidget(self.candidate_safety_notice)
+        summary = QTextEdit()
+        summary.setReadOnly(True)
+        summary.setMaximumHeight(230)
+        summary.setPlainText(self._summary_text())
+        root.addWidget(summary)
+
+        self.preview_tabs = QTabWidget()
+        self._add_candidate_previews()
+        root.addWidget(self.preview_tabs, 1)
+
+        actions = QHBoxLayout()
+        path_label = QLabel(str(self.candidate_directory))
+        path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        actions.addWidget(path_label, 1)
+        export_button = QPushButton("导出报告")
+        export_button.clicked.connect(self.export_report)
+        self.apply_candidate_button = QPushButton("应用候选标定")
+        self.apply_candidate_button.setEnabled(False)
+        self.apply_candidate_button.setToolTip(
+            (
+                "experimental 候选禁止写入正式配置。"
+                if experimental
+                else "本阶段未启用正式应用流程。"
+            )
+        )
+        close_button = QPushButton("返回采样向导补拍")
+        close_button.clicked.connect(self.accept)
+        actions.addWidget(export_button)
+        actions.addWidget(self.apply_candidate_button)
+        actions.addWidget(close_button)
+        root.addLayout(actions)
+
+    def _safety_notice_text(self) -> str:
+        reasons = []
+        readiness = self.candidate.get("readiness", {})
+        reasons.extend(readiness.get("blocking_reasons", []))
+        reasons.extend(readiness.get("quality_issues", []))
+        for name, result in self.candidate.get("intrinsics", {}).items():
+            used = int(result.get("used_sample_count", 0))
+            outliers = int(result.get("outlier_count", 0))
+            if result.get("status") != "success":
+                reasons.append(f"{name} 的镜头参数候选未成功生成。")
+            elif used and outliers / max(1, used + outliers) > 0.2:
+                reasons.append(f"{name} 的异常样本比例较高，需要补拍。")
+        for name, result in self.candidate.get("stereo_pairs", {}).items():
+            used = int(result.get("used_sample_count", 0))
+            outliers = int(result.get("outlier_count", 0))
+            if result.get("status") != "success":
+                reasons.append(
+                    f"{name.replace('__', ' ↔ ')} 的相机位置关系候选未成功生成。"
+                )
+            elif used and outliers / max(1, used + outliers) > 0.2:
+                reasons.append(
+                    f"{name.replace('__', ' ↔ ')} 的异常样本比例较高。"
+                )
+        panorama = self.candidate.get("virtual_panorama") or {}
+        if "rotation_only" in str(panorama.get("projection", "")):
+            reasons.append(
+                "三台相机光心不重合；当前仅旋转全景优先保证远景，"
+                "近处人物和物体仍可能重影。"
+            )
+        if not reasons:
+            reasons.append("候选尚未经过正式复核，本阶段不允许写入正式配置。")
+        unique_reasons = list(dict.fromkeys(str(reason) for reason in reasons))
+        suggestions = [
+            rejection_advice(reason)
+            for reason in unique_reasons
+            if "光心不重合" not in reason
+        ]
+        unique_suggestions = list(dict.fromkeys(suggestions))
+        return (
+            "为什么不能应用：\n• "
+            + "\n• ".join(unique_reasons)
+            + "\n\n下一步：\n• "
+            + "\n• ".join(
+                unique_suggestions
+                or [
+                    "在 Grid 或 Focus 中检查近景，补充相邻 Pair 的位置、"
+                    "距离和倾角覆盖后重新生成候选。"
+                ]
+            )
+        )
+
+    def _summary_text(self) -> str:
+        lines = [
+            (
+                "等级：experimental / report-only"
+                if self.candidate.get("experimental")
+                else "等级：candidate / report-only"
+            ),
+            f"Session：{self.candidate.get('session_id', '')}",
+            f"分辨率：{self.candidate.get('resolution', [])}",
+            f"Rig 完整：{'是' if self.candidate['rig']['complete'] else '否'}",
+            "",
+            "候选内参：",
+        ]
+        for camera, result in self.candidate["intrinsics"].items():
+            lines.append(
+                f"  {camera}: {result['status']}，"
+                f"RMS={result.get('rms_px')} px，"
+                f"使用 {result.get('used_sample_count', 0)}，"
+                f"异常 {result.get('outlier_count', 0)}"
+            )
+        lines.append("")
+        lines.append("候选相邻相机关系：")
+        for pair, result in self.candidate["stereo_pairs"].items():
+            time_stats = result.get("time_delta_statistics", {})
+            lines.append(
+                f"  {pair.replace('__', ' ↔ ')}: {result['status']}，"
+                f"RMS={result.get('rms_px')} px，"
+                f"使用 {result.get('used_sample_count', 0)}，"
+                f"异常 {result.get('outlier_count', 0)}，"
+                f"时间差风险 {time_stats.get('risk_count', 0)}"
+            )
+        lines.extend(
+            [
+                "",
+                "限制：Pair 仅有软件时间戳；近景物体存在物理视差。",
+                "补充 Pair 的位置、距离和倾角覆盖后，"
+                "才能申请正式可应用求解。",
+            ]
+        )
+        for issue in self.candidate["readiness"].get(
+            "quality_issues",
+            [],
+        ):
+            lines.append(f"  - {issue}")
+        return "\n".join(lines)
+
+    def _add_preview(
+        self,
+        title: str,
+        relative_path: str | None,
+    ) -> None:
+        view = ImageView(title)
+        if relative_path:
+            image = cv2.imread(
+                str(self.candidate_directory / relative_path)
+            )
+            if image is not None:
+                view.set_image(image, title)
+            else:
+                view.set_placeholder("预览文件读取失败")
+        else:
+            view.set_placeholder("当前候选没有生成此预览")
+        self.preview_tabs.addTab(view, title)
+
+    def _add_candidate_previews(self) -> None:
+        panorama = self.candidate.get("virtual_panorama") or {}
+        files = panorama.get("files", {})
+        self._add_preview("候选全景", files.get("canvas"))
+        for camera, path in files.get("remap_previews", {}).items():
+            self._add_preview(f"Remap · {camera}", path)
+        for pair, pair_files in files.get("pair_previews", {}).items():
+            display = pair.replace("__", " ↔ ")
+            self._add_preview(
+                f"{display} · 50% Alpha",
+                pair_files.get("alpha_50"),
+            )
+            self._add_preview(
+                f"{display} · Hard Seam",
+                pair_files.get("hard_seam"),
+            )
+
+    def export_report(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择报告导出目录",
+            str(PROJECT_ROOT),
+        )
+        if not selected:
+            return
+        base = Path(selected) / (
+            f"DeepShark_candidate_report_{self.candidate_directory.name}"
+        )
+        target = base
+        suffix = 1
+        while target.exists():
+            target = Path(f"{base}_{suffix:02d}")
+            suffix += 1
+        target.mkdir(parents=True, exist_ok=False)
+        for filename in ("candidate.yaml", "report.yaml"):
+            shutil.copy2(
+                self.candidate_directory / filename,
+                target / filename,
+            )
+        previews = self.candidate_directory / "previews"
+        if previews.exists():
+            shutil.copytree(previews, target / "previews")
+        QMessageBox.information(
+            self,
+            "导出报告",
+            f"候选报告已导出到：\n{target}",
+        )
+
+
 class SeamEditorView(QLabel):
     """Canvas-coordinate seam editor with draggable seam endpoints."""
 
@@ -488,7 +1124,11 @@ class SeamEditorView(QLabel):
     def __init__(self):
         super().__init__("Drag seam endpoints on the surround canvas.")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(560, 420)
+        self.setMinimumSize(320, 220)
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self.setMouseTracking(True)
         self.setStyleSheet(
             "QLabel { background: #0b1220; color: #d7e0ea; border: 1px solid #334155; padding: 4px; }"
@@ -497,6 +1137,7 @@ class SeamEditorView(QLabel):
         self._pixmap: QPixmap | None = None
         self._canvas_size = (2440, 1800)
         self._stitch_points: dict[str, list[list[float]]] = {}
+        self._overlap_ranges: dict[str, tuple[float, float]] = {}
         self._drag_key: tuple[str, int] | None = None
         self._display_rect = QRectF()
         self._line_colors = {
@@ -521,6 +1162,17 @@ class SeamEditorView(QLabel):
             name: [[float(x), float(y)] for x, y in endpoints[:2]]
             for name, endpoints in points.items()
         }
+        self.update()
+
+    def set_overlaps(self, overlaps: list[dict[str, Any]]) -> None:
+        self._overlap_ranges = {}
+        for overlap in overlaps:
+            x_range = overlap.get("x_range", [])
+            seam_name = str(overlap.get("seam", ""))
+            if seam_name and len(x_range) == 2:
+                self._overlap_ranges[seam_name] = tuple(
+                    sorted((float(x_range[0]), float(x_range[1])))
+                )
         self.update()
 
     def stitch_points(self) -> dict[str, list[list[float]]]:
@@ -549,6 +1201,36 @@ class SeamEditorView(QLabel):
         painter.drawPixmap(int(x), int(y), self._pixmap)
 
         painter.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+        for name, (overlap_start, overlap_end) in self._overlap_ranges.items():
+            start = self._canvas_to_widget(overlap_start, 0.0)
+            end = self._canvas_to_widget(
+                overlap_end,
+                float(self._canvas_size[1]),
+            )
+            left = min(start.x(), end.x())
+            right = max(start.x(), end.x())
+            color = self._line_colors.get(name, QColor("#facc15"))
+            fill = QColor(color)
+            fill.setAlpha(45)
+            painter.fillRect(
+                QRectF(
+                    left,
+                    self._display_rect.top(),
+                    max(1.0, right - left),
+                    self._display_rect.height(),
+                ),
+                fill,
+            )
+            painter.setPen(QPen(color, 1, Qt.PenStyle.DashLine))
+            painter.drawLine(
+                QPointF(left, self._display_rect.top()),
+                QPointF(left, self._display_rect.bottom()),
+            )
+            painter.drawLine(
+                QPointF(right, self._display_rect.top()),
+                QPointF(right, self._display_rect.bottom()),
+            )
+
         for name, endpoints in self._stitch_points.items():
             if len(endpoints) < 2:
                 continue
@@ -590,6 +1272,9 @@ class SeamEditorView(QLabel):
             return
         name, index = self._drag_key
         x, y = canvas_point
+        overlap_range = self._overlap_ranges.get(name)
+        if overlap_range is not None:
+            x = min(max(x, overlap_range[0]), overlap_range[1])
         self._stitch_points[name][index] = [x, y]
         self.seamPointMoved.emit(name, index, x, y)
         self.update()
@@ -660,10 +1345,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("DeepShark View Studio")
-        self.resize(1500, 920)
 
         self.input_dir = PROJECT_ROOT / "samples" / "input"
         self.output_dir = PROJECT_ROOT / "samples" / "output"
+        self.log_path = PROJECT_ROOT / "logs" / "deep_shark_studio.log"
+        self.app_logger = create_application_logger(self.log_path)
         self.calibration_config = load_config("calibration.yaml")
         self.camera_config = load_config("cameras.yaml")
         self._calibration_config_revision = config_revision("calibration.yaml")
@@ -696,6 +1382,27 @@ class MainWindow(QMainWindow):
         self._syncing_camera_widgets = False
         self._camera_config_dirty = False
         self.last_stitched_raw_preview_time = 0.0
+        self.source_contract_log_messages: set[str] = set()
+        self.last_stitch_ui_error = ""
+        self.calibration_session: CalibrationSession | None = None
+        self.live_candidate_directory = latest_calibration_candidate(
+            topology=str(
+                self.calibration_config.get(
+                    "stitch_topology",
+                    "triple_front_panorama",
+                )
+            )
+        )
+        self.live_stitch_mode = (
+            "candidate"
+            if self.live_candidate_directory is not None
+            else "template"
+        )
+        self._candidate_ui_cache_path: Path | None = None
+        self._candidate_ui_cache: dict[str, Any] = {}
+        self.b2_candidate_solver_launcher: (
+            Callable[[dict[str, Any]], None] | None
+        ) = None
 
         self.preview_timer = QTimer(self)
         self.preview_timer.setInterval(15)
@@ -706,11 +1413,40 @@ class MainWindow(QMainWindow):
         self.warped_views: dict[str, ImageView] = {}
 
         self._build_ui()
+        self.fit_initial_window_to_available_screen()
         self.refresh_camera_count()
         self.statusBar().showMessage(self.t("Ready"))
+        self.log(
+            "Application ready: "
+            f"topology={self.calibration_config.get('stitch_topology', '')}, "
+            f"cameras={self.active_camera_keys()}"
+        )
+        for validation_error in validate_overlap_seams(
+            self.current_stitch_profile()
+        ):
+            self.log(
+                f"Configuration validation: {validation_error}",
+                level="ERROR",
+            )
 
     def t(self, text: str, **kwargs: Any) -> str:
         return i18n(self.language, text, **kwargs)
+
+    def fit_initial_window_to_available_screen(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.resize(1280, 760)
+            return
+        available = screen.availableGeometry()
+        target_width = min(1500, max(720, int(available.width() * 0.92)))
+        target_height = min(920, max(560, int(available.height() * 0.90)))
+        target_width = min(target_width, available.width())
+        target_height = min(target_height, available.height())
+        self.resize(target_width, target_height)
+        self.move(
+            available.x() + (available.width() - target_width) // 2,
+            available.y() + (available.height() - target_height) // 2,
+        )
 
     def create_stitcher(self) -> SurroundStitcher:
         max_width = int(self.performance_config.get("max_input_width", 960))
@@ -718,6 +1454,27 @@ class MainWindow(QMainWindow):
             max_width = None
         use_intrinsics = bool(self.performance_config.get("use_intrinsics", False))
         return SurroundStitcher(self.calibration_config, max_input_width=max_width, use_intrinsics=use_intrinsics)
+
+    def log_source_coordinate_warnings(
+        self,
+        frames: dict[str, np.ndarray],
+    ) -> None:
+        profile = self.current_stitch_profile()
+        for key, frame in frames.items():
+            if frame is None or key not in profile.get("cameras", {}):
+                continue
+            height, width = frame.shape[:2]
+            diagnostics = source_coordinate_diagnostics(
+                profile,
+                key,
+                (width, height),
+            )
+            for warning in diagnostics["warnings"]:
+                if warning in self.source_contract_log_messages:
+                    continue
+                self.source_contract_log_messages.add(warning)
+                self.log(f"Source coordinate warning: {warning}", level="WARNING")
+        self.update_preview_status_summary()
 
     def current_stitch_profile(self) -> dict[str, Any]:
         return active_stitch_profile(self.calibration_config)
@@ -737,12 +1494,39 @@ class MainWindow(QMainWindow):
 
     def configure_live_stitch_processor(self) -> None:
         max_width, use_intrinsics = self.live_stitcher_options()
-        self.stitch_processor.configure(
-            self.preview_session_id,
-            self.calibration_config,
-            max_width,
-            use_intrinsics,
+        processor_mode = self.live_stitch_mode
+        candidate_directory = (
+            str(self.live_candidate_directory)
+            if processor_mode == "candidate"
+            and self.live_candidate_directory is not None
+            else None
         )
+        try:
+            self.stitch_processor.configure(
+                self.preview_session_id,
+                self.calibration_config,
+                max_width,
+                use_intrinsics,
+                processor_mode=processor_mode,
+                candidate_directory=candidate_directory,
+            )
+        except Exception as exc:
+            if processor_mode != "candidate":
+                raise
+            self.log(
+                f"Candidate live processor unavailable; falling back to "
+                f"template: {exc}",
+                level="ERROR",
+            )
+            self.live_stitch_mode = "template"
+            self.stitch_processor.configure(
+                self.preview_session_id,
+                self.calibration_config,
+                max_width,
+                use_intrinsics,
+                processor_mode="template",
+            )
+            self.apply_live_stitch_mode_controls()
 
     def frame_signature(self, snapshots: dict[str, Any]) -> tuple[tuple[str, int], ...]:
         return tuple(
@@ -774,6 +1558,7 @@ class MainWindow(QMainWindow):
         self.root_tabs.addTab(self._build_camera_config_workspace(), self.t("Camera Config"))
         self.root_tabs.addTab(self._build_calibration_workspace(), self.t("Calibration"))
         self.root_tabs.addTab(self._build_project_workspace(), self.t("Project"))
+        self.root_tabs.addTab(self._build_log_workspace(), self.t("Logs"))
         self.root_tabs.currentChanged.connect(self.on_root_tab_changed)
         central_layout.addWidget(self.root_tabs, 1)
         self.setCentralWidget(central)
@@ -808,10 +1593,17 @@ class MainWindow(QMainWindow):
     def _build_preview_workspace(self) -> QWidget:
         page = QWidget()
         root = QVBoxLayout(page)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
 
-        toolbar = QHBoxLayout()
+        source_toolbar = QHBoxLayout()
+        view_toolbar = QHBoxLayout()
         self.input_path_label = QLabel(str(self.input_dir))
         self.input_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.input_path_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
         self.choose_input_dir_button = QPushButton(self.t("Choose Image Directory"))
         self.load_images_button = QPushButton(self.t("Load Images"))
         self.start_live_button = QPushButton(self.t("Start Live"))
@@ -826,6 +1618,22 @@ class MainWindow(QMainWindow):
         )
         self.grid_view_button.setCheckable(True)
         self.stitched_view_button.setCheckable(True)
+        self.candidate_stitch_button = QPushButton(
+            f"{self.t('Candidate Stitch')} [{self.t('Experimental')}]"
+        )
+        self.template_stitch_button = QPushButton(
+            self.t("Template Stitch")
+        )
+        self.candidate_stitch_button.setCheckable(True)
+        self.template_stitch_button.setCheckable(True)
+        self.stitch_strategy_group = QButtonGroup(self)
+        self.stitch_strategy_group.setExclusive(True)
+        self.stitch_strategy_group.addButton(self.candidate_stitch_button)
+        self.stitch_strategy_group.addButton(self.template_stitch_button)
+        self.stitch_strategy_label = QLabel()
+        self.stitch_strategy_label.setStyleSheet(
+            "QLabel { color: #9a3412; font-weight: 600; padding: 0 8px; }"
+        )
         self.choose_input_dir_button.clicked.connect(self.choose_input_dir)
         self.load_images_button.clicked.connect(self.run_still_preview)
         self.start_live_button.clicked.connect(self.start_live_preview)
@@ -840,17 +1648,45 @@ class MainWindow(QMainWindow):
         self.back_to_grid_button.clicked.connect(
             lambda: self.set_preview_layout_mode(PreviewLayoutMode.GRID)
         )
-        toolbar.addWidget(self.choose_input_dir_button)
-        toolbar.addWidget(self.load_images_button)
-        toolbar.addWidget(self.start_live_button)
-        toolbar.addWidget(self.stop_live_button)
-        toolbar.addWidget(self.save_results_button)
-        toolbar.addWidget(self.grid_view_button)
-        toolbar.addWidget(self.stitched_view_button)
-        toolbar.addWidget(self.back_to_grid_button)
-        toolbar.addWidget(self.preview_mode_label)
-        toolbar.addWidget(self.input_path_label, 1)
-        root.addLayout(toolbar)
+        self.candidate_stitch_button.clicked.connect(
+            lambda: self.set_live_stitch_mode("candidate")
+        )
+        self.template_stitch_button.clicked.connect(
+            lambda: self.set_live_stitch_mode("template")
+        )
+        source_toolbar.addWidget(self.choose_input_dir_button)
+        source_toolbar.addWidget(self.load_images_button)
+        source_toolbar.addWidget(self.start_live_button)
+        source_toolbar.addWidget(self.stop_live_button)
+        source_toolbar.addWidget(self.save_results_button)
+        source_toolbar.addStretch(1)
+        view_toolbar.addWidget(self.grid_view_button)
+        view_toolbar.addWidget(self.stitched_view_button)
+        view_toolbar.addWidget(self.back_to_grid_button)
+        view_toolbar.addWidget(self.candidate_stitch_button)
+        view_toolbar.addWidget(self.template_stitch_button)
+        view_toolbar.addWidget(self.stitch_strategy_label)
+        view_toolbar.addWidget(self.preview_mode_label)
+        view_toolbar.addWidget(self.input_path_label, 1)
+        root.addLayout(source_toolbar)
+        root.addLayout(view_toolbar)
+        self.preview_status_summary = QLabel()
+        self.preview_status_summary.setWordWrap(True)
+        self.preview_status_summary.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.preview_status_summary.setStyleSheet(
+            "QLabel { color: #334155; background: #f8fafc; "
+            "border: 1px solid #cbd5e1; padding: 5px 8px; }"
+        )
+        root.addWidget(self.preview_status_summary)
+        self.stitched_view_notice = QLabel()
+        self.stitched_view_notice.setWordWrap(True)
+        self.stitched_view_notice.setStyleSheet(
+            "QLabel { color: #92400e; background: #fffbeb; "
+            "border: 1px solid #fcd34d; padding: 5px 8px; }"
+        )
+        root.addWidget(self.stitched_view_notice)
 
         self.preview_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.camera_grid = QWidget()
@@ -864,7 +1700,7 @@ class MainWindow(QMainWindow):
 
         self.preview_tabs = QTabWidget()
         self.canvas_view = ImageView(self.t("Stitched surround canvas"))
-        self.canvas_view.setMinimumSize(560, 420)
+        self.canvas_view.setMinimumSize(320, 220)
         self.warped_page = QWidget()
         self.warped_grid_layout = QGridLayout(self.warped_page)
         self.warped_grid_layout.setContentsMargins(0, 0, 0, 0)
@@ -892,6 +1728,7 @@ class MainWindow(QMainWindow):
         self.health_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.health_table.setMaximumHeight(180)
         root.addWidget(self.health_table)
+        self.apply_live_stitch_mode_controls()
         return page
 
     def _build_camera_config_workspace(self) -> QWidget:
@@ -1011,6 +1848,13 @@ class MainWindow(QMainWindow):
         open_project_button = QPushButton(self.t("Open Project"))
         backup_button = QPushButton(self.t("Backup Current Configs"))
         export_runtime_button = QPushButton(self.t("Export Runtime Config"))
+        export_runtime_button.setText(
+            f"{self.t('Export Runtime Config')} [{self.t('Experimental')}]"
+        )
+        export_runtime_button.setToolTip(
+            "高级/实验性入口：用于未来服务或 QGC 桥接，"
+            "不会自动部署或应用到运行设备。"
+        )
         save_project_button.clicked.connect(self.save_project_as)
         open_project_button.clicked.connect(self.open_project_file)
         backup_button.clicked.connect(self.backup_current_configs)
@@ -1032,9 +1876,76 @@ class MainWindow(QMainWindow):
         root.addWidget(notes, 1)
         return page
 
-    def _build_calibration_workspace(self) -> QWidget:
+    def _build_log_workspace(self) -> QWidget:
         page = QWidget()
         root = QVBoxLayout(page)
+        toolbar = QHBoxLayout()
+        copy_button = QPushButton(self.t("Copy Log"))
+        clear_button = QPushButton(self.t("Clear View"))
+        copy_button.clicked.connect(self.copy_application_log)
+        clear_button.clicked.connect(self.clear_application_log_view)
+        toolbar.addWidget(copy_button)
+        toolbar.addWidget(clear_button)
+        toolbar.addWidget(QLabel(self.t("Log file")))
+        log_path_label = QLabel(str(self.log_path))
+        log_path_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        log_path_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        log_path_label.setToolTip(str(self.log_path))
+        toolbar.addWidget(log_path_label, 1)
+        root.addLayout(toolbar)
+
+        self.application_log = QTextEdit()
+        self.application_log.setReadOnly(True)
+        self.application_log.setLineWrapMode(
+            QTextEdit.LineWrapMode.NoWrap
+        )
+        if self.log_path.exists():
+            existing_lines = self.log_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            ).splitlines()[-500:]
+            self.application_log.setPlainText("\n".join(existing_lines))
+        root.addWidget(self.application_log, 1)
+        return page
+
+    def copy_application_log(self) -> None:
+        QApplication.clipboard().setText(self.application_log.toPlainText())
+        self.statusBar().showMessage(self.t("Copy Log"))
+
+    def clear_application_log_view(self) -> None:
+        self.application_log.clear()
+
+    def _build_calibration_workspace(self) -> QWidget:
+        self.calibration_scroll_area = QScrollArea()
+        self.calibration_scroll_area.setWidgetResizable(True)
+        self.calibration_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.calibration_scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.calibration_scroll_area.setStyleSheet(
+            "QScrollArea { border: none; background: transparent; }"
+        )
+        page = QWidget()
+        page.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        root = QVBoxLayout(page)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(6)
+        self.calibration_legacy_header = QWidget()
+        calibration_header_layout = QVBoxLayout(
+            self.calibration_legacy_header
+        )
+        calibration_header_layout.setContentsMargins(0, 0, 0, 0)
+        calibration_header_layout.setSpacing(6)
 
         diagnostics_group = QGroupBox(self.t("Topology diagnostics"))
         diagnostics_layout = QVBoxLayout(diagnostics_group)
@@ -1044,7 +1955,7 @@ class MainWindow(QMainWindow):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         diagnostics_layout.addWidget(self.topology_diagnostics_label)
-        root.addWidget(diagnostics_group)
+        calibration_header_layout.addWidget(diagnostics_group)
 
         board_group = QGroupBox(self.t("Chessboard"))
         board_form = QFormLayout(board_group)
@@ -1061,9 +1972,10 @@ class MainWindow(QMainWindow):
         board_form.addRow(self.t("Total square columns"), self.board_columns)
         board_form.addRow(self.t("Total square rows"), self.board_rows)
         board_form.addRow(self.t("Square size mm"), self.square_size)
-        root.addWidget(board_group)
+        calibration_header_layout.addWidget(board_group)
 
-        toolbar = QHBoxLayout()
+        calibration_toolbar_primary = QHBoxLayout()
+        calibration_toolbar_secondary = QHBoxLayout()
         self.calibration_camera = QComboBox()
         self.calibration_camera.addItems(active_topology_camera_keys(self.calibration_config))
         load_image = QPushButton(self.t("Load Calibration Image"))
@@ -1078,20 +1990,28 @@ class MainWindow(QMainWindow):
         undistort_preview.clicked.connect(self.preview_undistort)
         export_report.clicked.connect(self.export_calibration_report)
         save_board.clicked.connect(self.save_board_settings)
-        toolbar.addWidget(QLabel(self.t("Camera")))
-        toolbar.addWidget(self.calibration_camera)
-        toolbar.addWidget(load_image)
-        toolbar.addWidget(detect_board)
-        toolbar.addWidget(calibrate_folder)
-        toolbar.addWidget(undistort_preview)
-        toolbar.addWidget(export_report)
-        toolbar.addWidget(save_board)
-        toolbar.addStretch(1)
-        root.addLayout(toolbar)
+        calibration_toolbar_primary.addWidget(QLabel(self.t("Camera")))
+        calibration_toolbar_primary.addWidget(self.calibration_camera)
+        calibration_toolbar_primary.addWidget(load_image)
+        calibration_toolbar_primary.addWidget(detect_board)
+        calibration_toolbar_primary.addWidget(calibrate_folder)
+        calibration_toolbar_primary.addStretch(1)
+        calibration_toolbar_secondary.addWidget(undistort_preview)
+        calibration_toolbar_secondary.addWidget(export_report)
+        calibration_toolbar_secondary.addWidget(save_board)
+        calibration_toolbar_secondary.addStretch(1)
+        calibration_header_layout.addLayout(calibration_toolbar_primary)
+        calibration_header_layout.addLayout(calibration_toolbar_secondary)
+        root.addWidget(self.calibration_legacy_header)
 
-        calibration_tabs = QTabWidget()
+        self.calibration_tabs = QTabWidget()
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.calibration_image_view = PointEditorView()
+        stitch_profile = self.current_stitch_profile()
+        self.calibration_image_view.set_source_coordinate_contract(
+            str(stitch_profile.get("source_coordinate_space", "")),
+            stitch_profile.get("source_reference_size"),
+        )
         self.calibration_image_view.pointMoved.connect(self.on_source_point_moved)
         splitter.addWidget(self.calibration_image_view)
 
@@ -1115,7 +2035,7 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(apply_points)
         right_layout.addWidget(preview_warp)
         self.calibration_warp_view = ImageView(self.t("Warp preview"))
-        self.calibration_warp_view.setMinimumHeight(220)
+        self.calibration_warp_view.setMinimumHeight(120)
         right_layout.addWidget(self.calibration_warp_view)
         self.calibration_log = QTextEdit()
         self.calibration_log.setReadOnly(True)
@@ -1123,20 +2043,26 @@ class MainWindow(QMainWindow):
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 1)
-        calibration_tabs.addTab(splitter, self.t("Perspective"))
+        self.calibration_tabs.addTab(
+            splitter,
+            f"{self.t('Advanced')} · {self.t('Perspective')}",
+        )
 
         seam_page = QWidget()
         seam_layout = QVBoxLayout(seam_page)
         seam_toolbar = QHBoxLayout()
         refresh_seam = QPushButton(self.t("Refresh Seam Canvas"))
         save_seam = QPushButton(self.t("Save Seam Points"))
+        center_seams = QPushButton(self.t("Center Seams in Overlaps"))
         self.feather_width = QSpinBox()
         self.feather_width.setRange(1, 1000)
         self.feather_width.setValue(self.current_feather_width())
         refresh_seam.clicked.connect(self.refresh_seam_editor)
         save_seam.clicked.connect(self.save_seam_points)
+        center_seams.clicked.connect(self.center_seams_in_overlaps)
         seam_toolbar.addWidget(refresh_seam)
         seam_toolbar.addWidget(save_seam)
+        seam_toolbar.addWidget(center_seams)
         seam_toolbar.addWidget(QLabel(self.t("Feather width")))
         seam_toolbar.addWidget(self.feather_width)
         seam_toolbar.addStretch(1)
@@ -1162,6 +2088,13 @@ class MainWindow(QMainWindow):
         image_set_toolbar = QHBoxLayout()
         self.calibration_folder_label = QLabel(str(PROJECT_ROOT / "samples" / "calibration"))
         self.calibration_folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.calibration_folder_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.calibration_folder_label.setToolTip(
+            str(PROJECT_ROOT / "samples" / "calibration")
+        )
         choose_calibration_folder = QPushButton(self.t("Choose Folder"))
         capture_frame = QPushButton(self.t("Capture Current Frame"))
         self.save_calibration_snapshot_button = QPushButton(
@@ -1191,9 +2124,94 @@ class MainWindow(QMainWindow):
         self.calibration_image_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         image_set_layout.addWidget(self.calibration_image_table)
         seam_layout.addWidget(image_set_group)
-        calibration_tabs.addTab(seam_page, self.t("Seams & Image Set"))
+        self.calibration_tabs.addTab(
+            seam_page,
+            f"{self.t('Advanced')} · {self.t('Seams & Image Set')}",
+        )
 
-        root.addWidget(calibration_tabs, 1)
+        geometry_page = QWidget()
+        geometry_layout = QVBoxLayout(geometry_page)
+        geometry_toolbar = QHBoxLayout()
+        pairwise_toolbar = QHBoxLayout()
+        refresh_geometry = QPushButton(
+            self.t("Refresh Geometry Diagnostics")
+        )
+        self.geometry_pair_mode = QComboBox()
+        self.geometry_pair_mode.addItem(self.t("50% Alpha"), ALPHA_50)
+        self.geometry_pair_mode.addItem(self.t("No Feather"), NO_FEATHER)
+        self.run_pairwise_button = QPushButton(
+            self.t("Run Pairwise Auto Detection")
+        )
+        self.manual_pairwise_button = QPushButton(
+            self.t("Manual Correspondences")
+        )
+        self.pairwise_pair_combo = QComboBox()
+        refresh_geometry.clicked.connect(self.refresh_geometry_diagnostics)
+        self.run_pairwise_button.clicked.connect(
+            self.run_pairwise_candidate_diagnostics
+        )
+        self.manual_pairwise_button.clicked.connect(
+            self.open_manual_pairwise_dialog
+        )
+        geometry_toolbar.addWidget(refresh_geometry)
+        geometry_toolbar.addWidget(self.geometry_pair_mode)
+        geometry_toolbar.addStretch(1)
+        pairwise_toolbar.addWidget(self.run_pairwise_button)
+        pairwise_toolbar.addWidget(self.pairwise_pair_combo)
+        pairwise_toolbar.addWidget(self.manual_pairwise_button)
+        pairwise_toolbar.addStretch(1)
+        geometry_layout.addLayout(geometry_toolbar)
+        geometry_layout.addLayout(pairwise_toolbar)
+
+        self.diagnostic_output_tabs = QTabWidget()
+        warp_output_page = QWidget()
+        warp_output_layout = QVBoxLayout(warp_output_page)
+        self.geometry_diagnostics_summary = QTextEdit()
+        self.geometry_diagnostics_summary.setReadOnly(True)
+        self.geometry_diagnostics_summary.setMaximumHeight(160)
+        warp_output_layout.addWidget(self.geometry_diagnostics_summary)
+        self.geometry_diagnostics_tabs = QTabWidget()
+        warp_output_layout.addWidget(self.geometry_diagnostics_tabs, 1)
+        self.diagnostic_output_tabs.addTab(
+            warp_output_page,
+            self.t("Geometry Diagnostics"),
+        )
+
+        pairwise_output_page = QWidget()
+        pairwise_output_layout = QVBoxLayout(pairwise_output_page)
+        self.pairwise_diagnostics_summary = QTextEdit()
+        self.pairwise_diagnostics_summary.setReadOnly(True)
+        self.pairwise_diagnostics_summary.setMaximumHeight(160)
+        pairwise_output_layout.addWidget(self.pairwise_diagnostics_summary)
+        self.pairwise_diagnostics_tabs = QTabWidget()
+        pairwise_output_layout.addWidget(self.pairwise_diagnostics_tabs, 1)
+        self.pairwise_output_tab_index = self.diagnostic_output_tabs.addTab(
+            pairwise_output_page,
+            self.t("Pairwise Candidates"),
+        )
+        geometry_layout.addWidget(self.diagnostic_output_tabs, 1)
+        self.calibration_tabs.addTab(
+            geometry_page,
+            f"{self.t('Advanced')}/{self.t('Experimental')} · "
+            f"{self.t('Geometry Diagnostics')}",
+        )
+        session_details_page = self._build_calibration_session_page()
+        self.calibration_tabs.addTab(
+            session_details_page,
+            f"{self.t('Advanced')} · {self.t('Sample Session Details')}",
+        )
+        self.calibration_tabs.insertTab(
+            0,
+            self._build_calibration_wizard_page(),
+            self.t("Calibration Wizard"),
+        )
+        self.calibration_tabs.setCurrentIndex(0)
+        self.calibration_tabs.currentChanged.connect(
+            self.on_calibration_tab_changed
+        )
+        self.on_calibration_tab_changed(0)
+
+        root.addWidget(self.calibration_tabs, 1)
 
         self.calibration_camera.currentTextChanged.connect(self.populate_point_table)
         self.point_table.itemChanged.connect(self.on_point_table_changed)
@@ -1202,10 +2220,526 @@ class MainWindow(QMainWindow):
         self._updating_point_table = False
         self._updating_seam_table = False
         self.calibration_folder = PROJECT_ROOT / "samples" / "calibration"
+        self.pairwise_diagnostic_results: list[
+            PairwiseCandidateResult
+        ] = []
+        self.refresh_pairwise_pair_choices()
         self.populate_point_table()
         self.populate_seam_table()
         self.refresh_seam_editor()
         self.update_topology_diagnostics()
+        self.calibration_scroll_area.setWidget(page)
+        return self.calibration_scroll_area
+
+    def _build_calibration_session_page(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+
+        setup_group = QGroupBox(self.t("Fisheye Sample Session"))
+        setup_layout = QFormLayout(setup_group)
+        self.session_board_type = QComboBox()
+        self.session_board_type.addItem("Chessboard", "chessboard")
+        self.session_board_type.addItem("ArUco Grid", "aruco_grid")
+        self.session_board_type.addItem("Charuco", "charuco")
+        self.session_board_columns = QSpinBox()
+        self.session_board_columns.setRange(2, 40)
+        self.session_board_rows = QSpinBox()
+        self.session_board_rows.setRange(2, 40)
+        board = self.calibration_config.get("calibration_board", {})
+        self.session_board_columns.setValue(
+            max(2, int(board.get("total_columns", 12)) - 1)
+        )
+        self.session_board_rows.setValue(
+            max(2, int(board.get("total_rows", 9)) - 1)
+        )
+        self.session_square_length = QDoubleSpinBox()
+        self.session_square_length.setRange(0.1, 1000.0)
+        self.session_square_length.setDecimals(3)
+        self.session_square_length.setSuffix(" mm")
+        self.session_square_length.setValue(
+            float(board.get("square_size_mm", 25.0))
+        )
+        self.session_marker_length = QDoubleSpinBox()
+        self.session_marker_length.setRange(0.1, 1000.0)
+        self.session_marker_length.setDecimals(3)
+        self.session_marker_length.setSuffix(" mm")
+        self.session_marker_length.setValue(18.0)
+        self.session_marker_separation = QDoubleSpinBox()
+        self.session_marker_separation.setRange(0.0, 1000.0)
+        self.session_marker_separation.setDecimals(3)
+        self.session_marker_separation.setSuffix(" mm")
+        self.session_marker_separation.setValue(5.0)
+        self.session_dictionary = QComboBox()
+        self.session_dictionary.addItems(supported_aruco_dictionaries())
+        self.session_board_confirmed = QCheckBox(
+            self.t("Board definition confirmed")
+        )
+        self.session_columns_label = QLabel(self.t("Inner corner columns"))
+        self.session_rows_label = QLabel(self.t("Inner corner rows"))
+        self.session_square_label = QLabel(self.t("Square size"))
+        self.session_marker_label = QLabel(self.t("Marker length"))
+        self.session_separation_label = QLabel(
+            self.t("Marker separation")
+        )
+        setup_layout.addRow(self.t("Board type"), self.session_board_type)
+        setup_layout.addRow(
+            self.session_columns_label,
+            self.session_board_columns,
+        )
+        setup_layout.addRow(
+            self.session_rows_label,
+            self.session_board_rows,
+        )
+        setup_layout.addRow(
+            self.session_square_label,
+            self.session_square_length,
+        )
+        setup_layout.addRow(
+            self.session_marker_label,
+            self.session_marker_length,
+        )
+        setup_layout.addRow(
+            self.session_separation_label,
+            self.session_marker_separation,
+        )
+        setup_layout.addRow(
+            self.t("ArUco dictionary"),
+            self.session_dictionary,
+        )
+        setup_layout.addRow(self.session_board_confirmed)
+
+        quality_group = QGroupBox(self.t("Quality gates"))
+        quality_form = QFormLayout(quality_group)
+        self.session_min_area_percent = QDoubleSpinBox()
+        self.session_min_area_percent.setRange(0.1, 50.0)
+        self.session_min_area_percent.setDecimals(2)
+        self.session_min_area_percent.setSuffix(" %")
+        self.session_min_area_percent.setValue(1.5)
+        self.session_blur_threshold = QDoubleSpinBox()
+        self.session_blur_threshold.setRange(0.0, 100000.0)
+        self.session_blur_threshold.setDecimals(1)
+        self.session_blur_threshold.setValue(60.0)
+        self.session_sync_threshold_ms = QSpinBox()
+        self.session_sync_threshold_ms.setRange(1, 5000)
+        self.session_sync_threshold_ms.setSuffix(" ms")
+        self.session_sync_threshold_ms.setValue(100)
+        quality_form.addRow(
+            self.t("Minimum board area"),
+            self.session_min_area_percent,
+        )
+        quality_form.addRow(
+            self.t("Minimum Laplacian variance"),
+            self.session_blur_threshold,
+        )
+        quality_form.addRow(
+            self.t("Maximum pair time delta"),
+            self.session_sync_threshold_ms,
+        )
+
+        setup_column = QVBoxLayout()
+        setup_column.addWidget(setup_group)
+        setup_column.addWidget(quality_group)
+        root.addLayout(setup_column)
+
+        session_toolbar = QHBoxLayout()
+        self.create_calibration_session_button = QPushButton(
+            self.t("Create Session")
+        )
+        self.load_calibration_session_button = QPushButton(
+            self.t("Load Session")
+        )
+        self.calibration_session_path_label = QLabel(
+            self.t("No active session")
+        )
+        self.calibration_session_path_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.create_calibration_session_button.clicked.connect(
+            self.create_calibration_sample_session
+        )
+        self.load_calibration_session_button.clicked.connect(
+            self.load_calibration_sample_session
+        )
+        session_toolbar.addWidget(self.create_calibration_session_button)
+        session_toolbar.addWidget(self.load_calibration_session_button)
+        session_toolbar.addWidget(self.calibration_session_path_label, 1)
+        root.addLayout(session_toolbar)
+
+        capture_group = QGroupBox(self.t("Sample capture"))
+        capture_layout = QVBoxLayout(capture_group)
+        capture_primary = QHBoxLayout()
+        capture_board = QHBoxLayout()
+        self.session_capture_target = QComboBox()
+        for camera in ("front_left", "front", "front_right"):
+            self.session_capture_target.addItem(
+                f"{self.t('Intrinsic')}: {camera}",
+                f"intrinsic:{camera}",
+            )
+        for left, right in (
+            ("front_left", "front"),
+            ("front", "front_right"),
+        ):
+            self.session_capture_target.addItem(
+                f"{self.t('Pair')}: {left} <-> {right}",
+                f"pair:{left}__{right}",
+            )
+        self.session_physical_board_id = QLineEdit("board_1")
+        self.session_pair_board_confirmed = QCheckBox(
+            self.t("Same physical board confirmed")
+        )
+        self.capture_calibration_session_button = QPushButton(
+            self.t("Capture Sample")
+        )
+        self.capture_calibration_session_button.clicked.connect(
+            self.capture_calibration_session_sample
+        )
+        self.session_capture_target.currentIndexChanged.connect(
+            self.update_session_capture_controls
+        )
+        capture_primary.addWidget(self.session_capture_target)
+        capture_primary.addWidget(self.capture_calibration_session_button)
+        capture_primary.addStretch(1)
+        capture_board.addWidget(QLabel(self.t("Physical board ID")))
+        capture_board.addWidget(self.session_physical_board_id)
+        capture_board.addWidget(self.session_pair_board_confirmed)
+        capture_board.addStretch(1)
+        capture_layout.addLayout(capture_primary)
+        capture_layout.addLayout(capture_board)
+        root.addWidget(capture_group)
+
+        self.calibration_session_status_table = QTableWidget(0, 6)
+        self.calibration_session_status_table.setHorizontalHeaderLabels(
+            [
+                self.t("Target"),
+                self.t("Accepted"),
+                self.t("Goal"),
+                self.t("Rejected"),
+                self.t("Missing coverage"),
+                self.t("Last rejection"),
+            ]
+        )
+        self.calibration_session_status_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        root.addWidget(self.calibration_session_status_table, 1)
+        self.calibration_session_log = QTextEdit()
+        self.calibration_session_log.setReadOnly(True)
+        self.calibration_session_log.setMaximumHeight(120)
+        root.addWidget(self.calibration_session_log)
+
+        historical = self.calibration_config.get("camera_intrinsics", {})
+        reference_lines = [
+            "Historical intrinsics are reference-only and are not imported "
+            "into this 1920x1080 session."
+        ]
+        for camera in ("front_left", "front", "front_right"):
+            item = historical.get(camera)
+            if item:
+                reference_lines.append(
+                    f"{camera}: {item.get('image_size')}, "
+                    f"images={item.get('image_count')}, "
+                    f"RMS={float(item.get('rms', 0)):.3f}"
+                )
+            else:
+                reference_lines.append(f"{camera}: no historical intrinsics")
+        reference_label = QLabel("\n".join(reference_lines))
+        reference_label.setWordWrap(True)
+        root.addWidget(reference_label)
+
+        self.session_board_type.currentIndexChanged.connect(
+            self.update_session_board_controls
+        )
+        self.update_session_board_controls()
+        self.update_session_capture_controls()
+        if self.calibration_session is not None:
+            self.apply_calibration_session_to_controls(
+                self.calibration_session
+            )
+        self.refresh_calibration_session_status()
+        return page
+
+    def _build_calibration_wizard_page(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        self.wizard_step_title = QLabel()
+        self.wizard_step_title.setStyleSheet(
+            "QLabel { font-size: 16px; font-weight: 700; color: #1f2937; }"
+        )
+        root.addWidget(self.wizard_step_title)
+        self.calibration_wizard_stack = QStackedWidget()
+        self.calibration_wizard_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Ignored,
+        )
+        self.calibration_wizard_stack.setMinimumHeight(440)
+        root.addWidget(self.calibration_wizard_stack, 1)
+
+        prepare_page = QWidget()
+        prepare_layout = QVBoxLayout(prepare_page)
+        prepare_text = QLabel(
+            "开始前请完成以下检查。本步骤只确认现场条件，不会修改相机或运行配置。\n\n"
+            "• 固定三台相机，整个采集过程中不要移动支架。\n"
+            "• 保持 1920×1080，不改焦距、电子防抖或画面裁切。\n"
+            "• 标定板必须平整，避免反光、运动模糊和剧烈光照变化。"
+        )
+        prepare_text.setWordWrap(True)
+        prepare_layout.addWidget(prepare_text)
+        self.wizard_camera_fixed_check = QCheckBox(
+            "三台相机和支架已经固定"
+        )
+        self.wizard_resolution_check = QCheckBox(
+            "已确认三路原始画面均为 1920×1080"
+        )
+        self.wizard_board_ready_check = QCheckBox(
+            "标定板平整、清晰，现场光线稳定"
+        )
+        prepare_layout.addWidget(self.wizard_camera_fixed_check)
+        prepare_layout.addWidget(self.wizard_resolution_check)
+        prepare_layout.addWidget(self.wizard_board_ready_check)
+        prepare_layout.addStretch(1)
+        self.calibration_wizard_stack.addWidget(prepare_page)
+
+        board_page = QWidget()
+        board_layout = QVBoxLayout(board_page)
+        board_intro = QLabel(
+            "请选择实际使用的标定板并填写实测参数。程序不会根据画面猜测尺寸或字典。"
+        )
+        board_intro.setWordWrap(True)
+        board_layout.addWidget(board_intro)
+        self.wizard_board_hint = QLabel(
+            "实验室棋盘默认：总格 12×9，对应内角点 11×8，"
+            "方格边长 25mm。请按实物核对后再确认。"
+        )
+        self.wizard_board_hint.setWordWrap(True)
+        self.wizard_board_hint.setStyleSheet(
+            "QLabel { color: #92400e; padding: 4px; }"
+        )
+        board_layout.addWidget(self.wizard_board_hint)
+        board_form = QFormLayout()
+        self.wizard_board_type = QComboBox()
+        self.wizard_board_type.addItem("Chessboard", "chessboard")
+        self.wizard_board_type.addItem("ArUco Grid", "aruco_grid")
+        self.wizard_board_type.addItem("Charuco", "charuco")
+        self.wizard_board_columns = QSpinBox()
+        self.wizard_board_columns.setRange(2, 40)
+        self.wizard_board_columns.setValue(11)
+        self.wizard_board_rows = QSpinBox()
+        self.wizard_board_rows.setRange(2, 40)
+        self.wizard_board_rows.setValue(8)
+        self.wizard_square_length = QDoubleSpinBox()
+        self.wizard_square_length.setRange(0.1, 1000.0)
+        self.wizard_square_length.setDecimals(3)
+        self.wizard_square_length.setSuffix(" mm")
+        self.wizard_square_length.setValue(25.0)
+        self.wizard_marker_length = QDoubleSpinBox()
+        self.wizard_marker_length.setRange(0.1, 1000.0)
+        self.wizard_marker_length.setDecimals(3)
+        self.wizard_marker_length.setSuffix(" mm")
+        self.wizard_marker_length.setValue(18.0)
+        self.wizard_marker_separation = QDoubleSpinBox()
+        self.wizard_marker_separation.setRange(0.0, 1000.0)
+        self.wizard_marker_separation.setDecimals(3)
+        self.wizard_marker_separation.setSuffix(" mm")
+        self.wizard_marker_separation.setValue(5.0)
+        self.wizard_dictionary = QComboBox()
+        self.wizard_dictionary.addItems(supported_aruco_dictionaries())
+        self.wizard_board_confirmed = QCheckBox(
+            "我已核对标定板类型、行列数、尺寸和字典"
+        )
+        self.wizard_columns_label = QLabel("内角点列数")
+        self.wizard_rows_label = QLabel("内角点行数")
+        self.wizard_square_label = QLabel("方格边长")
+        self.wizard_marker_label = QLabel("Charuco Marker 边长")
+        self.wizard_separation_label = QLabel("Marker 间距")
+        board_form.addRow("标定板类型", self.wizard_board_type)
+        board_form.addRow(
+            self.wizard_columns_label,
+            self.wizard_board_columns,
+        )
+        board_form.addRow(
+            self.wizard_rows_label,
+            self.wizard_board_rows,
+        )
+        board_form.addRow(
+            self.wizard_square_label,
+            self.wizard_square_length,
+        )
+        board_form.addRow(
+            self.wizard_marker_label,
+            self.wizard_marker_length,
+        )
+        board_form.addRow(
+            self.wizard_separation_label,
+            self.wizard_marker_separation,
+        )
+        board_form.addRow("ArUco 字典", self.wizard_dictionary)
+        board_form.addRow(self.wizard_board_confirmed)
+        board_layout.addLayout(board_form)
+        board_actions = QHBoxLayout()
+        self.wizard_create_session_button = QPushButton("创建新采集会话")
+        self.wizard_load_session_button = QPushButton("继续已有会话")
+        self.wizard_create_session_button.clicked.connect(
+            self.wizard_create_session
+        )
+        self.wizard_load_session_button.clicked.connect(
+            self.wizard_load_session
+        )
+        board_actions.addWidget(self.wizard_create_session_button)
+        board_actions.addWidget(self.wizard_load_session_button)
+        board_actions.addStretch(1)
+        board_layout.addLayout(board_actions)
+        self.wizard_session_label = QLabel("尚未创建或加载采集会话")
+        self.wizard_session_label.setWordWrap(True)
+        board_layout.addWidget(self.wizard_session_label)
+        board_layout.addStretch(1)
+        self.wizard_board_type.currentIndexChanged.connect(
+            self.update_wizard_board_controls
+        )
+        self.calibration_wizard_stack.addWidget(board_page)
+
+        intrinsic_page = QWidget()
+        intrinsic_layout = QVBoxLayout(intrinsic_page)
+        intrinsic_intro = QLabel(
+            "按 front_left → front → front_right 的顺序采集。一次只需要一台相机看见板。\n"
+            "这里采集的是“每台相机自己的镜头畸变参数”。"
+            "把板移动到画面中心、四边和四角，同时改变距离和倾斜方向。\n"
+            "若样本被拒绝，请按进度框中的“建议”调整后再次主动采集。"
+        )
+        intrinsic_intro.setWordWrap(True)
+        intrinsic_layout.addWidget(intrinsic_intro)
+        intrinsic_controls = QHBoxLayout()
+        self.wizard_intrinsic_camera = QComboBox()
+        for camera in ("front_left", "front", "front_right"):
+            self.wizard_intrinsic_camera.addItem(camera, camera)
+        self.wizard_capture_intrinsic_button = QPushButton("采集当前相机样本")
+        self.wizard_next_camera_button = QPushButton("下一台相机")
+        self.wizard_capture_intrinsic_button.clicked.connect(
+            self.wizard_capture_intrinsic
+        )
+        self.wizard_next_camera_button.clicked.connect(
+            self.wizard_advance_intrinsic_camera
+        )
+        intrinsic_controls.addWidget(self.wizard_intrinsic_camera)
+        intrinsic_controls.addWidget(self.wizard_capture_intrinsic_button)
+        intrinsic_controls.addWidget(self.wizard_next_camera_button)
+        intrinsic_controls.addStretch(1)
+        intrinsic_layout.addLayout(intrinsic_controls)
+        self.wizard_intrinsic_progress = QTextEdit()
+        self.wizard_intrinsic_progress.setReadOnly(True)
+        intrinsic_layout.addWidget(self.wizard_intrinsic_progress, 1)
+        self.calibration_wizard_stack.addWidget(intrinsic_page)
+
+        pair_page = QWidget()
+        pair_layout = QVBoxLayout(pair_page)
+        pair_intro = QLabel(
+            "先采 front_left ↔ front，再采 front ↔ front_right。\n"
+            "Pair 用于求出“相邻两台相机之间的位置和朝向关系”。"
+            "每次必须让同一块物理标定板同时出现在所选两路中。两个 pair "
+            "可以使用不同标定板，也不要求两块板之间位置固定。\n"
+            "采集前让板停稳约 1 秒，并覆盖重叠区域的不同位置、距离和倾角。"
+        )
+        pair_intro.setWordWrap(True)
+        pair_layout.addWidget(pair_intro)
+        pair_controls = QHBoxLayout()
+        self.wizard_pair = QComboBox()
+        self.wizard_pair.addItem(
+            "front_left ↔ front",
+            "front_left__front",
+        )
+        self.wizard_pair.addItem(
+            "front ↔ front_right",
+            "front__front_right",
+        )
+        self.wizard_pair.currentIndexChanged.connect(
+            self.wizard_inspect_pair_if_visible
+        )
+        self.wizard_pair_board_id = QLineEdit("board_1")
+        self.wizard_pair_board_confirmed = QCheckBox(
+            "确认两路看到的是同一块物理板"
+        )
+        pair_controls.addWidget(self.wizard_pair)
+        pair_controls.addWidget(QLabel("标定板编号"))
+        pair_controls.addWidget(self.wizard_pair_board_id)
+        pair_controls.addWidget(self.wizard_pair_board_confirmed)
+        pair_layout.addLayout(pair_controls)
+        pair_actions = QHBoxLayout()
+        self.wizard_inspect_pair_button = QPushButton(
+            self.t("Check Current Pair")
+        )
+        self.wizard_capture_pair_button = QPushButton("保存这组 Pair 样本")
+        self.wizard_next_pair_button = QPushButton("下一个 Pair")
+        self.wizard_inspect_pair_button.clicked.connect(
+            self.wizard_inspect_pair
+        )
+        self.wizard_capture_pair_button.clicked.connect(
+            self.wizard_capture_pair
+        )
+        self.wizard_next_pair_button.clicked.connect(
+            self.wizard_advance_pair
+        )
+        pair_actions.addWidget(self.wizard_inspect_pair_button)
+        pair_actions.addWidget(self.wizard_capture_pair_button)
+        pair_actions.addWidget(self.wizard_next_pair_button)
+        pair_actions.addStretch(1)
+        pair_layout.addLayout(pair_actions)
+        self.wizard_pair_detection_status = QLabel(
+            "尚未检查当前两路画面。检查不会保存图片。"
+        )
+        self.wizard_pair_detection_status.setWordWrap(True)
+        pair_layout.addWidget(self.wizard_pair_detection_status)
+        self.wizard_pair_progress = QTextEdit()
+        self.wizard_pair_progress.setReadOnly(True)
+        pair_layout.addWidget(self.wizard_pair_progress, 1)
+        self.calibration_wizard_stack.addWidget(pair_page)
+
+        review_page = QWidget()
+        review_layout = QVBoxLayout(review_page)
+        self.wizard_readiness_label = QLabel()
+        self.wizard_readiness_label.setWordWrap(True)
+        self.wizard_readiness_label.setStyleSheet(
+            "QLabel { font-size: 16px; font-weight: 700; padding: 8px; }"
+        )
+        review_layout.addWidget(self.wizard_readiness_label)
+        self.wizard_b2_mode_label = QLabel()
+        self.wizard_b2_mode_label.setWordWrap(True)
+        review_layout.addWidget(self.wizard_b2_mode_label)
+        self.wizard_review_summary = QTextEdit()
+        self.wizard_review_summary.setReadOnly(True)
+        review_layout.addWidget(self.wizard_review_summary, 1)
+        self.wizard_details_group = QGroupBox("详细信息")
+        self.wizard_details_group.setCheckable(True)
+        self.wizard_details_group.setChecked(False)
+        details_layout = QVBoxLayout(self.wizard_details_group)
+        self.wizard_details_text = QTextEdit()
+        self.wizard_details_text.setReadOnly(True)
+        self.wizard_details_text.setVisible(False)
+        self.wizard_details_group.toggled.connect(
+            self.wizard_details_text.setVisible
+        )
+        details_layout.addWidget(self.wizard_details_text)
+        review_layout.addWidget(self.wizard_details_group)
+        note = QLabel(
+            "本阶段只确认样本是否足够。B-2 将读取本 session 生成候选标定，"
+            "当前不会修改正式拼接参数。"
+        )
+        note.setWordWrap(True)
+        review_layout.addWidget(note)
+        self.calibration_wizard_stack.addWidget(review_page)
+
+        navigation = QHBoxLayout()
+        self.wizard_back_button = QPushButton(self.t("Previous"))
+        self.wizard_next_button = QPushButton(self.t("Next"))
+        self.wizard_back_button.clicked.connect(self.wizard_previous_step)
+        self.wizard_next_button.clicked.connect(self.wizard_next_step)
+        navigation.addStretch(1)
+        navigation.addWidget(self.wizard_back_button)
+        navigation.addWidget(self.wizard_next_button)
+        root.addLayout(navigation)
+
+        self.update_wizard_board_controls()
+        self.set_calibration_wizard_step(0)
+        self.refresh_calibration_wizard()
         return page
 
     def set_preview_layout_mode(
@@ -1252,6 +2786,28 @@ class MainWindow(QMainWindow):
         ):
             self.set_preview_layout_mode(PreviewLayoutMode.GRID)
 
+    def on_calibration_tab_changed(self, index: int) -> None:
+        if hasattr(self, "calibration_legacy_header"):
+            self.calibration_legacy_header.setVisible(index != 0)
+        if hasattr(self, "calibration_tabs"):
+            self.calibration_tabs.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                (
+                    QSizePolicy.Policy.Ignored
+                    if index == 0
+                    else QSizePolicy.Policy.Preferred
+                ),
+            )
+            self.calibration_tabs.setMinimumHeight(
+                520 if index == 0 else 0
+            )
+            self.calibration_tabs.setMaximumHeight(
+                560 if index == 0 else 16777215
+            )
+            self.calibration_tabs.updateGeometry()
+        if hasattr(self, "calibration_scroll_area"):
+            self.calibration_scroll_area.verticalScrollBar().setValue(0)
+
     def camera_display_name(self, camera_id: str) -> str:
         row = self.camera_rows.get(camera_id)
         if row is not None:
@@ -1276,12 +2832,232 @@ class MainWindow(QMainWindow):
             return self.t("Stitched View")
         return self.t("Multi-camera monitoring")
 
+    def current_candidate_metadata(self) -> dict[str, Any]:
+        path = self.live_candidate_directory
+        if path is None:
+            self._candidate_ui_cache_path = None
+            self._candidate_ui_cache = {}
+            return {}
+        resolved = Path(path)
+        if self._candidate_ui_cache_path == resolved:
+            return self._candidate_ui_cache
+        try:
+            candidate, _report = load_calibration_candidate(resolved)
+        except Exception:
+            candidate = {}
+        self._candidate_ui_cache_path = resolved
+        self._candidate_ui_cache = candidate
+        return candidate
+
+    def calibration_candidate_state(self) -> str:
+        if self.live_stitch_mode != "candidate":
+            origin = self.current_stitch_profile().get(
+                "calibration_origin",
+                {},
+            )
+            if any(
+                "initial_template" in str(value)
+                for value in origin.values()
+            ):
+                return "initial_template"
+            return "applied"
+        if self.live_candidate_directory is None:
+            return "none"
+        candidate = self.current_candidate_metadata()
+        if candidate.get("applied"):
+            return "applied"
+        if candidate.get("recommended"):
+            return "recommended"
+        if candidate.get("experimental", True):
+            return "experimental"
+        return "none"
+
+    def preview_warning_messages(self) -> list[str]:
+        warnings: list[str] = []
+        if self.source_contract_log_messages:
+            warnings.append("source 坐标存在警告，请查看日志和拓扑诊断")
+        seam_errors = validate_overlap_seams(self.current_stitch_profile())
+        if seam_errors:
+            warnings.append("当前 profile 的 overlap/seam 校验未通过")
+        if self.last_stitch_ui_error:
+            warnings.append(f"最近一次拼接失败：{self.last_stitch_ui_error}")
+        candidate = self.current_candidate_metadata()
+        if self.calibration_candidate_state() == "experimental":
+            warnings.append("当前候选为 experimental，仅供诊断")
+        readiness = candidate.get("readiness", {})
+        quality_issues = readiness.get("quality_issues", [])
+        if quality_issues:
+            warnings.append(f"候选仍有 {len(quality_issues)} 项采样质量风险")
+        panorama = candidate.get("virtual_panorama") or {}
+        if (
+            self.live_stitch_mode == "candidate"
+            and "rotation_only" in str(panorama.get("projection", ""))
+        ):
+            warnings.append("三台相机非共光心：远景优先，近景可能重影")
+        if self.calibration_session is not None:
+            readiness = self.calibration_session.readiness()
+            if readiness["blocking_reasons"]:
+                warnings.append("当前采集 session 尚未满足 B-2 最低门槛")
+            elif readiness["quality_issues"]:
+                warnings.append("当前采集 session 的 Pair/姿态覆盖仍需补充")
+        return list(dict.fromkeys(warnings))
+
+    def stitched_view_notice_text(self) -> str:
+        if self.preview_content_mode == PreviewContentMode.STOPPED:
+            return "实时预览已停止。当前布局偏好已保留，启动后才会继续刷新。"
+        if self.preview_content_mode == PreviewContentMode.STILL:
+            return "静态拼接画面：用于检查图片，不代表实时流状态。"
+        if self.live_stitch_mode == "candidate":
+            return (
+                "实验性候选（rotation-only）：远景优先，近景可能重影。"
+                "检查近处人物或物体时，建议切换到多路视图或单路查看。"
+            )
+        return (
+            "初始模板拼接：当前结果不是已正式应用的候选标定。"
+            "近景目标建议切换到多路视图或单路查看。"
+        )
+
+    def update_preview_status_summary(self) -> None:
+        if not hasattr(self, "preview_status_summary"):
+            return
+        active_keys = self.active_camera_keys()[:4]
+        status_counts = {
+            STREAM_LIVE: 0,
+            STREAM_CONNECTING: 0,
+            STREAM_FAILED: 0,
+            STREAM_STOPPING: 0,
+            STREAM_STOPPED: 0,
+        }
+        for key in active_keys:
+            snapshot = self.stream_snapshots.get(key)
+            status = snapshot.status if snapshot is not None else STREAM_STOPPED
+            if self.preview_content_mode == PreviewContentMode.STOPPED:
+                status = STREAM_STOPPED
+            status_counts[status] = status_counts.get(status, 0) + 1
+        topology = str(
+            self.calibration_config.get("stitch_topology", "未设置")
+        )
+        layout = {
+            PreviewLayoutMode.GRID: "Grid",
+            PreviewLayoutMode.FOCUS: (
+                f"Focus({self.focused_camera_id or '-'})"
+            ),
+            PreviewLayoutMode.STITCHED: "Stitched",
+        }[self.preview_layout_mode]
+        content = {
+            PreviewContentMode.STOPPED: "Stopped",
+            PreviewContentMode.LIVE: "Live",
+            PreviewContentMode.STILL: "Still",
+        }[self.preview_content_mode]
+        warnings = self.preview_warning_messages()
+        summary = (
+            f"Topology: {topology}  |  相机: {len(active_keys)} 路 "
+            f"(Live {status_counts[STREAM_LIVE]} / "
+            f"Connecting {status_counts[STREAM_CONNECTING]} / "
+            f"Failed {status_counts[STREAM_FAILED]} / "
+            f"Stopped {status_counts[STREAM_STOPPED]})  |  "
+            f"布局: {layout}  |  内容: {content}  |  "
+            f"标定状态: {self.calibration_candidate_state()}"
+        )
+        if warnings:
+            summary += f"  |  警告: {len(warnings)} 项"
+        else:
+            summary += "  |  警告: 无"
+        self.preview_status_summary.setText(summary)
+        self.preview_status_summary.setToolTip("\n".join(warnings))
+        self.preview_status_summary.setStyleSheet(
+            "QLabel { color: #7c2d12; background: #fff7ed; "
+            "border: 1px solid #fdba74; padding: 5px 8px; }"
+            if warnings
+            else
+            "QLabel { color: #334155; background: #f8fafc; "
+            "border: 1px solid #cbd5e1; padding: 5px 8px; }"
+        )
+
     def canvas_status_text(self) -> str:
         if self.preview_content_mode == PreviewContentMode.LIVE:
+            if self.live_stitch_mode == "candidate":
+                return self.t("Experimental candidate live view")
             return self.t("Live stitched view")
         if self.preview_content_mode == PreviewContentMode.STILL:
             return self.t("Static stitched view")
         return self.t("Live preview stopped")
+
+    def apply_live_stitch_mode_controls(self) -> None:
+        if not hasattr(self, "candidate_stitch_button"):
+            return
+        candidate_available = self.live_candidate_directory is not None
+        if self.live_stitch_mode == "candidate" and not candidate_available:
+            self.live_stitch_mode = "template"
+        self.candidate_stitch_button.blockSignals(True)
+        self.template_stitch_button.blockSignals(True)
+        self.candidate_stitch_button.setEnabled(candidate_available)
+        self.candidate_stitch_button.setToolTip(
+            (
+                "实验性候选，仅供实时诊断；不会写入正式 calibration.yaml。"
+                if candidate_available
+                else "当前 topology 没有可用候选，请先完成采样和 B-2 候选求解。"
+            )
+        )
+        self.template_stitch_button.setToolTip(
+            "初始模板/正式 profile 的当前几何配置；不代表候选标定已应用。"
+        )
+        self.candidate_stitch_button.setChecked(
+            self.live_stitch_mode == "candidate"
+        )
+        self.template_stitch_button.setChecked(
+            self.live_stitch_mode == "template"
+        )
+        self.candidate_stitch_button.blockSignals(False)
+        self.template_stitch_button.blockSignals(False)
+        if self.live_stitch_mode == "candidate":
+            self.stitch_strategy_label.setText(
+                self.t("Experimental candidate live view")
+            )
+            self.stitch_strategy_label.setToolTip(
+                str(self.live_candidate_directory)
+            )
+        else:
+            self.stitch_strategy_label.setText(
+                self.t("Template stitching")
+            )
+            self.stitch_strategy_label.setToolTip("")
+
+    def set_live_stitch_mode(self, mode: str) -> None:
+        if mode not in {"candidate", "template"}:
+            raise ValueError(f"Unknown live stitch mode: {mode}")
+        if mode == "candidate" and self.live_candidate_directory is None:
+            QMessageBox.information(
+                self,
+                self.t("Stitched View"),
+                "当前没有可用的三路候选标定。\n\n"
+                "可能原因：尚未完成采样、B-2 求解失败，或候选与当前 "
+                "topology 不匹配。\n"
+                "下一步：使用初始模板查看画面，或到“标定向导”检查进度。",
+            )
+            self.apply_live_stitch_mode_controls()
+            return
+        if mode == self.live_stitch_mode:
+            self.apply_live_stitch_mode_controls()
+            return
+        self.live_stitch_mode = mode
+        self.apply_live_stitch_mode_controls()
+        self.log(
+            "Live stitch strategy changed: "
+            f"mode={mode}, candidate={self.live_candidate_directory}"
+        )
+        if self.preview_content_mode != PreviewContentMode.LIVE:
+            self.apply_preview_view_state()
+            return
+        self.bump_preview_session()
+        self.configure_live_stitch_processor()
+        self.warped.clear()
+        self.canvas = None
+        self.canvas_view.set_placeholder(self.canvas_status_text())
+        for view in self.warped_views.values():
+            view.set_placeholder(self.canvas_status_text())
+        self.last_process_time = 0.0
+        self.apply_preview_view_state()
 
     def apply_preview_view_state(self) -> None:
         if self._applying_view_state or not hasattr(self, "preview_splitter"):
@@ -1332,7 +3108,13 @@ class MainWindow(QMainWindow):
             self.stitched_view_button.setChecked(is_stitched)
             self.back_to_grid_button.setVisible(is_focus)
             self.preview_mode_label.setText(self.preview_mode_text())
+            self.apply_live_stitch_mode_controls()
             self.canvas_view.set_overlay(self.canvas_status_text())
+            self.stitched_view_notice.setVisible(is_stitched)
+            self.stitched_view_notice.setText(
+                self.stitched_view_notice_text()
+            )
+            self.update_preview_status_summary()
 
             if is_focus:
                 self.preview_splitter.setSizes([1, 0])
@@ -1480,6 +3262,12 @@ class MainWindow(QMainWindow):
         self.frame_counts.clear()
         self.stream_error_log_counts.clear()
         self.stream_manager.start(self.live_stream_configs())
+        self.log(
+            "Starting live preview: "
+            f"topology={self.calibration_config.get('stitch_topology', '')}, "
+            f"cameras={self.active_camera_keys()}, "
+            f"stitch_mode={self.live_stitch_mode}"
+        )
         self.stream_snapshots = self.stream_manager.snapshots(include_frames=False)
         for key, snapshot in self.stream_snapshots.items():
             if snapshot.status == STREAM_FAILED:
@@ -1548,6 +3336,7 @@ class MainWindow(QMainWindow):
                     self.stream_error_log_counts[key] = snapshot.failed_read_count
             if latest_frames:
                 self.frames.update(latest_frames)
+                self.log_source_coordinate_warnings(latest_frames)
 
             signature = self.frame_signature(snapshots)
             has_new_frames = bool(signature) and signature != self.last_frame_signature
@@ -1590,7 +3379,8 @@ class MainWindow(QMainWindow):
             display_name = self.camera_display_name(key)
             if self.preview_content_mode == PreviewContentMode.STOPPED:
                 view.set_placeholder(
-                    f"{display_name}\n{self.t('Live preview stopped')}"
+                    f"{display_name}\n{self.t('Live preview stopped')}\n"
+                    "下一步：点击“开始实时预览”连接已启用相机。"
                 )
                 continue
             if self.preview_content_mode == PreviewContentMode.STILL:
@@ -1605,7 +3395,9 @@ class MainWindow(QMainWindow):
             if snapshot is not None:
                 if snapshot.status == STREAM_CONNECTING:
                     view.set_placeholder(
-                        f"{display_name}\n{self.t('Connecting')}"
+                        f"{display_name}\n正在连接视频流\n"
+                        "可能原因：RTSP 正在握手或设备响应较慢。\n"
+                        "下一步：稍候；若长时间不变，请检查地址、网络和设备。"
                     )
                     continue
                 if snapshot.status == STREAM_FAILED:
@@ -1614,6 +3406,8 @@ class MainWindow(QMainWindow):
                         display_name,
                         self.t("Video stream unavailable"),
                         self.t("Last error: {error}", error=error),
+                        "可能原因：地址错误、网络中断、设备离线或认证失败。",
+                        "下一步：检查相机配置和网络；其他正常相机可继续使用。",
                     ]
                     if (
                         self.preview_layout_mode == PreviewLayoutMode.FOCUS
@@ -1628,7 +3422,10 @@ class MainWindow(QMainWindow):
                 view.set_image(self.frames[key], display_name)
             else:
                 status = self.t(snapshot.status) if snapshot is not None else self.t("No frame")
-                view.set_placeholder(f"{display_name}\n{status}")
+                view.set_placeholder(
+                    f"{display_name}\n{status}\n"
+                    "下一步：确认该相机已启用且输入源可用。"
+                )
 
     def should_render_canvas(self) -> bool:
         if not hasattr(self, "preview_tabs"):
@@ -1684,11 +3481,21 @@ class MainWindow(QMainWindow):
         self.displayed_stitch_result_id = result.result_id
         self.last_stitch_ms = result.elapsed_ms
         if result.error:
+            self.last_stitch_ui_error = str(result.error).splitlines()[0][:220]
             if result.result_id != self.last_stitch_error_result_id:
                 self.last_stitch_error_result_id = result.result_id
-                self.log(f"Stitch failed: {result.error}")
+                self.log(f"Stitch failed: {result.error}", level="ERROR")
+            if self.should_render_canvas():
+                self.canvas_view.set_placeholder(
+                    "拼接结果暂不可用\n"
+                    f"发生了什么：{self.last_stitch_ui_error}\n"
+                    "下一步：检查状态摘要、日志和 topology/profile；"
+                    "可先切换 Grid 或 Focus 检查各路原始画面。"
+                )
+            self.update_preview_status_summary()
             return
 
+        self.last_stitch_ui_error = ""
         self.warped = result.warped
         self.canvas = result.canvas
         self.refresh_warped_views()
@@ -1708,6 +3515,7 @@ class MainWindow(QMainWindow):
         if not self.frames:
             QMessageBox.warning(self, self.t("No images"), self.t("No matching camera images were found."))
             return
+        self.log_source_coordinate_warnings(self.frames)
 
         try:
             self.warped, self.canvas = self.stitcher.process(self.frames)
@@ -1762,6 +3570,7 @@ class MainWindow(QMainWindow):
             ]
             for column, value in enumerate(values):
                 self.health_table.setItem(row_index, column, QTableWidgetItem(value))
+        self.update_preview_status_summary()
 
     def save_results(self) -> None:
         if self.canvas is None:
@@ -1832,6 +3641,10 @@ class MainWindow(QMainWindow):
         return True
 
     def show_config_conflict(self) -> None:
+        self.log(
+            "Configuration changed on disk; refusing stale save.",
+            level="ERROR",
+        )
         QMessageBox.warning(
             self,
             self.t("Configuration changed on disk"),
@@ -1861,6 +3674,8 @@ class MainWindow(QMainWindow):
         self.stitcher = self.create_stitcher()
         self.bump_preview_session()
         self.configure_live_stitch_processor()
+        self.refresh_seam_editor()
+        self.update_topology_diagnostics()
         self.statusBar().showMessage(self.t("Saved configs to {path}", path=CONFIG_DIR))
 
     def closeEvent(self, event) -> None:  # noqa: N802
@@ -1882,6 +3697,19 @@ class MainWindow(QMainWindow):
         self._calibration_config_revision = config_revision("calibration.yaml")
         self._camera_config_revision = config_revision("cameras.yaml")
         self.performance_config = self.camera_config.get("performance", {})
+        self.live_candidate_directory = latest_calibration_candidate(
+            topology=str(
+                self.calibration_config.get(
+                    "stitch_topology",
+                    "triple_front_panorama",
+                )
+            )
+        )
+        self._candidate_ui_cache_path = None
+        self._candidate_ui_cache = {}
+        if self.live_candidate_directory is None:
+            self.live_stitch_mode = "template"
+        self.apply_live_stitch_mode_controls()
         self.sync_camera_config_widgets()
         self.stitcher = self.create_stitcher()
         self.bump_preview_session()
@@ -1890,6 +3718,7 @@ class MainWindow(QMainWindow):
         self.populate_seam_table()
         self.refresh_seam_editor()
         self.update_topology_diagnostics()
+        self.refresh_pairwise_pair_choices()
 
     def sync_camera_config_widgets(self) -> None:
         if not self.camera_rows:
@@ -2011,6 +3840,9 @@ class MainWindow(QMainWindow):
         self.calibration_image = image
         self.calibration_image_view.set_editor_image(image)
         self.calibration_image_view.set_points(self.current_source_points())
+        self.log_source_coordinate_warnings(
+            {self.calibration_camera.currentText(): image}
+        )
         self.log(f"Loaded calibration image: {path}")
 
     def detect_chessboard(self) -> None:
@@ -2026,6 +3858,13 @@ class MainWindow(QMainWindow):
             f"Chessboard detection: {'OK' if ok else 'FAILED'}; "
             f"inner pattern={spec.inner_columns}x{spec.inner_rows}; corners={count}; square={spec.square_size_mm}mm"
         )
+        if not ok:
+            self.log(
+                "标定板检测失败：未找到完整内角点。可能原因是板被遮挡、"
+                "画面模糊、反光，或行列参数与实物不一致。"
+                "下一步：停稳标定板、保证整板清晰可见，并核对 11×8 内角点。",
+                level="WARNING",
+            )
 
     def calibrate_from_folder(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "Choose calibration image folder", str(PROJECT_ROOT))
@@ -2122,6 +3961,11 @@ class MainWindow(QMainWindow):
                 self.point_table.setItem(row, column, item)
         self._updating_point_table = False
         if hasattr(self, "calibration_image_view"):
+            profile = self.current_stitch_profile()
+            self.calibration_image_view.set_source_coordinate_contract(
+                str(profile.get("source_coordinate_space", "")),
+                profile.get("source_reference_size"),
+            )
             self.calibration_image_view.set_points(source_points)
 
     def current_source_points(self) -> list[list[float]]:
@@ -2177,6 +4021,22 @@ class MainWindow(QMainWindow):
         origin = self.current_stitch_profile().setdefault("calibration_origin", {})
         origin["source_points"] = "field_adjusted"
         origin["target_points"] = "field_adjusted"
+        actual_size = None
+        if self.calibration_image is not None:
+            actual_size = (
+                int(self.calibration_image.shape[1]),
+                int(self.calibration_image.shape[0]),
+            )
+        diagnostics = source_coordinate_diagnostics(
+            self.current_stitch_profile(),
+            camera_key,
+            actual_size,
+        )
+        for warning in diagnostics["warnings"]:
+            self.log(
+                f"Source coordinate warning: {warning}",
+                level="WARNING",
+            )
         if not self.persist_calibration_config():
             return
         self.stitcher = self.create_stitcher()
@@ -2244,6 +4104,12 @@ class MainWindow(QMainWindow):
             f"Camera order: {' -> '.join(diagnostics.get('camera_order', []))}",
             f"Canvas: {canvas.get('width', 0)} x {canvas.get('height', 0)}",
             (
+                "Source contract: "
+                f"{diagnostics.get('source_coordinate_space', '')}, "
+                f"reference={diagnostics.get('source_reference_size')}, "
+                f"version={diagnostics.get('source_contract_version')}"
+            ),
+            (
                 "Point origin: "
                 f"source={origin.get('source_points', 'unmarked')}, "
                 f"target={origin.get('target_points', 'unmarked')}"
@@ -2272,7 +4138,1340 @@ class MainWindow(QMainWindow):
                 f"X={range_text}, seam={overlap.get('seam', '')} "
                 f"@ X={seam_text}, feather={feather}"
             )
+        validation_errors = validate_overlap_seams(
+            self.current_stitch_profile()
+        )
+        if validation_errors:
+            lines.append("Validation: INVALID")
+            lines.extend(f"- {error}" for error in validation_errors)
+            self.topology_diagnostics_label.setStyleSheet(
+                "QLabel { color: #b91c1c; }"
+            )
+        else:
+            lines.append("Validation: OK")
+            self.topology_diagnostics_label.setStyleSheet(
+                "QLabel { color: #166534; }"
+            )
         self.topology_diagnostics_label.setText("\n".join(lines))
+
+    def update_session_board_controls(self) -> None:
+        if not hasattr(self, "session_board_type"):
+            return
+        board_type = str(self.session_board_type.currentData())
+        is_chessboard = board_type == "chessboard"
+        is_aruco = board_type == "aruco_grid"
+        self.session_columns_label.setText(
+            self.t("Inner corner columns")
+            if is_chessboard
+            else self.t("Marker columns")
+            if is_aruco
+            else self.t("Charuco squares X")
+        )
+        self.session_rows_label.setText(
+            self.t("Inner corner rows")
+            if is_chessboard
+            else self.t("Marker rows")
+            if is_aruco
+            else self.t("Charuco squares Y")
+        )
+        self.session_square_label.setText(
+            self.t("Square size")
+            if is_chessboard
+            else self.t("Marker length")
+            if is_aruco
+            else self.t("Charuco square length")
+        )
+        self.session_marker_label.setText(
+            self.t("Charuco marker length")
+        )
+        self.session_marker_length.setEnabled(board_type == "charuco")
+        self.session_marker_label.setEnabled(board_type == "charuco")
+        self.session_marker_separation.setEnabled(is_aruco)
+        self.session_separation_label.setEnabled(is_aruco)
+        self.session_dictionary.setEnabled(not is_chessboard)
+
+    def update_wizard_board_controls(self) -> None:
+        if not hasattr(self, "wizard_board_type"):
+            return
+        board_type = str(self.wizard_board_type.currentData())
+        is_chessboard = board_type == "chessboard"
+        is_aruco = board_type == "aruco_grid"
+        self.wizard_columns_label.setText(
+            "内角点列数"
+            if is_chessboard
+            else "Marker 列数"
+            if is_aruco
+            else "Charuco 方格列数"
+        )
+        self.wizard_rows_label.setText(
+            "内角点行数"
+            if is_chessboard
+            else "Marker 行数"
+            if is_aruco
+            else "Charuco 方格行数"
+        )
+        self.wizard_square_label.setText(
+            "方格边长"
+            if is_chessboard
+            else "Marker 边长"
+            if is_aruco
+            else "Charuco 方格边长"
+        )
+        self.wizard_marker_length.setEnabled(board_type == "charuco")
+        self.wizard_marker_label.setEnabled(board_type == "charuco")
+        self.wizard_marker_separation.setEnabled(is_aruco)
+        self.wizard_separation_label.setEnabled(is_aruco)
+        self.wizard_dictionary.setEnabled(not is_chessboard)
+        self.wizard_board_hint.setText(
+            "实验室棋盘默认：总格 12×9，对应内角点 11×8，"
+            "方格边长 25mm。请按实物核对后再确认。"
+            if is_chessboard
+            else "请按标定板实物填写行列、物理尺寸和字典；"
+            "程序不会自动猜测这些参数。"
+        )
+
+    def sync_wizard_board_to_session_controls(self) -> None:
+        board_type = str(self.wizard_board_type.currentData())
+        index = self.session_board_type.findData(board_type)
+        if index >= 0:
+            self.session_board_type.setCurrentIndex(index)
+        self.session_board_columns.setValue(
+            self.wizard_board_columns.value()
+        )
+        self.session_board_rows.setValue(self.wizard_board_rows.value())
+        self.session_square_length.setValue(
+            self.wizard_square_length.value()
+        )
+        self.session_marker_length.setValue(
+            self.wizard_marker_length.value()
+        )
+        self.session_marker_separation.setValue(
+            self.wizard_marker_separation.value()
+        )
+        dictionary_index = self.session_dictionary.findText(
+            self.wizard_dictionary.currentText()
+        )
+        if dictionary_index >= 0:
+            self.session_dictionary.setCurrentIndex(dictionary_index)
+        self.session_board_confirmed.setChecked(
+            self.wizard_board_confirmed.isChecked()
+        )
+
+    def sync_session_to_wizard_controls(
+        self,
+        session: CalibrationSession,
+    ) -> None:
+        if not hasattr(self, "wizard_board_type"):
+            return
+        definition = session.data["board_definition"]
+        index = self.wizard_board_type.findData(definition["type"])
+        if index >= 0:
+            self.wizard_board_type.setCurrentIndex(index)
+        if definition["type"] == "chessboard":
+            columns = definition["inner_columns"]
+            rows = definition["inner_rows"]
+            square = definition["square_size_mm"]
+        elif definition["type"] == "aruco_grid":
+            columns = definition["markers_x"]
+            rows = definition["markers_y"]
+            square = definition["marker_length_mm"]
+            self.wizard_marker_separation.setValue(
+                float(definition["marker_separation_mm"])
+            )
+        else:
+            columns = definition["squares_x"]
+            rows = definition["squares_y"]
+            square = definition["square_length_mm"]
+            self.wizard_marker_length.setValue(
+                float(definition["marker_length_mm"])
+            )
+        self.wizard_board_columns.setValue(int(columns))
+        self.wizard_board_rows.setValue(int(rows))
+        self.wizard_square_length.setValue(float(square))
+        dictionary = definition.get("dictionary")
+        if dictionary:
+            dictionary_index = self.wizard_dictionary.findText(
+                str(dictionary)
+            )
+            if dictionary_index >= 0:
+                self.wizard_dictionary.setCurrentIndex(dictionary_index)
+        self.wizard_board_confirmed.setChecked(
+            bool(session.data.get("board_confirmed"))
+        )
+        self.wizard_session_label.setText(
+            f"当前 session：{session.directory}\n"
+            "已加载已有进度；继续采集不会覆盖旧样本。"
+        )
+        self.update_wizard_board_controls()
+
+    def wizard_create_session(self) -> None:
+        if not self.wizard_board_confirmed.isChecked():
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请先核对并确认标定板参数。",
+            )
+            return
+        self.sync_wizard_board_to_session_controls()
+        if not self.create_calibration_sample_session():
+            return
+        self.sync_session_to_wizard_controls(self.calibration_session)
+        self.set_calibration_wizard_step(2)
+        self.refresh_calibration_wizard()
+
+    def wizard_load_session(self) -> None:
+        if not self.load_calibration_sample_session():
+            return
+        self.sync_session_to_wizard_controls(self.calibration_session)
+        self.resume_calibration_wizard()
+
+    def set_calibration_wizard_step(self, index: int) -> None:
+        if not hasattr(self, "calibration_wizard_stack"):
+            return
+        index = min(4, max(0, int(index)))
+        self.calibration_wizard_stack.setCurrentIndex(index)
+        titles = (
+            "步骤 1/5：准备设备",
+            "步骤 2/5：确认标定板",
+            "步骤 3/5：采集单相机画面",
+            "步骤 4/5：采集相邻相机 Pair",
+            "步骤 5/5：检查与下一步",
+        )
+        self.wizard_step_title.setText(titles[index])
+        self.wizard_back_button.setEnabled(index > 0)
+        self.wizard_next_button.setEnabled(index < 4)
+        self.wizard_next_button.setText(self.t("Next"))
+        self.refresh_calibration_wizard()
+        if index == 3 and self.calibration_session is not None:
+            QTimer.singleShot(0, self.wizard_inspect_pair_if_visible)
+
+    def wizard_previous_step(self) -> None:
+        self.set_calibration_wizard_step(
+            self.calibration_wizard_stack.currentIndex() - 1
+        )
+
+    def wizard_next_step(self) -> None:
+        step = self.calibration_wizard_stack.currentIndex()
+        if step == 4:
+            self.request_b2_candidate_solve()
+            return
+        if step == 0 and not all(
+            checkbox.isChecked()
+            for checkbox in (
+                self.wizard_camera_fixed_check,
+                self.wizard_resolution_check,
+                self.wizard_board_ready_check,
+            )
+        ):
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请完成并勾选三项现场准备检查。",
+            )
+            return
+        if step == 1 and (
+            self.calibration_session is None
+            or not self.calibration_session.data.get("board_confirmed")
+        ):
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请确认标定板参数并创建或加载 session。",
+            )
+            return
+        if step == 2 and not self._wizard_intrinsics_minimum_met():
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "三台相机都达到至少 20 张合格样本后，才能进入 Pair 采集。",
+            )
+            return
+        if step == 3 and not self._wizard_pairs_minimum_met():
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "两个 Pair 都达到至少 15 组合格样本后，才能进入最终检查。",
+            )
+            return
+        self.set_calibration_wizard_step(step + 1)
+
+    def resume_calibration_wizard(self) -> None:
+        if self.calibration_session is None:
+            self.set_calibration_wizard_step(1)
+        elif not self._wizard_intrinsics_minimum_met():
+            self.set_calibration_wizard_step(2)
+        elif not self._wizard_pairs_minimum_met():
+            self.set_calibration_wizard_step(3)
+        else:
+            self.set_calibration_wizard_step(4)
+
+    def _wizard_intrinsics_minimum_met(self) -> bool:
+        if self.calibration_session is None:
+            return False
+        summary = self.calibration_session.summary()["intrinsics"]
+        return all(
+            summary[camera]["accepted"] >= MINIMUM_INTRINSIC_SAMPLES
+            for camera in ("front_left", "front", "front_right")
+        )
+
+    def _wizard_pairs_minimum_met(self) -> bool:
+        if self.calibration_session is None:
+            return False
+        summary = self.calibration_session.summary()["stereo_pairs"]
+        return all(
+            summary[pair]["accepted"] >= MINIMUM_PAIR_SAMPLES
+            for pair in ("front_left__front", "front__front_right")
+        )
+
+    def _first_incomplete_intrinsic_index(self) -> int | None:
+        if self.calibration_session is None:
+            return 0
+        summary = self.calibration_session.summary()["intrinsics"]
+        for index, camera in enumerate(
+            ("front_left", "front", "front_right")
+        ):
+            if summary[camera]["accepted"] < MINIMUM_INTRINSIC_SAMPLES:
+                return index
+        return None
+
+    def _first_incomplete_pair_index(self) -> int | None:
+        if self.calibration_session is None:
+            return 0
+        summary = self.calibration_session.summary()["stereo_pairs"]
+        for index, pair in enumerate(
+            ("front_left__front", "front__front_right")
+        ):
+            if summary[pair]["accepted"] < MINIMUM_PAIR_SAMPLES:
+                return index
+        return None
+
+    def wizard_capture_intrinsic(self) -> None:
+        if self.calibration_session is None:
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请先创建或加载 session。",
+            )
+            return
+        selected_index = self.wizard_intrinsic_camera.currentIndex()
+        first_incomplete = self._first_incomplete_intrinsic_index()
+        if (
+            first_incomplete is not None
+            and selected_index > first_incomplete
+        ):
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请先完成前一台相机的 20 张最低样本。",
+            )
+            return
+        camera = str(self.wizard_intrinsic_camera.currentData())
+        index = self.session_capture_target.findData(
+            f"intrinsic:{camera}"
+        )
+        if index >= 0:
+            self.session_capture_target.setCurrentIndex(index)
+        self.capture_calibration_session_sample()
+        self.refresh_calibration_wizard()
+
+    def wizard_advance_intrinsic_camera(self) -> None:
+        if self.calibration_session is None:
+            return
+        camera = str(self.wizard_intrinsic_camera.currentData())
+        accepted = self.calibration_session.summary()["intrinsics"][camera][
+            "accepted"
+        ]
+        if accepted < MINIMUM_INTRINSIC_SAMPLES:
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                f"{camera} 还需要 "
+                f"{MINIMUM_INTRINSIC_SAMPLES - accepted} 张合格样本。",
+            )
+            return
+        self.wizard_intrinsic_camera.setCurrentIndex(
+            min(2, self.wizard_intrinsic_camera.currentIndex() + 1)
+        )
+
+    def wizard_inspect_pair(self) -> None:
+        if self.calibration_session is None:
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请先创建或加载 session。",
+            )
+            return
+        frames, timestamps = self._current_session_frames()
+        pair_key = str(self.wizard_pair.currentData())
+        left, right = pair_key.split("__", 1)
+        missing = [key for key in (left, right) if key not in frames]
+        if missing:
+            self.wizard_pair_detection_status.setText(
+                f"缺少当前画面：{', '.join(missing)}"
+            )
+            return
+        try:
+            inspection = self.calibration_session.inspect_pair(
+                left,
+                right,
+                frames[left],
+                frames[right],
+                timestamps.get(left),
+                timestamps.get(right),
+            )
+        except Exception as exc:
+            self.wizard_pair_detection_status.setText(str(exc))
+            return
+        self.wizard_pair_detection_status.setText(
+            f"{left}："
+            f"{'已识别' if inspection['left_detected'] else '未识别'}"
+            f"（{inspection['left_point_count']} 点）；"
+            f"{right}："
+            f"{'已识别' if inspection['right_detected'] else '未识别'}"
+            f"（{inspection['right_point_count']} 点）\n"
+            f"共同点：{inspection['common_point_count']} / "
+            f"{inspection['minimum_common_points']}，"
+            f"{'足够' if inspection['common_points_sufficient'] else '不足'}；"
+            f"{inspection['time_status']}"
+        )
+
+    def wizard_inspect_pair_if_visible(self) -> None:
+        if (
+            self.calibration_session is not None
+            and hasattr(self, "calibration_wizard_stack")
+            and self.calibration_wizard_stack.currentIndex() == 3
+        ):
+            self.wizard_inspect_pair()
+
+    def wizard_capture_pair(self) -> None:
+        if self.calibration_session is None:
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请先创建或加载 session。",
+            )
+            return
+        selected_index = self.wizard_pair.currentIndex()
+        first_incomplete = self._first_incomplete_pair_index()
+        if (
+            first_incomplete is not None
+            and selected_index > first_incomplete
+        ):
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请先完成 front_left ↔ front 的 15 组最低样本。",
+            )
+            return
+        if not self.wizard_pair_board_confirmed.isChecked():
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "请确认两路画面中是同一块物理标定板。",
+            )
+            return
+        pair_key = str(self.wizard_pair.currentData())
+        index = self.session_capture_target.findData(f"pair:{pair_key}")
+        if index >= 0:
+            self.session_capture_target.setCurrentIndex(index)
+        self.session_physical_board_id.setText(
+            self.wizard_pair_board_id.text()
+        )
+        self.session_pair_board_confirmed.setChecked(True)
+        self.capture_calibration_session_sample()
+        self.wizard_inspect_pair()
+        self.refresh_calibration_wizard()
+
+    def wizard_advance_pair(self) -> None:
+        if self.calibration_session is None:
+            return
+        pair_key = str(self.wizard_pair.currentData())
+        accepted = self.calibration_session.summary()["stereo_pairs"][
+            pair_key
+        ]["accepted"]
+        if accepted < MINIMUM_PAIR_SAMPLES:
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                f"当前 Pair 还需要 "
+                f"{MINIMUM_PAIR_SAMPLES - accepted} 组合格样本。",
+            )
+            return
+        self.wizard_pair.setCurrentIndex(
+            min(1, self.wizard_pair.currentIndex() + 1)
+        )
+
+    def refresh_calibration_wizard(self) -> None:
+        if not hasattr(self, "wizard_intrinsic_progress"):
+            return
+        if self.calibration_session is None:
+            self.wizard_session_label.setText("尚未创建或加载采集会话")
+            self.wizard_intrinsic_progress.setPlainText(
+                "请先在步骤 2 创建或加载 session。"
+            )
+            self.wizard_pair_progress.setPlainText(
+                "请先完成三台相机的单独采集。"
+            )
+            self.wizard_readiness_label.setText("暂不建议求解")
+            self.wizard_b2_mode_label.setText(
+                "尚无 session，B-2 入口不可用。"
+            )
+            if self.calibration_wizard_stack.currentIndex() == 4:
+                self.wizard_next_button.setText("暂不可进入 B-2")
+                self.wizard_next_button.setEnabled(False)
+            self.wizard_review_summary.setPlainText(
+                "当前没有可检查的采集会话。"
+            )
+            self.wizard_details_text.clear()
+            return
+        session = self.calibration_session
+        summary = session.summary()
+        intrinsic_lines = []
+        for camera in ("front_left", "front", "front_right"):
+            item = summary["intrinsics"][camera]
+            missing = "、".join(item["missing_coverage_zones"][:5]) or "无"
+            intrinsic_lines.append(
+                f"{camera}：已接受 {item['accepted']} / 目标 {item['target']}，"
+                f"最低 {MINIMUM_INTRINSIC_SAMPLES}；拒绝 {item['rejected']}\n"
+                f"  覆盖不足：{missing}\n"
+                f"  最近拒绝：{item['last_rejection_reason'] or '无'}\n"
+                f"  建议：{rejection_advice(item['last_rejection_reason'])}"
+            )
+        self.wizard_intrinsic_progress.setPlainText(
+            "\n\n".join(intrinsic_lines)
+        )
+        first_intrinsic = self._first_incomplete_intrinsic_index()
+        if first_intrinsic is not None:
+            self.wizard_intrinsic_camera.setCurrentIndex(first_intrinsic)
+
+        pair_lines = []
+        for pair_key in ("front_left__front", "front__front_right"):
+            item = summary["stereo_pairs"][pair_key]
+            display = pair_key.replace("__", " ↔ ")
+            missing = "、".join(item["missing_coverage_zones"][:5]) or "无"
+            pair_lines.append(
+                f"{display}：已接受 {item['accepted']} / 目标 {item['target']}，"
+                f"最低 {MINIMUM_PAIR_SAMPLES}；拒绝 {item['rejected']}\n"
+                f"  位置/距离覆盖不足：{missing}\n"
+                f"  最近拒绝：{item['last_rejection_reason'] or '无'}\n"
+                f"  建议：{rejection_advice(item['last_rejection_reason'])}"
+            )
+        self.wizard_pair_progress.setPlainText("\n\n".join(pair_lines))
+        first_pair = self._first_incomplete_pair_index()
+        if first_pair is not None:
+            self.wizard_pair.setCurrentIndex(first_pair)
+
+        readiness = session.readiness()
+        b2_access = session.b2_candidate_access()
+        color = {
+            "ready": "#166534",
+            "try_with_risk": "#a16207",
+            "not_recommended": "#b91c1c",
+        }[readiness["status"]]
+        self.wizard_readiness_label.setStyleSheet(
+            f"QLabel {{ font-size: 16px; font-weight: 700; "
+            f"padding: 8px; color: {color}; }}"
+        )
+        self.wizard_readiness_label.setText(readiness["label"])
+        review_lines = [
+            f"Session：{session.directory}",
+            f"标定板参数：{'已确认' if session.data.get('board_confirmed') else '未确认'}",
+            f"分辨率：{session.data.get('resolution')}",
+        ]
+        review_lines.extend(
+            f"阻塞：{reason}\n  下一步：{rejection_advice(reason)}"
+            for reason in readiness["blocking_reasons"]
+        )
+        review_lines.extend(
+            f"风险：{reason}\n  下一步：{rejection_advice(reason)}"
+            for reason in readiness["quality_issues"]
+        )
+        if readiness["status"] == "ready":
+            review_lines.append(
+                "数量与基础质量门控均满足，可以在 B-2 中生成候选标定。"
+            )
+            mode_text = (
+                "正式候选模式：可进入 B-2；候选通过复核后才可申请应用。"
+            )
+            entry_text = "进入 B-2 候选求解"
+        elif readiness["status"] == "try_with_risk":
+            review_lines.extend(
+                (
+                    "[experimental] 仅允许生成候选与诊断报告，"
+                    "禁止应用候选标定。",
+                    "请补充 Pair 的位置、距离和倾角覆盖，"
+                    "通过正式质量门槛后再申请应用。",
+                )
+            )
+            mode_text = (
+                "[experimental] 实验性候选求解（仅报告）："
+                "可查看候选内外参、RMS、异常样本、Pair-only 与"
+                "候选全景预览；禁止应用。"
+            )
+            entry_text = "实验性候选求解（仅报告）"
+        else:
+            mode_text = "当前样本不满足求解前提，B-2 入口已锁定。"
+            entry_text = "暂不可进入 B-2"
+        self.wizard_b2_mode_label.setText(mode_text)
+        if self.calibration_wizard_stack.currentIndex() == 4:
+            self.wizard_next_button.setText(entry_text)
+            self.wizard_next_button.setEnabled(b2_access["can_enter"])
+        self.wizard_review_summary.setPlainText("\n".join(review_lines))
+        self.wizard_details_text.setPlainText(
+            self.calibration_session_status_text()
+        )
+        self.update_preview_status_summary()
+
+    def b2_candidate_request_context(self) -> dict[str, Any] | None:
+        """Build the stable hand-off contract for the future B-2 module."""
+        if self.calibration_session is None:
+            return None
+        access = self.calibration_session.b2_candidate_access()
+        return {
+            **access,
+            "session_directory": str(
+                self.calibration_session.directory.resolve()
+            ),
+            "topology": self.calibration_session.data.get("topology"),
+            "resolution": list(
+                self.calibration_session.data.get("resolution", [])
+            ),
+        }
+
+    def set_b2_candidate_solver_launcher(
+        self,
+        launcher: Callable[[dict[str, Any]], None] | None,
+    ) -> None:
+        """Register the future B-2 UI/module without coupling it to capture."""
+        self.b2_candidate_solver_launcher = launcher
+
+    def request_b2_candidate_solve(self) -> None:
+        context = self.b2_candidate_request_context()
+        if context is None or not context["can_enter"]:
+            QMessageBox.information(
+                self,
+                self.t("Calibration Wizard"),
+                "当前采样结论为“暂不建议求解”，不能进入 B-2。\n\n"
+                "发生了什么：标定板确认、分辨率或最低样本数量尚未满足。\n"
+                "下一步：查看本页的“阻塞”和“下一步”提示，补拍后再检查。",
+            )
+            return
+        if self.b2_candidate_solver_launcher is not None:
+            self.b2_candidate_solver_launcher(context)
+            return
+        self.run_b2_candidate_solver(context)
+
+    def run_b2_candidate_solver(self, context: dict[str, Any]) -> None:
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            output_dir = generate_calibration_candidate(
+                context["session_directory"]
+            )
+        except Exception as exc:
+            self.log(
+                f"B-2 candidate solve failed: {type(exc).__name__}: {exc}",
+                level="ERROR",
+            )
+            QMessageBox.critical(
+                self,
+                self.t("Calibration Wizard"),
+                f"实验性候选求解失败：\n{exc}\n\n"
+                "可能原因：某台相机有效样本不足、某个 Pair 无法求出稳定关系，"
+                "或候选输出文件不完整。\n"
+                "下一步：保留当前 session，查看日志与拒绝原因，补拍后重试；"
+                "正式 calibration.yaml 未被应用。",
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.log(f"B-2 experimental candidate saved: {output_dir}")
+        self.live_candidate_directory = output_dir
+        self._candidate_ui_cache_path = None
+        self._candidate_ui_cache = {}
+        self.set_live_stitch_mode("candidate")
+        dialog = CalibrationCandidateDialog(output_dir, self)
+        dialog.exec()
+
+    def calibration_session_status_text(self) -> str:
+        if self.calibration_session is None:
+            return ""
+        lines = [
+            f"Board: {self.calibration_session.data['board_definition']}",
+            f"Quality gates: {self.calibration_session.data['quality_gate']}",
+        ]
+        for group_name in ("intrinsics", "stereo_pairs"):
+            for key, group in self.calibration_session.data[
+                group_name
+            ].items():
+                time_risks = sum(
+                    1
+                    for sample in group.get("samples", [])
+                    if "time delta" in " ".join(
+                        sample.get("rejection_reasons", [])
+                    ).lower()
+                    or "timestamps unavailable" in " ".join(
+                        sample.get("warnings", [])
+                    ).lower()
+                )
+                lines.append(
+                    f"{group_name}/{key}: total={len(group.get('samples', []))}, "
+                    f"time_risks={time_risks}"
+                )
+        return "\n".join(lines)
+
+    def current_session_board_definition(self) -> dict[str, Any]:
+        board_type = str(self.session_board_type.currentData())
+        if board_type == "chessboard":
+            return {
+                "type": board_type,
+                "inner_columns": int(self.session_board_columns.value()),
+                "inner_rows": int(self.session_board_rows.value()),
+                "square_size_mm": float(
+                    self.session_square_length.value()
+                ),
+            }
+        if board_type == "aruco_grid":
+            return {
+                "type": board_type,
+                "markers_x": int(self.session_board_columns.value()),
+                "markers_y": int(self.session_board_rows.value()),
+                "marker_length_mm": float(
+                    self.session_square_length.value()
+                ),
+                "marker_separation_mm": float(
+                    self.session_marker_separation.value()
+                ),
+                "dictionary": str(self.session_dictionary.currentText()),
+            }
+        return {
+            "type": "charuco",
+            "squares_x": int(self.session_board_columns.value()),
+            "squares_y": int(self.session_board_rows.value()),
+            "square_length_mm": float(
+                self.session_square_length.value()
+            ),
+            "marker_length_mm": float(
+                self.session_marker_length.value()
+            ),
+            "dictionary": str(self.session_dictionary.currentText()),
+        }
+
+    def create_calibration_sample_session(self) -> bool:
+        if not self.session_board_confirmed.isChecked():
+            QMessageBox.information(
+                self,
+                self.t("Fisheye Sample Session"),
+                "Confirm the measured board definition before creating "
+                "a capture session.",
+            )
+            return False
+        profile = self.current_stitch_profile()
+        try:
+            session = CalibrationSession.create(
+                sessions_root=(
+                    PROJECT_ROOT / "projects" / "calibration_sessions"
+                ),
+                topology=str(
+                    self.calibration_config.get("stitch_topology", "")
+                ),
+                resolution=(1920, 1080),
+                source_coordinate_space=str(
+                    profile.get("source_coordinate_space", "")
+                ),
+                source_reference_size=list(
+                    profile.get("source_reference_size", [])
+                ),
+                source_contract_version=profile.get(
+                    "source_contract_version"
+                ),
+                board_definition=self.current_session_board_definition(),
+                board_confirmed=True,
+                quality_gate={
+                    "minimum_board_area_ratio": (
+                        float(self.session_min_area_percent.value()) / 100.0
+                    ),
+                    "minimum_blur_variance": float(
+                        self.session_blur_threshold.value()
+                    ),
+                    "maximum_pair_time_delta_seconds": (
+                        float(self.session_sync_threshold_ms.value()) / 1000.0
+                    ),
+                },
+            )
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                self.t("Fisheye Sample Session"),
+                str(exc),
+            )
+            return False
+        self.calibration_session = session
+        self.apply_calibration_session_to_controls(session)
+        self.calibration_session_log.setPlainText(
+            "Session created. Board definition, resolution and quality gates "
+            "are now fixed in session.yaml."
+        )
+        self.refresh_calibration_session_status()
+        self.log(f"Calibration sample session created: {session.directory}")
+        return True
+
+    def load_calibration_sample_session(self) -> bool:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            self.t("Load Session"),
+            str(PROJECT_ROOT / "projects" / "calibration_sessions"),
+        )
+        if not directory:
+            return False
+        try:
+            session = CalibrationSession.load(directory)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                self.t("Fisheye Sample Session"),
+                str(exc),
+            )
+            return False
+        self.calibration_session = session
+        self.apply_calibration_session_to_controls(session)
+        self.calibration_session_log.setPlainText(
+            "Session loaded. Captures will continue using the immutable "
+            "board definition and quality gates stored in session.yaml."
+        )
+        self.refresh_calibration_session_status()
+        self.log(f"Calibration sample session loaded: {session.directory}")
+        return True
+
+    def apply_calibration_session_to_controls(
+        self,
+        session: CalibrationSession,
+    ) -> None:
+        self.calibration_session_path_label.setText(str(session.directory))
+        self.calibration_session_path_label.setToolTip(str(session.directory))
+        definition = session.data["board_definition"]
+        index = self.session_board_type.findData(definition["type"])
+        if index >= 0:
+            self.session_board_type.setCurrentIndex(index)
+        board_type = definition["type"]
+        if board_type == "chessboard":
+            columns = definition["inner_columns"]
+            rows = definition["inner_rows"]
+            square = definition["square_size_mm"]
+        elif board_type == "aruco_grid":
+            columns = definition["markers_x"]
+            rows = definition["markers_y"]
+            square = definition["marker_length_mm"]
+            self.session_marker_separation.setValue(
+                float(definition["marker_separation_mm"])
+            )
+        else:
+            columns = definition["squares_x"]
+            rows = definition["squares_y"]
+            square = definition["square_length_mm"]
+            self.session_marker_length.setValue(
+                float(definition["marker_length_mm"])
+            )
+        self.session_board_columns.setValue(int(columns))
+        self.session_board_rows.setValue(int(rows))
+        self.session_square_length.setValue(float(square))
+        dictionary = definition.get("dictionary")
+        if dictionary:
+            dictionary_index = self.session_dictionary.findText(
+                str(dictionary)
+            )
+            if dictionary_index >= 0:
+                self.session_dictionary.setCurrentIndex(dictionary_index)
+        gate = session.data["quality_gate"]
+        self.session_min_area_percent.setValue(
+            float(gate["minimum_board_area_ratio"]) * 100.0
+        )
+        self.session_blur_threshold.setValue(
+            float(gate["minimum_blur_variance"])
+        )
+        self.session_sync_threshold_ms.setValue(
+            int(
+                round(
+                    float(gate["maximum_pair_time_delta_seconds"])
+                    * 1000.0
+                )
+            )
+        )
+        self.session_board_confirmed.setChecked(
+            bool(session.data.get("board_confirmed"))
+        )
+        self.update_session_board_controls()
+        self.sync_session_to_wizard_controls(session)
+
+    def update_session_capture_controls(self) -> None:
+        if not hasattr(self, "session_capture_target"):
+            return
+        is_pair = str(
+            self.session_capture_target.currentData() or ""
+        ).startswith("pair:")
+        self.session_physical_board_id.setEnabled(is_pair)
+        self.session_pair_board_confirmed.setEnabled(is_pair)
+
+    def _current_session_frames(
+        self,
+    ) -> tuple[dict[str, np.ndarray], dict[str, float | None]]:
+        if self.preview_content_mode == PreviewContentMode.LIVE:
+            frames, snapshots = self.stream_manager.latest_frames()
+        else:
+            frames = {
+                key: frame.copy()
+                for key, frame in self.frames.items()
+                if frame is not None
+            }
+            snapshots = {}
+        timestamps = {
+            key: (
+                float(snapshot.frame_timestamp)
+                if snapshot is not None and snapshot.frame_timestamp > 0
+                else None
+            )
+            for key, snapshot in snapshots.items()
+        }
+        return frames, timestamps
+
+    def capture_calibration_session_sample(self) -> None:
+        if self.calibration_session is None:
+            QMessageBox.information(
+                self,
+                self.t("Fisheye Sample Session"),
+                "Create or load a calibration session first.",
+            )
+            return
+        frames, timestamps = self._current_session_frames()
+        selection = str(self.session_capture_target.currentData() or "")
+        try:
+            if selection.startswith("intrinsic:"):
+                camera = selection.split(":", 1)[1]
+                if camera not in frames:
+                    raise ValueError(f"No current raw frame for {camera}.")
+                record = self.calibration_session.capture_intrinsic(
+                    camera,
+                    frames[camera],
+                    frame_timestamp=timestamps.get(camera),
+                )
+            elif selection.startswith("pair:"):
+                pair = selection.split(":", 1)[1]
+                left, right = pair.split("__", 1)
+                missing = [
+                    key for key in (left, right) if key not in frames
+                ]
+                if missing:
+                    raise ValueError(
+                        f"Missing current raw frames: {', '.join(missing)}"
+                    )
+                record = self.calibration_session.capture_pair(
+                    left,
+                    right,
+                    frames[left],
+                    frames[right],
+                    timestamps.get(left),
+                    timestamps.get(right),
+                    self.session_physical_board_id.text(),
+                    self.session_pair_board_confirmed.isChecked(),
+                )
+            else:
+                raise ValueError("Unknown calibration capture target.")
+        except BoardDefinitionNotConfirmedError as exc:
+            QMessageBox.information(
+                self,
+                self.t("Fisheye Sample Session"),
+                str(exc),
+            )
+            return
+        except Exception as exc:
+            self.log(
+                f"Calibration session capture failed: "
+                f"{exc}\n{traceback.format_exc()}",
+                level="ERROR",
+            )
+            QMessageBox.warning(
+                self,
+                self.t("Fisheye Sample Session"),
+                str(exc),
+            )
+            return
+        reasons = "; ".join(record["rejection_reasons"]) or "none"
+        warnings = "; ".join(record.get("warnings", [])) or "none"
+        message = (
+            f"{record['sample_id']}: "
+            f"{'ACCEPTED' if record['accepted'] else 'REJECTED'}\n"
+            f"Reasons: {reasons}\nWarnings: {warnings}\n"
+            f"下一步建议：{rejection_advice(reasons if reasons != 'none' else '')}"
+        )
+        self.calibration_session_log.append(message)
+        self.refresh_calibration_session_status()
+        self.log(f"Calibration session sample: {message}")
+
+    def refresh_calibration_session_status(self) -> None:
+        if not hasattr(self, "calibration_session_status_table"):
+            return
+        table = self.calibration_session_status_table
+        rows: list[tuple[str, dict[str, Any]]] = []
+        if self.calibration_session is not None:
+            summary = self.calibration_session.summary()
+            rows.extend(
+                (f"{self.t('Intrinsic')}: {key}", value)
+                for key, value in summary["intrinsics"].items()
+            )
+            rows.extend(
+                (
+                    f"{self.t('Pair')}: {key.replace('__', ' <-> ')}",
+                    value,
+                )
+                for key, value in summary["stereo_pairs"].items()
+            )
+        table.setRowCount(len(rows))
+        for row_index, (name, item) in enumerate(rows):
+            missing = item["missing_coverage_zones"]
+            missing_text = ", ".join(missing[:4])
+            if len(missing) > 4:
+                missing_text += f" (+{len(missing) - 4})"
+            values = [
+                name,
+                str(item["accepted"]),
+                str(item["target"]),
+                str(item["rejected"]),
+                missing_text,
+                item["last_rejection_reason"],
+            ]
+            for column, value in enumerate(values):
+                table.setItem(
+                    row_index,
+                    column,
+                    QTableWidgetItem(value),
+                )
+        self.refresh_calibration_wizard()
+
+    def refresh_pairwise_pair_choices(self) -> None:
+        if not hasattr(self, "pairwise_pair_combo"):
+            return
+        selected_name = str(self.pairwise_pair_combo.currentData() or "")
+        self.pairwise_pair_combo.clear()
+        for pair in pair_definitions(self.calibration_config):
+            self.pairwise_pair_combo.addItem(
+                f"{pair.left_camera} <-> {pair.right_camera}",
+                pair.name,
+            )
+        if selected_name:
+            index = self.pairwise_pair_combo.findData(selected_name)
+            if index >= 0:
+                self.pairwise_pair_combo.setCurrentIndex(index)
+
+    def selected_pair_definition(self) -> PairDefinition | None:
+        selected_name = str(self.pairwise_pair_combo.currentData() or "")
+        return next(
+            (
+                pair
+                for pair in pair_definitions(self.calibration_config)
+                if pair.name == selected_name
+            ),
+            None,
+        )
+
+    def run_pairwise_candidate_diagnostics(self) -> None:
+        snapshots_root = PROJECT_ROOT / "projects" / "calibration_snapshots"
+        try:
+            results = run_automatic_pairwise_candidates(
+                snapshots_root,
+                self.calibration_config,
+            )
+            output_dir = save_pairwise_results(
+                PROJECT_ROOT / "projects" / "pairwise_diagnostics",
+                results,
+            )
+        except Exception as exc:
+            self.log(
+                f"Pairwise candidate diagnostics failed: "
+                f"{exc}\n{traceback.format_exc()}",
+                level="ERROR",
+            )
+            QMessageBox.warning(
+                self,
+                self.t("Pairwise Candidates"),
+                str(exc),
+            )
+            return
+        self.pairwise_diagnostic_results = results
+        self.render_pairwise_candidate_diagnostics(results, output_dir)
+        self.log(
+            "Pairwise candidate diagnostics saved: "
+            f"{output_dir}; formal profile unchanged."
+        )
+
+    def open_manual_pairwise_dialog(self) -> None:
+        pair = self.selected_pair_definition()
+        if pair is None:
+            QMessageBox.information(
+                self,
+                self.t("Pairwise Candidates"),
+                "No pair is selected.",
+            )
+            return
+        try:
+            snapshot_dir = latest_snapshot_directory(
+                PROJECT_ROOT / "projects" / "calibration_snapshots",
+                str(self.calibration_config.get("stitch_topology", "")),
+            )
+            frames = load_snapshot_frames(snapshot_dir)
+            left = frames[pair.left_camera]
+            right = frames[pair.right_camera]
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                self.t("Pairwise Candidates"),
+                str(exc),
+            )
+            return
+
+        dialog = ManualCorrespondenceDialog(
+            pair,
+            left,
+            right,
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        result = estimate_pairwise_candidate(
+            snapshot_dir,
+            self.calibration_config,
+            pair,
+            manual_left_points=dialog.left_points,
+            manual_right_points=dialog.right_points,
+        )
+        try:
+            output_dir = save_pairwise_results(
+                PROJECT_ROOT / "projects" / "pairwise_diagnostics",
+                [result],
+            )
+        except Exception as exc:
+            self.log(
+                f"Manual pairwise candidate save failed: {exc}",
+                level="ERROR",
+            )
+            QMessageBox.warning(
+                self,
+                self.t("Pairwise Candidates"),
+                str(exc),
+            )
+            return
+        self.pairwise_diagnostic_results = [result]
+        self.render_pairwise_candidate_diagnostics([result], output_dir)
+        self.log(
+            "Manual pairwise candidate saved: "
+            f"{output_dir}; formal profile unchanged."
+        )
+
+    def render_pairwise_candidate_diagnostics(
+        self,
+        results: list[PairwiseCandidateResult],
+        output_dir: Path,
+    ) -> None:
+        lines = [
+            f"Output: {output_dir}",
+            "Scope: planar pairwise candidate only; calibration.yaml was not updated.",
+        ]
+        while self.pairwise_diagnostics_tabs.count():
+            widget = self.pairwise_diagnostics_tabs.widget(0)
+            self.pairwise_diagnostics_tabs.removeTab(0)
+            widget.deleteLater()
+        for result in results:
+            error_text = result.error or "none"
+            reprojection = (
+                f"{result.reprojection_error:.3f}px"
+                if result.reprojection_error is not None
+                else "unavailable"
+            )
+            lines.append(
+                f"{result.pair.left_camera} <-> "
+                f"{result.pair.right_camera}: method={result.method}, "
+                f"points={result.point_count}, inliers={result.inlier_count}, "
+                f"reprojection={reprojection}, error={error_text}"
+            )
+            for warning in result.warnings:
+                lines.append(f"  WARNING: {warning}")
+            images = (
+                (
+                    f"{result.pair.name}: left points",
+                    result.left_visualization,
+                ),
+                (
+                    f"{result.pair.name}: right points",
+                    result.right_visualization,
+                ),
+                (
+                    f"{result.pair.name}: alpha 50%",
+                    result.alpha_overlay,
+                ),
+                (
+                    f"{result.pair.name}: hard cut",
+                    result.hard_cut_overlay,
+                ),
+            )
+            for title, image in images:
+                view = ImageView(title)
+                if image is not None:
+                    view.set_image(image, title)
+                else:
+                    view.set_placeholder(result.error or "No candidate image")
+                self.pairwise_diagnostics_tabs.addTab(view, title)
+        self.pairwise_diagnostics_summary.setPlainText("\n".join(lines))
+        self.diagnostic_output_tabs.setCurrentIndex(
+            self.pairwise_output_tab_index
+        )
+
+    def refresh_geometry_diagnostics(self) -> None:
+        if self.preview_content_mode == PreviewContentMode.LIVE:
+            frames, _ = self.stream_manager.latest_frames()
+        else:
+            frames = {
+                key: frame.copy()
+                for key, frame in self.frames.items()
+                if frame is not None
+            }
+        active = set(active_topology_camera_keys(self.calibration_config))
+        frames = {key: frame for key, frame in frames.items() if key in active}
+        max_input_width, use_intrinsics = self.live_stitcher_options()
+        pair_mode = str(self.geometry_pair_mode.currentData() or ALPHA_50)
+        try:
+            result = compute_geometry_diagnostics(
+                frames=frames,
+                calibration_config=self.calibration_config,
+                max_input_width=max_input_width,
+                use_intrinsics=use_intrinsics,
+                pair_mode=pair_mode,
+            )
+        except Exception as exc:
+            self.log(
+                "Geometry diagnostics failed: "
+                f"{exc}\n{traceback.format_exc()}",
+                level="ERROR",
+            )
+            QMessageBox.warning(
+                self,
+                self.t("Geometry Diagnostics"),
+                str(exc),
+            )
+            return
+        self.geometry_diagnostic_result = result
+        self.render_geometry_diagnostics(result)
+
+    def render_geometry_diagnostics(
+        self,
+        result: GeometryDiagnosticResult,
+    ) -> None:
+        metadata = result.metadata
+        lines = [
+            f"Topology: {metadata.get('topology', '')}",
+            f"Camera order: {' -> '.join(metadata.get('camera_order', []))}",
+            (
+                f"Canvas: {metadata.get('canvas', {}).get('width', 0)} x "
+                f"{metadata.get('canvas', {}).get('height', 0)}"
+            ),
+            f"Runtime stages: {' -> '.join(metadata.get('runtime_stage_order', []))}",
+            (
+                "Source points: raw-frame pixel coordinates; "
+                "editor points: loaded image pixel coordinates."
+            ),
+            (
+                f"Source reference: {metadata.get('source_reference_size')}; "
+                f"contract version={metadata.get('source_contract_version')}"
+            ),
+            f"use_intrinsics={metadata.get('use_intrinsics', False)}",
+        ]
+        if not metadata.get("use_intrinsics", False):
+            lines.append(
+                "WARNING: undistortion is not executed. Current output is "
+                "fisheye/raw-frame perspective warp; natural global stitching "
+                "should not be expected."
+            )
+        for key in metadata.get("camera_order", []):
+            camera = metadata.get("cameras", {}).get(key, {})
+            if not camera.get("available"):
+                lines.append(f"{key}: no current frame")
+                continue
+            raw = camera.get("raw_size", [])
+            normalized = camera.get("normalized_size", [])
+            lines.append(
+                f"{key}: raw={raw[0]}x{raw[1]} -> "
+                f"normalized={normalized[0]}x{normalized[1]}, "
+                f"scale={camera.get('raw_to_normalized_scale', 1.0):.4f}, "
+                f"normalized->source factor="
+                f"{camera.get('normalized_to_source_factor', 1.0):.4f}"
+            )
+            lines.append(
+                f"  source bounds={camera.get('source_bounds')}, "
+                f"coverage={camera.get('source_coverage_fraction')}, "
+                f"intrinsics available={camera.get('intrinsics_available')}, "
+                f"effective={camera.get('intrinsics_effective')}, "
+                f"reference={camera.get('intrinsics_reference_size')}"
+            )
+            if camera.get("intrinsics_available"):
+                lines.append(
+                    "  intrinsics scale to raw="
+                    f"{camera.get('intrinsics_scale_to_raw')}, "
+                    "to normalized="
+                    f"{camera.get('intrinsics_scale_to_normalized')}, "
+                    "uniform-compatible="
+                    f"{camera.get('intrinsics_uniform_scale_compatible')}, "
+                    "runtime matrix scaled="
+                    f"{camera.get('intrinsics_runtime_matrix_scaled')}"
+                )
+            if camera.get("intrinsics_warning"):
+                lines.append(
+                    f"  WARNING: {camera.get('intrinsics_warning')}"
+                )
+            for warning in camera.get("coordinate_warnings", []):
+                lines.append(f"  WARNING: {warning}")
+        if result.final_error:
+            lines.append(f"Final canvas error: {result.final_error}")
+        self.geometry_diagnostics_summary.setPlainText("\n".join(lines))
+
+        while self.geometry_diagnostics_tabs.count():
+            widget = self.geometry_diagnostics_tabs.widget(0)
+            self.geometry_diagnostics_tabs.removeTab(0)
+            widget.deleteLater()
+        for key in metadata.get("camera_order", []):
+            view = ImageView(f"Warp: {key}")
+            if key in result.warped:
+                view.set_image(result.warped[key], f"Warp: {key}")
+            else:
+                view.set_placeholder(f"{key}: no current frame")
+            self.geometry_diagnostics_tabs.addTab(view, f"Warp: {key}")
+        for pair in metadata.get("pairs", []):
+            pair_name = str(pair.get("name", "pair"))
+            view = ImageView(f"Pair: {pair_name}")
+            if pair_name in result.pair_only:
+                view.set_image(
+                    result.pair_only[pair_name],
+                    f"Pair only: {pair_name}",
+                )
+            else:
+                view.set_placeholder(f"{pair_name}: missing camera frame")
+            self.geometry_diagnostics_tabs.addTab(view, f"Pair: {pair_name}")
+        final_view = ImageView(self.t("Final Canvas"))
+        if result.final_canvas is not None:
+            final_view.set_image(
+                result.final_canvas,
+                self.t("Final Canvas"),
+            )
+        else:
+            final_view.set_placeholder(
+                result.final_error or self.t("No frame")
+            )
+        self.geometry_diagnostics_tabs.addTab(
+            final_view,
+            self.t("Final Canvas"),
+        )
+        self.log(
+            "Geometry diagnostics refreshed: "
+            f"topology={metadata.get('topology', '')}, "
+            f"frames={list(result.warped)}, mode={metadata.get('pair_mode')}, "
+            f"final_error={result.final_error or 'none'}"
+        )
 
     def populate_seam_table(self) -> None:
         if not hasattr(self, "seam_table"):
@@ -2302,8 +5501,35 @@ class MainWindow(QMainWindow):
         width = int(stitch_profile.get("canvas", {}).get("width", 2440))
         height = int(stitch_profile.get("canvas", {}).get("height", 1800))
         self.seam_editor.set_canvas(self.canvas, width, height)
+        self.seam_editor.set_overlaps(stitch_profile.get("overlaps", []))
         self.seam_editor.set_stitch_points(self.current_stitch_points())
         self.populate_seam_table()
+
+    def center_seams_in_overlaps(self) -> None:
+        profile = self.current_stitch_profile()
+        height = float(profile.get("canvas", {}).get("height", 0))
+        self._updating_seam_table = True
+        try:
+            for overlap in profile.get("overlaps", []):
+                x_range = overlap.get("x_range", [])
+                seam_name = str(overlap.get("seam", ""))
+                if len(x_range) != 2 or not seam_name:
+                    continue
+                center_x = (float(x_range[0]) + float(x_range[1])) / 2.0
+                for point_index, y in ((0, 0.0), (1, height)):
+                    row = self._seam_table_row(seam_name, point_index)
+                    if row is None:
+                        continue
+                    self.seam_table.item(row, 2).setText(f"{center_x:.3f}")
+                    self.seam_table.item(row, 3).setText(f"{y:.3f}")
+        finally:
+            self._updating_seam_table = False
+        self.seam_editor.set_stitch_points(
+            self._stitch_points_from_table()
+        )
+        self.log(
+            "Seams centered in declared overlaps; changes are not saved yet."
+        )
 
     def on_seam_point_moved(self, seam_name: str, point_index: int, x: float, y: float) -> None:
         if self._updating_seam_table:
@@ -2332,6 +5558,25 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid seam points", str(exc))
             return
         profile = self.current_stitch_profile()
+        validation_errors = validate_overlap_seams(
+            profile,
+            stitch_points=stitch_points,
+        )
+        if validation_errors:
+            message = (
+                f"Topology={self.calibration_config.get('stitch_topology', '')}\n"
+                + "\n".join(validation_errors)
+            )
+            self.log(
+                f"Seam validation failed:\n{message}",
+                level="ERROR",
+            )
+            QMessageBox.warning(
+                self,
+                self.t("Seam validation failed"),
+                message,
+            )
+            return
         previous_stitch_points = profile.get("stitch_points", {})
         previous_feather = self.current_feather_width()
         feather_width = int(self.feather_width.value())
@@ -2445,6 +5690,11 @@ class MainWindow(QMainWindow):
                 _, canvas = self.stitcher.process(frames)
             except Exception as exc:
                 processing_error = str(exc)
+                self.log(
+                    "Calibration snapshot stitch failed: "
+                    f"{exc}\n{traceback.format_exc()}",
+                    level="ERROR",
+                )
         if canvas is None:
             if (
                 self.canvas is not None
@@ -2465,6 +5715,11 @@ class MainWindow(QMainWindow):
                 processing_error=processing_error,
             )
         except Exception as exc:
+            self.log(
+                "Calibration snapshot save failed: "
+                f"{exc}\n{traceback.format_exc()}",
+                level="ERROR",
+            )
             QMessageBox.warning(
                 self,
                 self.t("Calibration snapshot failed"),
@@ -2517,10 +5772,24 @@ class MainWindow(QMainWindow):
                 return key
         return self.calibration_camera.currentText()
 
-    def log(self, message: str) -> None:
+    def log(self, message: str, level: str = "INFO") -> None:
+        safe_message = redact_log_message(message)
+        normalized_level = level.upper()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        display_line = f"{timestamp} [{normalized_level}] {safe_message}"
+        log_method = getattr(
+            self.app_logger,
+            normalized_level.lower(),
+            self.app_logger.info,
+        )
+        log_method(safe_message)
+        if hasattr(self, "application_log"):
+            self.application_log.moveCursor(QTextCursor.MoveOperation.End)
+            self.application_log.insertPlainText(display_line + "\n")
         if hasattr(self, "calibration_log"):
-            self.calibration_log.append(message)
-        self.statusBar().showMessage(message)
+            self.calibration_log.moveCursor(QTextCursor.MoveOperation.End)
+            self.calibration_log.insertPlainText(display_line + "\n")
+        self.statusBar().showMessage(safe_message.splitlines()[0])
 
 
 def main() -> int:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,14 @@ import numpy as np
 
 from .calibration import undistort_image
 from .masks import crop_image_by_line
-from .topology import compose_horizontal_feather, resolve_stitch_config
+from .topology import (
+    compose_horizontal_feather,
+    resolve_stitch_config,
+    source_coordinate_diagnostics,
+)
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,11 @@ class SurroundStitcher:
     def __init__(self, config: dict[str, Any], max_input_width: int | None = None, use_intrinsics: bool = True):
         config = resolve_stitch_config(config)
         self.topology_name = str(config.get("_topology_name", "legacy_surround_5"))
+        self.source_coordinate_space = str(
+            config.get("source_coordinate_space", "")
+        )
+        self.source_reference_size = config.get("source_reference_size")
+        self.source_contract_version = config.get("source_contract_version")
         canvas = config.get("canvas", {})
         self.output_width = int(canvas.get("width", 2440))
         self.output_height = int(canvas.get("height", 1800))
@@ -59,9 +72,42 @@ class SurroundStitcher:
         self.composition = config.get("composition", {})
         self.camera_intrinsics = config.get("camera_intrinsics", {})
         self._masks: dict[str, np.ndarray] = {}
+        self._source_diagnostic_sizes: dict[str, tuple[int, int]] = {}
+
+    def source_diagnostics(
+        self,
+        camera_name: str,
+        actual_raw_size: tuple[int, int] | None = None,
+    ) -> dict[str, Any]:
+        return source_coordinate_diagnostics(
+            {
+                "source_coordinate_space": self.source_coordinate_space,
+                "source_reference_size": self.source_reference_size,
+                "source_contract_version": self.source_contract_version,
+                "cameras": {
+                    name: {
+                        "source_points": calibration.source_points.tolist(),
+                    }
+                    for name, calibration in self.cameras.items()
+                },
+            },
+            camera_name,
+            actual_raw_size,
+        )
 
     def warp(self, image: np.ndarray, camera_name: str) -> np.ndarray:
         calibration = self.cameras[camera_name]
+        raw_size = (int(image.shape[1]), int(image.shape[0]))
+        if (
+            (self.source_coordinate_space or self.source_reference_size)
+            and self._source_diagnostic_sizes.get(camera_name) != raw_size
+        ):
+            self._source_diagnostic_sizes[camera_name] = raw_size
+            for warning in self.source_diagnostics(
+                camera_name,
+                raw_size,
+            )["warnings"]:
+                LOGGER.warning("Source coordinate warning: %s", warning)
         matrix = calibration.matrix.copy()
         if self.max_input_width and image.shape[1] > self.max_input_width:
             scale = self.max_input_width / float(image.shape[1])

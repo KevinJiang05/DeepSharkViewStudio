@@ -18,6 +18,12 @@ def solid_frame(bgr: tuple[int, int, int]) -> np.ndarray:
     return frame
 
 
+def triple_reference_frame(bgr: tuple[int, int, int]) -> np.ndarray:
+    frame = np.empty((1080, 1920, 3), dtype=np.uint8)
+    frame[:] = bgr
+    return frame
+
+
 class TopologyConfigTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -98,9 +104,9 @@ class TopologyImageTests(unittest.TestCase):
         stitcher = SurroundStitcher(config, max_input_width=None, use_intrinsics=False)
         _, canvas = stitcher.process(
             {
-                "front_left": solid_frame((0, 0, 255)),
-                "front": solid_frame((0, 255, 0)),
-                "front_right": solid_frame((255, 0, 0)),
+                "front_left": triple_reference_frame((0, 0, 255)),
+                "front": triple_reference_frame((0, 255, 0)),
+                "front_right": triple_reference_frame((255, 0, 0)),
             }
         )
         self.assertEqual((700, 2200, 3), canvas.shape)
@@ -116,9 +122,9 @@ class TopologyImageTests(unittest.TestCase):
             manager.submit_latest(
                 7,
                 {
-                    "front_left": solid_frame((0, 0, 255)),
-                    "front": solid_frame((0, 255, 0)),
-                    "front_right": solid_frame((255, 0, 0)),
+                    "front_left": triple_reference_frame((0, 0, 255)),
+                    "front": triple_reference_frame((0, 255, 0)),
+                    "front_right": triple_reference_frame((255, 0, 0)),
                 },
             )
             deadline = time.monotonic() + 3.0
