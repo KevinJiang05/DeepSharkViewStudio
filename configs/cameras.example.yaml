@@ -1,0 +1,46 @@
+active_camera_count: 3
+camera_order:
+- front_left
+- front_right
+- front
+- behind
+- left
+- right
+cameras:
+  front_left:
+    display_name: Front Left
+    enabled: true
+    source_type: rtsp
+    source: rtsp://camera.example.invalid/live/front_left
+  front_right:
+    display_name: Front Right
+    enabled: true
+    source_type: rtsp
+    source: rtsp://camera.example.invalid/live/front_right
+  front:
+    display_name: Front
+    enabled: true
+    source_type: rtsp
+    source: rtsp://camera.example.invalid/live/front
+  behind:
+    display_name: Rear
+    enabled: false
+    source_type: image_dir
+    source: samples/input/behind
+  left:
+    display_name: Left
+    enabled: false
+    source_type: image_dir
+    source: samples/input/left
+  right:
+    display_name: Right
+    enabled: false
+    source_type: image_dir
+    source: samples/input/right
+language: zh_CN
+performance:
+  process_fps: 5
+  preview_fps: 2
+  max_input_width: 960
+  refresh_warped_preview: false
+  use_intrinsics: false

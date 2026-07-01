@@ -1,0 +1,35 @@
+# Local camera and network configuration
+configs/cameras.yaml
+configs/network.yaml
+
+# Runtime projects, captures, calibration artifacts, and reports
+projects/backups/
+projects/calibration_snapshots/
+samples/input/
+samples/output/
+samples/calibration/
+testbd/
+reports/
+
+# Python bytecode, caches, environments, and test output
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Editor and operating-system metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,624 @@
+canvas:
+  width: 2440
+  height: 1800
+transition_width: 5
+active_camera_count: 5
+stitch_topology: triple_front_panorama
+topologies:
+  dual_horizontal:
+    active_cameras:
+    - front_left
+    - front_right
+    canvas:
+      width: 1600
+      height: 600
+    cameras:
+      front_left:
+        display_name: Front Left
+        source_points:
+        - - 0.0
+          - 0.0
+        - - 0.0
+          - 539.0
+        - - 959.0
+          - 0.0
+        - - 959.0
+          - 539.0
+        target_points:
+        - - 0.0
+          - 0.0
+        - - 0.0
+          - 600.0
+        - - 900.0
+          - 0.0
+        - - 900.0
+          - 600.0
+      front_right:
+        display_name: Front Right
+        source_points:
+        - - 0.0
+          - 0.0
+        - - 0.0
+          - 539.0
+        - - 959.0
+          - 0.0
+        - - 959.0
+          - 539.0
+        target_points:
+        - - 700.0
+          - 0.0
+        - - 700.0
+          - 600.0
+        - - 1600.0
+          - 0.0
+        - - 1600.0
+          - 600.0
+    stitch_points:
+      front_left_front_right:
+      - - 1132.143
+        - 97.479
+      - - 1575.84
+        - 81.513
+    overlaps:
+    - name: front_left_front_right
+      cameras:
+      - front_left
+      - front_right
+      x_range:
+      - 700.0
+      - 900.0
+      seam: front_left_front_right
+      feather_width: 160
+    composition:
+      mode: horizontal_feather
+      feather_width: 160
+  triple_front_panorama:
+    active_cameras:
+    - front_left
+    - front
+    - front_right
+    calibration_origin:
+      source_points: initial_template
+      target_points: initial_template
+      seams: field_adjusted
+      feather: initial_template
+    canvas:
+      width: 3200
+      height: 1080
+    cameras:
+      front_left:
+        display_name: Left
+        source_points:
+        - - 0.0
+          - 0.0
+        - - 0.0
+          - 539.0
+        - - 959.0
+          - 0.0
+        - - 959.0
+          - 539.0
+        target_points:
+        - - 0.0
+          - 0.0
+        - - 0.0
+          - 700.0
+        - - 850.0
+          - 0.0
+        - - 850.0
+          - 700.0
+      front:
+        display_name: Front
+        source_points:
+        - - 0.0
+          - 0.0
+        - - 0.0
+          - 539.0
+        - - 959.0
+          - 0.0
+        - - 959.0
+          - 539.0
+        target_points:
+        - - 650.0
+          - 0.0
+        - - 650.0
+          - 700.0
+        - - 1550.0
+          - 0.0
+        - - 1550.0
+          - 700.0
+      front_right:
+        display_name: Right
+        source_points:
+        - - 0.0
+          - 0.0
+        - - 0.0
+          - 539.0
+        - - 959.0
+          - 0.0
+        - - 959.0
+          - 539.0
+        target_points:
+        - - 1350.0
+          - 0.0
+        - - 1350.0
+          - 700.0
+        - - 2200.0
+          - 0.0
+        - - 2200.0
+          - 700.0
+    stitch_points:
+      left_front:
+      - - 882.809
+        - 0.0
+      - - 880.456
+        - 717.059
+      front_right:
+      - - 1953.594
+        - 0.0
+      - - 1948.888
+        - 721.765
+    overlaps:
+    - name: left_front
+      cameras:
+      - front_left
+      - front
+      x_range:
+      - 650.0
+      - 850.0
+      seam: left_front
+      feather_width: 160
+    - name: front_right
+      cameras:
+      - front
+      - front_right
+      x_range:
+      - 1350.0
+      - 1550.0
+      seam: front_right
+      feather_width: 160
+    composition:
+      mode: horizontal_feather
+      feather_width: 160
+  legacy_surround_5:
+    legacy_root: true
+camera_order:
+- front_left
+- front_right
+- behind
+- left
+- right
+calibration_board:
+  total_columns: 12
+  total_rows: 9
+  square_size_mm: 25.0
+cameras:
+  front_left:
+    display_name: Front Left
+    source_points:
+    - - 236.692
+      - 383.275
+    - - 216.5395
+      - 451.0785
+    - - 753.6
+      - 383.8395
+    - - 778.765
+      - 444.1495
+    target_points:
+    - - 1497.0
+      - 153.0
+    - - 1399.0
+      - 153.0
+    - - 1497.0
+      - 926.0
+    - - 1399.0
+      - 926.0
+  front_right:
+    display_name: Front Right
+    source_points:
+    - - 162.718
+      - 368.168
+    - - 133.14
+      - 432.264
+    - - 686.095
+      - 380.0665
+    - - 701.775
+      - 444.398
+    target_points:
+    - - 1497.0
+      - 153.0
+    - - 1399.0
+      - 153.0
+    - - 1497.0
+      - 926.0
+    - - 1399.0
+      - 926.0
+  behind:
+    display_name: Rear
+    source_points:
+    - - 235.2835
+      - 361.1665
+    - - 215.3025
+      - 423.318
+    - - 796.055
+      - 363.371
+    - - 820.555
+      - 425.607
+    target_points:
+    - - 423.0
+      - 926.0
+    - - 521.0
+      - 926.0
+    - - 423.0
+      - 153.0
+    - - 521.0
+      - 153.0
+  left:
+    display_name: Left
+    source_points:
+    - - 103.991
+      - 379.999
+    - - 59.6665
+      - 475.3355
+    - - 876.85
+      - 399.525
+    - - 914.06
+      - 505.385
+    target_points:
+    - - 423.0
+      - 153.0
+    - - 423.0
+      - 291.0
+    - - 1497.0
+      - 153.0
+    - - 1497.0
+      - 291.0
+  right:
+    display_name: Right
+    source_points:
+    - - 61.943
+      - 372.8975
+    - - 11.3113
+      - 475.218
+    - - 829.105
+      - 400.624
+    - - 870.195
+      - 502.55
+    target_points:
+    - - 1497.0
+      - 926.0
+    - - 1497.0
+      - 788.0
+    - - 423.0
+      - 926.0
+    - - 423.0
+      - 788.0
+stitch_points:
+  front_right:
+  - - 280.0
+    - 0.0
+  - - 781.0
+    - 681.0
+  right_behind:
+  - - 2000.0
+    - 0.0
+  - - 1541.0
+    - 680.0
+  behind_left:
+  - - 2000.0
+    - 1800.0
+  - - 1540.0
+    - 1101.0
+  left_front:
+  - - 280.0
+    - 1800.0
+  - - 780.0
+    - 1100.0
+mask_rules:
+- camera: behind
+  line_a: left_front
+  line_b: front_right
+  side: behind_other
+- camera: left
+  line_a: front_right
+  line_b: right_behind
+  side: left_other
+- camera: front_left
+  line_a: right_behind
+  line_b: behind_left
+  side: front_other_left
+- camera: front_right
+  line_a: right_behind
+  line_b: behind_left
+  side: front_other_right
+- camera: right
+  line_a: behind_left
+  line_b: left_front
+  side: right_other
+camera_intrinsics:
+  front_right:
+    rms: 4.143481280559135
+    image_count: 8
+    input_image_count: 10
+    image_size:
+    - 3840
+    - 2160
+    camera_matrix:
+    - - 1744.6831290079008
+      - 0.0
+      - 1947.3825591195603
+    - - 0.0
+      - 1735.0858315515172
+      - 997.771389585744
+    - - 0.0
+      - 0.0
+      - 1.0
+    distortion:
+    - -0.3973315986069606
+    - 0.1687265503354146
+    - -0.003185239472350117
+    - -0.0123184764626132
+    - -0.03861569859282958
+    mean_reprojection_error: 0.3243801584462742
+    per_view_reprojection_errors:
+    - 0.10594613610397854
+    - 0.0979131657198995
+    - 0.7219636458179387
+    - 0.07846244284792524
+    - 0.5911730563806681
+    - 0.10884751597104651
+    - 0.8021088118568165
+    - 0.08862649287192098
+    detections:
+    - index: 0
+      detected: false
+      corner_count: 0
+    - index: 1
+      detected: true
+      corner_count: 88
+    - index: 2
+      detected: true
+      corner_count: 88
+    - index: 3
+      detected: true
+      corner_count: 88
+    - index: 4
+      detected: true
+      corner_count: 88
+    - index: 5
+      detected: false
+      corner_count: 0
+    - index: 6
+      detected: true
+      corner_count: 88
+    - index: 7
+      detected: true
+      corner_count: 88
+    - index: 8
+      detected: true
+      corner_count: 88
+    - index: 9
+      detected: true
+      corner_count: 88
+    rotation_vectors:
+    - - -0.23791780210452007
+      - 0.29349510357642683
+      - -0.04397043696792293
+    - - -0.0817150809981136
+      - -0.06463143951221764
+      - -0.17177412625012278
+    - - -0.08765075245718405
+      - -0.035712015663336316
+      - -0.18084579112691657
+    - - -0.09208455808737118
+      - 0.04142696636449343
+      - -0.1702222970249972
+    - - -0.06937662753481444
+      - -0.06840592975697428
+      - -0.08860769789642285
+    - - -0.025003469525393573
+      - -0.12646750284340988
+      - -0.10874060079882579
+    - - -0.07354597740136513
+      - -0.2448558523082419
+      - -0.1436933252107162
+    - - -0.159208285239745
+      - -0.12212013889256407
+      - -0.14486669255120613
+    translation_vectors:
+    - - -567.4537681972593
+      - -201.8042248703521
+      - 846.0797777801259
+    - - -606.135371754064
+      - -172.56962461184884
+      - 790.4369380295954
+    - - -638.801813101244
+      - -163.60125507976724
+      - 772.1909797994787
+    - - -811.6613004899815
+      - -145.06826041118958
+      - 795.6508568250042
+    - - -795.6090215947593
+      - -481.51570116746217
+      - 798.2366840119209
+    - - -535.3544013158797
+      - -487.4660659696131
+      - 832.8179161050602
+    - - -374.734406118164
+      - -512.4735978730706
+      - 831.0273122748011
+    - - -147.0956225221299
+      - -24.78215982417434
+      - 917.2391272965486
+  front_left:
+    rms: 0.44566039292731974
+    image_count: 13
+    input_image_count: 18
+    image_size:
+    - 3840
+    - 2160
+    camera_matrix:
+    - - 2578.5768388995352
+      - 0.0
+      - 1818.2043968788216
+    - - 0.0
+      - 2623.226406449173
+      - 975.672497486544
+    - - 0.0
+      - 0.0
+      - 1.0
+    distortion:
+    - -0.9962312511742835
+    - 1.9227141425796652
+    - 0.003019146465714871
+    - -0.01739287007823587
+    - -2.4010876179123066
+    mean_reprojection_error: 0.04421945426723316
+    per_view_reprojection_errors:
+    - 0.051040099055872194
+    - 0.05593274595476563
+    - 0.04964812518806543
+    - 0.09913896715971657
+    - 0.03559721407321103
+    - 0.03543696925530001
+    - 0.03543696925530001
+    - 0.03543696925530001
+    - 0.03543696925530001
+    - 0.03543696925530001
+    - 0.03543696925530001
+    - 0.03543696925530001
+    - 0.03543696925530001
+    detections:
+    - index: 0
+      detected: true
+      corner_count: 88
+    - index: 1
+      detected: true
+      corner_count: 88
+    - index: 2
+      detected: true
+      corner_count: 88
+    - index: 3
+      detected: false
+      corner_count: 0
+    - index: 4
+      detected: false
+      corner_count: 0
+    - index: 5
+      detected: false
+      corner_count: 0
+    - index: 6
+      detected: false
+      corner_count: 0
+    - index: 7
+      detected: false
+      corner_count: 0
+    - index: 8
+      detected: true
+      corner_count: 88
+    - index: 9
+      detected: true
+      corner_count: 88
+    - index: 10
+      detected: true
+      corner_count: 88
+    - index: 11
+      detected: true
+      corner_count: 88
+    - index: 12
+      detected: true
+      corner_count: 88
+    - index: 13
+      detected: true
+      corner_count: 88
+    - index: 14
+      detected: true
+      corner_count: 88
+    - index: 15
+      detected: true
+      corner_count: 88
+    - index: 16
+      detected: true
+      corner_count: 88
+    - index: 17
+      detected: true
+      corner_count: 88
+    rotation_vectors:
+    - - 0.010302655769016634
+      - -0.12310322392225911
+      - -0.0664452813665644
+    - - 0.03457910884802041
+      - -0.15603862305562743
+      - -0.06991793816891523
+    - - 0.029661912708409833
+      - -0.15742492980933404
+      - -0.0580224955413582
+    - - -0.024003019609171644
+      - -0.14868508549749512
+      - -0.009404738968793628
+    - - 0.015345500446157472
+      - -0.11879094149593204
+      - -0.030040933703899722
+    - - 0.015519125802956512
+      - -0.11708017468172255
+      - -0.029693618992494477
+    - - 0.015519125802952893
+      - -0.1170801746816853
+      - -0.029693618992488728
+    - - 0.015519125802949812
+      - -0.11708017468168884
+      - -0.029693618992489748
+    - - 0.015519125802949969
+      - -0.11708017468167528
+      - -0.029693618992487684
+    - - 0.015519125802950368
+      - -0.11708017468169528
+      - -0.029693618992490463
+    - - 0.01551912580294946
+      - -0.117080174681688
+      - -0.029693618992489304
+    - - 0.0155191258029546
+      - -0.11708017468172548
+      - -0.029693618992495063
+    - - 0.01551912580295425
+      - -0.11708017468170336
+      - -0.029693618992491146
+    translation_vectors:
+    - - -153.06441718960184
+      - -127.05912418565225
+      - 851.1118388456218
+    - - -142.98258392685423
+      - -124.75744212430394
+      - 825.2071573353728
+    - - -142.5934374148474
+      - -125.43966427455446
+      - 836.4924269312984
+    - - -44.57697979626615
+      - -138.5647194247575
+      - 913.0295609764
+    - - -29.26998620590537
+      - -300.4210254467215
+      - 896.1658743638677
+    - - -29.725043143733703
+      - -300.46979521102173
+      - 896.3513472264522
+    - - -29.725043143733128
+      - -300.4697952110245
+      - 896.3513472264654
+    - - -29.725043143733366
+      - -300.469795211024
+      - 896.3513472264634
+    - - -29.725043143733128
+      - -300.469795211025
+      - 896.3513472264682
+    - - -29.72504314373343
+      - -300.4697952110236
+      - 896.3513472264614
+    - - -29.725043143733313
+      - -300.4697952110243
+      - 896.3513472264643
+    - - -29.72504314373382
+      - -300.4697952110215
+      - 896.3513472264509
+    - - -29.725043143733444
+      - -300.4697952110232
+      - 896.3513472264589

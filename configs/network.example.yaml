@@ -1,0 +1,13 @@
+output:
+  enabled: false
+  protocol: rtsp
+  host: stream.example.invalid
+  port: 8554
+  path: surround
+udp_legacy:
+  enabled: false
+  send_ip: 127.0.0.1
+  base_port: 9000
+  control_port: 9006
+  feedback_port: 9007
+  jpeg_quality: 80
