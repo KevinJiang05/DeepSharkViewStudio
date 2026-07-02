@@ -5,6 +5,12 @@ configs/network.yaml
 # Runtime projects, captures, calibration artifacts, and reports
 projects/backups/
 projects/calibration_snapshots/
+projects/calibration_candidates/
+projects/calibration_sessions/
+projects/layout_candidates/
+projects/pairwise_diagnostics/
+projects/projection_candidates/
+projects/seam_candidates/
 samples/input/
 samples/output/
 samples/calibration/
