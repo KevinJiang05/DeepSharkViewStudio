@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import cv2
 import numpy as np
+
+
+@dataclass(frozen=True)
+class FrontPriorityCostParams:
+    enabled: bool = False
+    weight: float = 0.40
+    preferred_side_fraction: float = 0.25
+    max_side_fraction: float = 0.50
+    ramp: str = "smoothstep"
+
+    def to_dict(self) -> dict[str, bool | float | str]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -14,12 +26,28 @@ class SeamCostParams:
     gradient_weight: float = 0.25
     edge_weight: float = 0.20
     margin_weight: float = 0.10
+    high_difference_weight: float = 0.0
+    object_proximity_weight: float = 0.0
     normalize_percentile: float = 95.0
     safe_erode_px: int = 6
     invalid_cost: float = 1.0e9
+    front_priority: FrontPriorityCostParams = field(
+        default_factory=FrontPriorityCostParams
+    )
 
-    def to_dict(self) -> dict[str, float | int]:
-        return asdict(self)
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "color_weight": self.color_weight,
+            "gradient_weight": self.gradient_weight,
+            "edge_weight": self.edge_weight,
+            "margin_weight": self.margin_weight,
+            "high_difference_weight": self.high_difference_weight,
+            "object_proximity_weight": self.object_proximity_weight,
+            "normalize_percentile": self.normalize_percentile,
+            "safe_erode_px": self.safe_erode_px,
+            "invalid_cost": self.invalid_cost,
+            "front_priority": self.front_priority.to_dict(),
+        }
 
 
 @dataclass(frozen=True)
@@ -31,6 +59,10 @@ class SeamCostResult:
     edge_cost: np.ndarray
     margin_cost: np.ndarray
     x_range: tuple[int, int]
+    front_priority_cost: np.ndarray | None = None
+    high_difference_cost: np.ndarray | None = None
+    object_proximity_cost: np.ndarray | None = None
+    side_position: str | None = None
 
 
 class SeamCostBuilder:
@@ -42,6 +74,7 @@ class SeamCostBuilder:
         image_b: np.ndarray,
         x_range: tuple[int, int],
         params: SeamCostParams | None = None,
+        side_position: str | None = None,
     ) -> SeamCostResult:
         params = params or SeamCostParams()
         if image_a.shape != image_b.shape:
@@ -104,12 +137,22 @@ class SeamCostBuilder:
             valid_mask,
             params.normalize_percentile,
         )
+        high_difference_cost = np.maximum(color_cost, gradient_cost).astype(np.float32)
+        object_proximity_cost = np.maximum(edge_cost, margin_cost).astype(np.float32)
+        front_priority_cost = self._front_priority_cost(
+            valid_mask,
+            params.front_priority,
+            side_position,
+        )
 
         cost = (
             params.color_weight * color_cost
             + params.gradient_weight * gradient_cost
             + params.edge_weight * edge_cost
             + params.margin_weight * margin_cost
+            + params.high_difference_weight * high_difference_cost
+            + params.object_proximity_weight * object_proximity_cost
+            + params.front_priority.weight * front_priority_cost
         ).astype(np.float32)
         cost[~valid_mask] = np.float32(params.invalid_cost)
 
@@ -121,6 +164,10 @@ class SeamCostBuilder:
             edge_cost=edge_cost,
             margin_cost=margin_cost,
             x_range=(start, end),
+            front_priority_cost=front_priority_cost,
+            high_difference_cost=high_difference_cost,
+            object_proximity_cost=object_proximity_cost,
+            side_position=side_position,
         )
 
     @staticmethod
@@ -169,3 +216,23 @@ class SeamCostBuilder:
             scale = max(max_value, 1.0)
         normalized[valid_mask] = np.clip(values[valid_mask] / scale, 0.0, 1.0)
         return normalized
+
+    @staticmethod
+    def _front_priority_cost(
+        valid_mask: np.ndarray,
+        params: FrontPriorityCostParams,
+        side_position: str | None,
+    ) -> np.ndarray:
+        height, width = valid_mask.shape
+        cost = np.zeros((height, width), dtype=np.float32)
+        if not params.enabled or side_position not in {"left", "right"} or width <= 1:
+            return cost
+        x_norm = np.linspace(0.0, 1.0, width, dtype=np.float32)
+        side_fraction = x_norm if side_position == "left" else 1.0 - x_norm
+        denom = max(1e-6, params.max_side_fraction - params.preferred_side_fraction)
+        t = np.clip((side_fraction - params.preferred_side_fraction) / denom, 0.0, 1.0)
+        if params.ramp == "smoothstep":
+            t = t * t * (3.0 - 2.0 * t)
+        cost[:, :] = t[None, :]
+        cost[~valid_mask] = 0.0
+        return cost

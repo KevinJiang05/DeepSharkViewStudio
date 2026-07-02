@@ -12,10 +12,11 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QDesktopServices,
     QFont,
     QImage,
     QPainter,
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QSpinBox,
     QStackedWidget,
     QSplitter,
@@ -119,6 +121,18 @@ from deep_shark_studio.stream_manager import (
 )
 from deep_shark_studio.stitch_processing import StitchProcessingManager
 from deep_shark_studio.stitcher import SurroundStitcher, load_images_from_directory, save_image
+from deep_shark_studio.seam import (
+    LAYOUT_TUNER_PRESETS_V2,
+    CameraAdjustParams,
+    LayoutPreviewParamsV2,
+    PairLayoutParams,
+    LayoutTunerParams,
+    default_layout_candidate_root,
+    layout_tuner_pair_candidates,
+    normalize_layout_tuner_params,
+    render_front_priority_layout_preview,
+    save_layout_tuner_candidate,
+)
 from deep_shark_studio.topology import (
     active_stitch_profile,
     active_topology_camera_keys,
@@ -379,6 +393,67 @@ ZH_CN = {
     "Failed": "失败",
     "Stopped": "已停止",
     "Stopping": "停止中",
+    "Layout Tuner": "布局调参",
+    "Experimental front-priority layout tuner. Uses current perspective/template warped images only; projection candidates are not used here and formal calibration.yaml is never written.": "实验性前视优先布局调参。这里只使用当前透视/模板 warp 后的图像，不使用 projection 候选，也绝不写入正式 calibration.yaml。",
+    "Preset": "预设",
+    "Balanced": "均衡",
+    "Conservative": "保守",
+    "Wide": "宽视场",
+    "Hard Seam": "硬切",
+    "Front Smaller": "缩小前视",
+    "Core Layout": "核心布局",
+    "Pair Boundary Params": "左右边界参数",
+    "Lock Left/Right Pair Params": "锁定左右参数",
+    "Left Side Shift": "左侧收边",
+    "Left Side Visible": "左侧可见比例",
+    "Left Feather": "左侧 Feather",
+    "Right Side Shift": "右侧收边",
+    "Right Side Visible": "右侧可见比例",
+    "Right Feather": "右侧 Feather",
+    "Post-warp Camera Adjustment": "Warp 后相机画面调整",
+    "X Offset": "X 偏移",
+    "Y Offset": "Y 偏移",
+    "Scale": "缩放",
+    "Vertical Safe Ratio": "上下安全比例",
+    "Side Vertical Fade": "侧路上下淡出",
+    "front_left": "左前",
+    "front": "前视",
+    "front_right": "右前",
+    "Reset Camera Adjust": "重置画面调整",
+    "Reset Front Only": "只重置前视",
+    "Reset Side Cameras": "重置左右侧路",
+    "Lock Side Camera Scale": "锁定左右侧路缩放",
+    "Advanced Vertical Safety": "高级：上下边缘保护",
+    "Moves front_left right and front_right left.": "让 front_left 向右收、front_right 向左收，用于减少侧路重复显示。",
+    "Moves this side camera inward after warp.": "在 warp 后将当前侧路画面向内收。",
+    "Final width crop only; no scaling.": "最终输出宽度；只裁剪，不缩放。",
+    "Allowed side-camera edge fraction.": "允许侧路相机显示的边缘比例。",
+    "Narrow seam feather; 0 means hard seam.": "拼接边界附近的窄 feather；0 表示硬切。",
+    "Preview-only x/y/scale after warp; not real extrinsics calibration.": "仅用于预览的 warp 后 x/y/缩放微调；不是外参标定。",
+    "Horizontal preview offset after warp.": "Warp 后水平预览偏移。",
+    "Vertical preview offset after warp.": "Warp 后垂直预览偏移。",
+    "Preview-only scale around valid-image center.": "围绕有效画面中心做仅预览缩放。",
+    "Final height crop only; no scaling.": "最终输出高度；只裁剪，不缩放。",
+    "Suppress only side cameras near top/bottom bands.": "只压制侧路相机的上下边缘，不压制 front。",
+    "Smooth fade width for side top/bottom suppression.": "侧路上下边缘压制的平滑过渡宽度。",
+    "Capture Preview Frame": "捕获预览帧",
+    "Refresh Preview": "刷新预览",
+    "Reset to Baseline": "恢复基准",
+    "Save Layout Candidate": "保存布局候选",
+    "Export Preview PNG": "导出预览 PNG",
+    "Open Candidate Folder": "打开候选目录",
+    "Capture preview frame to tune layout.": "请先捕获预览帧，再调整布局。",
+    "No cached warped images. Click Capture Preview Frame.": "没有缓存的 warped images。请点击“捕获预览帧”。",
+    "Missing frames for layout tuner: {cameras}": "布局调参缺少画面：{cameras}",
+    "Layout tuner capture failed: {error}": "布局调参捕获失败：{error}",
+    "Layout tuner render failed: {error}": "布局调参渲染失败：{error}",
+    "Layout tuner preview rendered in {ms:.1f} ms": "布局调参预览已渲染：{ms:.1f} ms",
+    "Capture and render a preview before saving.": "请先捕获并渲染预览，再保存。",
+    "Layout tuner candidate save failed: {error}": "布局候选保存失败：{error}",
+    "Layout candidate saved: {path}": "布局候选已保存：{path}",
+    "Capture and render a preview before export.": "请先捕获并渲染预览，再导出。",
+    "Export layout tuner preview": "导出布局调参预览",
+    "Layout tuner preview exported: {path}": "布局调参预览已导出：{path}",
 }
 
 
@@ -1362,6 +1437,10 @@ class MainWindow(QMainWindow):
         self.frames: dict[str, np.ndarray] = {}
         self.warped: dict[str, np.ndarray] = {}
         self.canvas: np.ndarray | None = None
+        self.layout_tuner_warped: dict[str, np.ndarray] = {}
+        self.layout_tuner_preview_result: Any | None = None
+        self.layout_tuner_candidate_dir: Path | None = None
+        self.layout_tuner_source_info: dict[str, Any] = {}
         self.stream_manager = CameraStreamManager()
         self.stream_snapshots = {}
         self.stream_error_log_counts: dict[str, int] = {}
@@ -1407,6 +1486,12 @@ class MainWindow(QMainWindow):
         self.preview_timer = QTimer(self)
         self.preview_timer.setInterval(15)
         self.preview_timer.timeout.connect(self.update_live_preview)
+        self.layout_tuner_preview_timer = QTimer(self)
+        self.layout_tuner_preview_timer.setSingleShot(True)
+        self.layout_tuner_preview_timer.setInterval(150)
+        self.layout_tuner_preview_timer.timeout.connect(
+            self.refresh_layout_tuner_preview
+        )
 
         self.camera_rows: dict[str, CameraRow] = {}
         self.camera_views: dict[str, ImageView] = {}
@@ -1709,6 +1794,10 @@ class MainWindow(QMainWindow):
         self._layout_camera_views(self.warped_views, self.warped_grid_layout)
         self.canvas_tab_index = self.preview_tabs.addTab(self.canvas_view, self.t("Canvas"))
         self.warped_tab_index = self.preview_tabs.addTab(self.warped_page, self.t("Warped Views"))
+        self.layout_tuner_tab_index = self.preview_tabs.addTab(
+            self._build_layout_tuner_page(),
+            self.t("Layout Tuner"),
+        )
         self.preview_tabs.currentChanged.connect(self.on_preview_tab_changed)
 
         self.preview_splitter.addWidget(self.camera_grid)
@@ -1730,6 +1819,775 @@ class MainWindow(QMainWindow):
         root.addWidget(self.health_table)
         self.apply_live_stitch_mode_controls()
         return page
+
+    def _build_layout_tuner_page(self) -> QWidget:
+        page = QWidget()
+        root = QHBoxLayout(page)
+        root.setContentsMargins(6, 6, 6, 6)
+        root.setSpacing(8)
+
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(8)
+
+        note = QLabel(
+            self.t(
+                "Experimental front-priority layout tuner. Uses current "
+                "perspective/template warped images only; projection candidates "
+                "are not used here and formal calibration.yaml is never written."
+            )
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            "QLabel { color: #92400e; background: #fffbeb; "
+            "border: 1px solid #fcd34d; padding: 6px; }"
+        )
+        controls_layout.addWidget(note)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel(self.t("Preset")))
+        self.layout_tuner_preset = QComboBox()
+        for name in LAYOUT_TUNER_PRESETS_V2:
+            self.layout_tuner_preset.addItem(self.t(name), name)
+        self.layout_tuner_preset.currentIndexChanged.connect(
+            self.on_layout_tuner_preset_changed
+        )
+        preset_row.addWidget(self.layout_tuner_preset, 1)
+        controls_layout.addLayout(preset_row)
+
+        params_group = QGroupBox(self.t("Core Layout"))
+        params_form = QFormLayout(params_group)
+        self.layout_tuner_output_width = self._layout_tuner_int_control(
+            1500,
+            2200,
+            20,
+            1800,
+            self.t("Final width crop only; no scaling."),
+        )
+        params_form.addRow(self.t("Width"), self.layout_tuner_output_width["widget"])
+        controls_layout.addWidget(params_group)
+
+        pair_group = QGroupBox(self.t("Pair Boundary Params"))
+        pair_layout = QVBoxLayout(pair_group)
+        self.layout_tuner_pair_syncing = False
+        self.layout_tuner_lock_pairs = QCheckBox(self.t("Lock Left/Right Pair Params"))
+        self.layout_tuner_lock_pairs.setChecked(True)
+        self.layout_tuner_lock_pairs.stateChanged.connect(
+            self._on_layout_tuner_lock_pairs_changed
+        )
+        pair_layout.addWidget(self.layout_tuner_lock_pairs)
+        pair_form = QFormLayout()
+        self.layout_tuner_left_shift = self._layout_tuner_int_control(
+            0,
+            160,
+            5,
+            40,
+            self.t("Moves this side camera inward after warp."),
+        )
+        self.layout_tuner_left_fraction = self._layout_tuner_float_control(
+            0.10,
+            0.50,
+            0.01,
+            0.30,
+            self.t("Allowed side-camera edge fraction."),
+        )
+        self.layout_tuner_left_feather = self._layout_tuner_int_control(
+            0,
+            48,
+            2,
+            24,
+            self.t("Narrow seam feather; 0 means hard seam."),
+        )
+        self.layout_tuner_right_shift = self._layout_tuner_int_control(
+            0,
+            160,
+            5,
+            40,
+            self.t("Moves this side camera inward after warp."),
+        )
+        self.layout_tuner_right_fraction = self._layout_tuner_float_control(
+            0.10,
+            0.50,
+            0.01,
+            0.30,
+            self.t("Allowed side-camera edge fraction."),
+        )
+        self.layout_tuner_right_feather = self._layout_tuner_int_control(
+            0,
+            48,
+            2,
+            24,
+            self.t("Narrow seam feather; 0 means hard seam."),
+        )
+        self.layout_tuner_side_shift = self.layout_tuner_left_shift
+        self.layout_tuner_side_fraction = self.layout_tuner_left_fraction
+        self.layout_tuner_feather = self.layout_tuner_left_feather
+        pair_form.addRow(self.t("Left Side Shift"), self.layout_tuner_left_shift["widget"])
+        pair_form.addRow(self.t("Left Side Visible"), self.layout_tuner_left_fraction["widget"])
+        pair_form.addRow(self.t("Left Feather"), self.layout_tuner_left_feather["widget"])
+        pair_form.addRow(self.t("Right Side Shift"), self.layout_tuner_right_shift["widget"])
+        pair_form.addRow(self.t("Right Side Visible"), self.layout_tuner_right_fraction["widget"])
+        pair_form.addRow(self.t("Right Feather"), self.layout_tuner_right_feather["widget"])
+        pair_layout.addLayout(pair_form)
+        controls_layout.addWidget(pair_group)
+        self._connect_layout_tuner_pair_sync_controls()
+
+        camera_group = QGroupBox(self.t("Post-warp Camera Adjustment"))
+        camera_group.setToolTip(self.t("Preview-only x/y/scale after warp; not real extrinsics calibration."))
+        camera_layout = QVBoxLayout(camera_group)
+        self.layout_tuner_camera_adjust_syncing = False
+        self.layout_tuner_lock_side_scale = QCheckBox(self.t("Lock Side Camera Scale"))
+        self.layout_tuner_lock_side_scale.setChecked(False)
+        self.layout_tuner_lock_side_scale.stateChanged.connect(
+            self._on_layout_tuner_lock_side_scale_changed
+        )
+        camera_layout.addWidget(self.layout_tuner_lock_side_scale)
+        self.layout_tuner_camera_adjust_controls: dict[str, dict[str, dict[str, Any]]] = {}
+        for camera in ("front_left", "front", "front_right"):
+            form = QFormLayout()
+            row = QWidget()
+            row_layout = QVBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(QLabel(self.t(camera)))
+            camera_controls = {
+                "x": self._layout_tuner_int_control(
+                    -120,
+                    120,
+                    2,
+                    0,
+                    self.t("Horizontal preview offset after warp."),
+                ),
+                "y": self._layout_tuner_int_control(
+                    -80,
+                    80,
+                    2,
+                    0,
+                    self.t("Vertical preview offset after warp."),
+                ),
+                "scale": self._layout_tuner_float_control(
+                    0.85,
+                    1.15,
+                    0.01,
+                    1.00,
+                    self.t("Preview-only scale around valid-image center."),
+                ),
+            }
+            self.layout_tuner_camera_adjust_controls[camera] = camera_controls
+            form.addRow(self.t("X Offset"), camera_controls["x"]["widget"])
+            form.addRow(self.t("Y Offset"), camera_controls["y"]["widget"])
+            form.addRow(self.t("Scale"), camera_controls["scale"]["widget"])
+            row_layout.addLayout(form)
+            camera_layout.addWidget(row)
+        camera_buttons = QGridLayout()
+        self.layout_tuner_reset_camera_adjust_button = QPushButton(self.t("Reset Camera Adjust"))
+        self.layout_tuner_reset_front_button = QPushButton(self.t("Reset Front Only"))
+        self.layout_tuner_reset_sides_button = QPushButton(self.t("Reset Side Cameras"))
+        self.layout_tuner_reset_camera_adjust_button.clicked.connect(
+            self.reset_layout_tuner_camera_adjust
+        )
+        self.layout_tuner_reset_front_button.clicked.connect(
+            self.reset_layout_tuner_front_adjust
+        )
+        self.layout_tuner_reset_sides_button.clicked.connect(
+            self.reset_layout_tuner_side_adjust
+        )
+        camera_buttons.addWidget(self.layout_tuner_reset_camera_adjust_button, 0, 0)
+        camera_buttons.addWidget(self.layout_tuner_reset_front_button, 0, 1)
+        camera_buttons.addWidget(self.layout_tuner_reset_sides_button, 1, 0, 1, 2)
+        camera_layout.addLayout(camera_buttons)
+        controls_layout.addWidget(camera_group)
+        self._connect_layout_tuner_camera_adjust_controls()
+
+        advanced_group = QGroupBox(self.t("Advanced Vertical Safety"))
+        advanced_form = QFormLayout(advanced_group)
+        self.layout_tuner_output_height = self._layout_tuner_int_control(
+            520,
+            700,
+            20,
+            700,
+            self.t("Final height crop only; no scaling."),
+        )
+        self.layout_tuner_vertical_safe = self._layout_tuner_float_control(
+            0.70,
+            1.00,
+            0.01,
+            1.00,
+            self.t("Suppress only side cameras near top/bottom bands."),
+        )
+        self.layout_tuner_vertical_fade = self._layout_tuner_int_control(
+            0,
+            96,
+            8,
+            0,
+            self.t("Smooth fade width for side top/bottom suppression."),
+        )
+        advanced_form.addRow(self.t("Height"), self.layout_tuner_output_height["widget"])
+        advanced_form.addRow(self.t("Vertical Safe Ratio"), self.layout_tuner_vertical_safe["widget"])
+        advanced_form.addRow(self.t("Side Vertical Fade"), self.layout_tuner_vertical_fade["widget"])
+        controls_layout.addWidget(advanced_group)
+
+        action_grid = QGridLayout()
+        self.layout_tuner_capture_button = QPushButton(self.t("Capture Preview Frame"))
+        self.layout_tuner_refresh_button = QPushButton(self.t("Refresh Preview"))
+        self.layout_tuner_reset_button = QPushButton(self.t("Reset to Baseline"))
+        self.layout_tuner_save_button = QPushButton(self.t("Save Layout Candidate"))
+        self.layout_tuner_export_button = QPushButton(self.t("Export Preview PNG"))
+        self.layout_tuner_open_button = QPushButton(self.t("Open Candidate Folder"))
+        self.layout_tuner_capture_button.clicked.connect(
+            self.capture_layout_tuner_preview_frame
+        )
+        self.layout_tuner_refresh_button.clicked.connect(
+            self.refresh_layout_tuner_preview
+        )
+        self.layout_tuner_reset_button.clicked.connect(
+            self.reset_layout_tuner_to_baseline
+        )
+        self.layout_tuner_save_button.clicked.connect(
+            self.save_layout_tuner_candidate
+        )
+        self.layout_tuner_export_button.clicked.connect(
+            self.export_layout_tuner_preview_png
+        )
+        self.layout_tuner_open_button.clicked.connect(
+            self.open_layout_tuner_candidate_folder
+        )
+        action_grid.addWidget(self.layout_tuner_capture_button, 0, 0)
+        action_grid.addWidget(self.layout_tuner_refresh_button, 0, 1)
+        action_grid.addWidget(self.layout_tuner_reset_button, 1, 0)
+        action_grid.addWidget(self.layout_tuner_save_button, 1, 1)
+        action_grid.addWidget(self.layout_tuner_export_button, 2, 0)
+        action_grid.addWidget(self.layout_tuner_open_button, 2, 1)
+        controls_layout.addLayout(action_grid)
+
+        self.layout_tuner_metrics = QTextEdit()
+        self.layout_tuner_metrics.setReadOnly(True)
+        self.layout_tuner_metrics.setMaximumHeight(170)
+        controls_layout.addWidget(self.layout_tuner_metrics)
+        controls_layout.addStretch(1)
+
+        controls_scroll = QScrollArea()
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        controls_scroll.setMaximumWidth(450)
+        controls_scroll.setWidget(controls)
+
+        self.layout_tuner_view = ImageView(self.t("Capture preview frame to tune layout."))
+        self.layout_tuner_view.setMinimumSize(320, 220)
+        root.addWidget(controls_scroll)
+        root.addWidget(self.layout_tuner_view, 1)
+        self.reset_layout_tuner_to_baseline(schedule=False)
+        return page
+
+    def _layout_tuner_int_control(
+        self,
+        minimum: int,
+        maximum: int,
+        step: int,
+        value: int,
+        tooltip: str,
+    ) -> dict[str, Any]:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(int(minimum), int(maximum))
+        slider.setSingleStep(int(step))
+        slider.setPageStep(int(step))
+        slider.setValue(int(value))
+        spin = QSpinBox()
+        spin.setRange(int(minimum), int(maximum))
+        spin.setSingleStep(int(step))
+        spin.setValue(int(value))
+        slider.setToolTip(tooltip)
+        spin.setToolTip(tooltip)
+        slider.valueChanged.connect(
+            lambda new_value, s=spin: self._sync_layout_tuner_int(
+                s,
+                int(new_value),
+            )
+        )
+        spin.valueChanged.connect(
+            lambda new_value, s=slider: self._sync_layout_tuner_int(
+                s,
+                int(new_value),
+            )
+        )
+        layout.addWidget(slider, 1)
+        layout.addWidget(spin)
+        return {"widget": container, "slider": slider, "spin": spin}
+
+    def _layout_tuner_float_control(
+        self,
+        minimum: float,
+        maximum: float,
+        step: float,
+        value: float,
+        tooltip: str,
+    ) -> dict[str, Any]:
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        scale = 100
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(int(round(minimum * scale)), int(round(maximum * scale)))
+        slider.setSingleStep(max(1, int(round(step * scale))))
+        slider.setPageStep(max(1, int(round(step * scale * 5))))
+        slider.setValue(int(round(value * scale)))
+        spin = QDoubleSpinBox()
+        spin.setRange(float(minimum), float(maximum))
+        spin.setSingleStep(float(step))
+        spin.setDecimals(2)
+        spin.setValue(float(value))
+        slider.setToolTip(tooltip)
+        spin.setToolTip(tooltip)
+        slider.valueChanged.connect(
+            lambda new_value, s=spin: self._sync_layout_tuner_float(
+                s,
+                float(new_value) / scale,
+            )
+        )
+        spin.valueChanged.connect(
+            lambda new_value, s=slider: self._sync_layout_tuner_slider_float(
+                s,
+                float(new_value),
+                scale,
+            )
+        )
+        layout.addWidget(slider, 1)
+        layout.addWidget(spin)
+        return {"widget": container, "slider": slider, "spin": spin}
+
+    def _sync_layout_tuner_int(self, target: Any, value: int) -> None:
+        target.blockSignals(True)
+        target.setValue(int(value))
+        target.blockSignals(False)
+        self.schedule_layout_tuner_preview()
+
+    def _sync_layout_tuner_float(
+        self,
+        target: QDoubleSpinBox,
+        value: float,
+    ) -> None:
+        target.blockSignals(True)
+        target.setValue(float(value))
+        target.blockSignals(False)
+        self.schedule_layout_tuner_preview()
+
+    def _sync_layout_tuner_slider_float(
+        self,
+        target: QSlider,
+        value: float,
+        scale: int,
+    ) -> None:
+        target.blockSignals(True)
+        target.setValue(int(round(float(value) * scale)))
+        target.blockSignals(False)
+        self.schedule_layout_tuner_preview()
+
+    def _connect_layout_tuner_pair_sync_controls(self) -> None:
+        pairs = [
+            ("left", "shift", self.layout_tuner_left_shift),
+            ("left", "fraction", self.layout_tuner_left_fraction),
+            ("left", "feather", self.layout_tuner_left_feather),
+            ("right", "shift", self.layout_tuner_right_shift),
+            ("right", "fraction", self.layout_tuner_right_fraction),
+            ("right", "feather", self.layout_tuner_right_feather),
+        ]
+        for side, field, control in pairs:
+            control["spin"].valueChanged.connect(
+                lambda _value, s=side, f=field: self._on_layout_tuner_pair_changed(s, f)
+            )
+
+    def _connect_layout_tuner_camera_adjust_controls(self) -> None:
+        for camera, controls in self.layout_tuner_camera_adjust_controls.items():
+            controls["scale"]["spin"].valueChanged.connect(
+                lambda _value, c=camera: self._on_layout_tuner_camera_adjust_changed(c, "scale")
+            )
+
+    def _on_layout_tuner_lock_pairs_changed(self, _state: int) -> None:
+        if not self.layout_tuner_lock_pairs.isChecked():
+            self.schedule_layout_tuner_preview()
+            return
+        for field in ("shift", "fraction", "feather"):
+            self._on_layout_tuner_pair_changed("left", field)
+        self.schedule_layout_tuner_preview()
+
+    def _on_layout_tuner_lock_side_scale_changed(self, _state: int) -> None:
+        if not self.layout_tuner_lock_side_scale.isChecked():
+            return
+        self._on_layout_tuner_camera_adjust_changed("front_left", "scale")
+
+    def _on_layout_tuner_pair_changed(self, side: str, field: str) -> None:
+        if self.layout_tuner_pair_syncing:
+            return
+        if not self.layout_tuner_lock_pairs.isChecked():
+            return
+        other = "right" if side == "left" else "left"
+        source = self._layout_tuner_pair_control(side, field)
+        target = self._layout_tuner_pair_control(other, field)
+        self.layout_tuner_pair_syncing = True
+        try:
+            if field == "fraction":
+                self._set_layout_tuner_float_control(target, float(source["spin"].value()))
+            else:
+                self._set_layout_tuner_int_control(target, int(source["spin"].value()))
+        finally:
+            self.layout_tuner_pair_syncing = False
+        self.schedule_layout_tuner_preview()
+
+    def _on_layout_tuner_camera_adjust_changed(self, camera: str, field: str) -> None:
+        if field != "scale" or self.layout_tuner_camera_adjust_syncing:
+            return
+        if not self.layout_tuner_lock_side_scale.isChecked():
+            return
+        if camera not in {"front_left", "front_right"}:
+            return
+        other = "front_right" if camera == "front_left" else "front_left"
+        source = self.layout_tuner_camera_adjust_controls[camera]["scale"]
+        target = self.layout_tuner_camera_adjust_controls[other]["scale"]
+        self.layout_tuner_camera_adjust_syncing = True
+        try:
+            self._set_layout_tuner_float_control(target, float(source["spin"].value()))
+        finally:
+            self.layout_tuner_camera_adjust_syncing = False
+        self.schedule_layout_tuner_preview()
+
+    def _layout_tuner_pair_control(self, side: str, field: str) -> dict[str, Any]:
+        return getattr(self, f"layout_tuner_{side}_{field}")
+
+    def _set_layout_tuner_int_control(self, control: dict[str, Any], value: int) -> None:
+        for widget in (control["slider"], control["spin"]):
+            widget.blockSignals(True)
+            widget.setValue(int(value))
+            widget.blockSignals(False)
+
+    def _set_layout_tuner_float_control(self, control: dict[str, Any], value: float) -> None:
+        control["slider"].blockSignals(True)
+        control["spin"].blockSignals(True)
+        control["slider"].setValue(int(round(float(value) * 100)))
+        control["spin"].setValue(float(value))
+        control["spin"].blockSignals(False)
+        control["slider"].blockSignals(False)
+
+    def current_layout_tuner_params(self) -> LayoutPreviewParamsV2:
+        left_pair = PairLayoutParams(
+            side_shift_px=int(self.layout_tuner_left_shift["spin"].value()),
+            side_visible_fraction=float(self.layout_tuner_left_fraction["spin"].value()),
+            feather_width_px=int(self.layout_tuner_left_feather["spin"].value()),
+        )
+        if self.layout_tuner_lock_pairs.isChecked():
+            right_pair = left_pair
+        else:
+            right_pair = PairLayoutParams(
+                side_shift_px=int(self.layout_tuner_right_shift["spin"].value()),
+                side_visible_fraction=float(self.layout_tuner_right_fraction["spin"].value()),
+                feather_width_px=int(self.layout_tuner_right_feather["spin"].value()),
+            )
+        camera_adjust = {}
+        for camera, controls in self.layout_tuner_camera_adjust_controls.items():
+            camera_adjust[camera] = CameraAdjustParams(
+                x_offset_px=int(controls["x"]["spin"].value()),
+                y_offset_px=int(controls["y"]["spin"].value()),
+                scale=float(controls["scale"]["spin"].value()),
+            )
+        return LayoutPreviewParamsV2(
+            left_pair=left_pair,
+            right_pair=right_pair,
+            output_width_px=int(self.layout_tuner_output_width["spin"].value()),
+            camera_adjust=camera_adjust,
+            output_height_px=int(self.layout_tuner_output_height["spin"].value()),
+            vertical_safe_ratio=float(self.layout_tuner_vertical_safe["spin"].value()),
+            side_vertical_fade_px=int(self.layout_tuner_vertical_fade["spin"].value()),
+        )
+
+    def apply_layout_tuner_params(
+        self,
+        params: LayoutPreviewParamsV2 | LayoutTunerParams,
+        schedule: bool = True,
+    ) -> None:
+        tuner_params = normalize_layout_tuner_params(params)
+        controls = [
+            (self.layout_tuner_left_shift, int(tuner_params.left_pair.side_shift_px)),
+            (self.layout_tuner_left_feather, int(tuner_params.left_pair.feather_width_px)),
+            (self.layout_tuner_right_shift, int(tuner_params.right_pair.side_shift_px)),
+            (self.layout_tuner_right_feather, int(tuner_params.right_pair.feather_width_px)),
+            (self.layout_tuner_output_width, int(tuner_params.output_width_px)),
+            (self.layout_tuner_output_height, int(tuner_params.output_height_px)),
+            (self.layout_tuner_vertical_fade, int(tuner_params.side_vertical_fade_px)),
+        ]
+        for control, value in controls:
+            self._set_layout_tuner_int_control(control, value)
+        float_controls = [
+            (self.layout_tuner_left_fraction, float(tuner_params.left_pair.side_visible_fraction)),
+            (self.layout_tuner_right_fraction, float(tuner_params.right_pair.side_visible_fraction)),
+            (self.layout_tuner_vertical_safe, float(tuner_params.vertical_safe_ratio)),
+        ]
+        for control, value in float_controls:
+            self._set_layout_tuner_float_control(control, value)
+        for camera, params_for_camera in (tuner_params.camera_adjust or {}).items():
+            controls_for_camera = self.layout_tuner_camera_adjust_controls.get(camera)
+            if not controls_for_camera:
+                continue
+            self._set_layout_tuner_int_control(
+                controls_for_camera["x"],
+                int(params_for_camera.x_offset_px),
+            )
+            self._set_layout_tuner_int_control(
+                controls_for_camera["y"],
+                int(params_for_camera.y_offset_px),
+            )
+            self._set_layout_tuner_float_control(
+                controls_for_camera["scale"],
+                float(params_for_camera.scale),
+            )
+        same_pairs = tuner_params.left_pair == tuner_params.right_pair
+        self.layout_tuner_lock_pairs.blockSignals(True)
+        self.layout_tuner_lock_pairs.setChecked(bool(same_pairs))
+        self.layout_tuner_lock_pairs.blockSignals(False)
+        if schedule:
+            self.schedule_layout_tuner_preview()
+
+    def on_layout_tuner_preset_changed(self, _index: int) -> None:
+        if not hasattr(self, "layout_tuner_preset"):
+            return
+        name = str(self.layout_tuner_preset.currentData() or "Balanced")
+        self.apply_layout_tuner_params(
+            LAYOUT_TUNER_PRESETS_V2.get(name, LAYOUT_TUNER_PRESETS_V2["Balanced"])
+        )
+
+    def reset_layout_tuner_to_baseline(self, schedule: bool = True) -> None:
+        if hasattr(self, "layout_tuner_preset"):
+            self.layout_tuner_preset.blockSignals(True)
+            self.layout_tuner_preset.setCurrentIndex(0)
+            self.layout_tuner_preset.blockSignals(False)
+        self.apply_layout_tuner_params(
+            LAYOUT_TUNER_PRESETS_V2["Balanced"],
+            schedule=schedule,
+        )
+
+    def reset_layout_tuner_camera_adjust(self) -> None:
+        for controls in self.layout_tuner_camera_adjust_controls.values():
+            self._set_layout_tuner_int_control(controls["x"], 0)
+            self._set_layout_tuner_int_control(controls["y"], 0)
+            self._set_layout_tuner_float_control(controls["scale"], 1.0)
+        self.schedule_layout_tuner_preview()
+
+    def reset_layout_tuner_front_adjust(self) -> None:
+        controls = self.layout_tuner_camera_adjust_controls.get("front")
+        if controls:
+            self._set_layout_tuner_int_control(controls["x"], 0)
+            self._set_layout_tuner_int_control(controls["y"], 0)
+            self._set_layout_tuner_float_control(controls["scale"], 1.0)
+        self.schedule_layout_tuner_preview()
+
+    def reset_layout_tuner_side_adjust(self) -> None:
+        for camera in ("front_left", "front_right"):
+            controls = self.layout_tuner_camera_adjust_controls.get(camera)
+            if not controls:
+                continue
+            self._set_layout_tuner_int_control(controls["x"], 0)
+            self._set_layout_tuner_int_control(controls["y"], 0)
+            self._set_layout_tuner_float_control(controls["scale"], 1.0)
+        self.schedule_layout_tuner_preview()
+
+    def schedule_layout_tuner_preview(self) -> None:
+        if not hasattr(self, "layout_tuner_preview_timer"):
+            return
+        self.layout_tuner_preview_timer.start()
+
+    def capture_layout_tuner_preview_frame(self) -> None:
+        captured_at = time.time()
+        frame_ages: dict[str, float | None] = {}
+        active = set(active_topology_camera_keys(self.calibration_config))
+        if self.preview_content_mode == PreviewContentMode.LIVE:
+            latest_frames, snapshots = self.stream_manager.latest_frames()
+            frames = {
+                key: frame
+                for key, frame in latest_frames.items()
+                if key in active and frame is not None
+            }
+            for key, snapshot in snapshots.items():
+                if key in active and snapshot.frame_timestamp > 0:
+                    frame_ages[key] = max(0.0, captured_at - snapshot.frame_timestamp)
+        else:
+            frames = {
+                key: frame.copy()
+                for key, frame in self.frames.items()
+                if key in active and frame is not None
+            }
+        if not frames and self.warped:
+            self.layout_tuner_warped = {
+                key: image.copy()
+                for key, image in self.warped.items()
+                if key in active
+            }
+            self.layout_tuner_source_info = {
+                "mode": "current_warped_cache",
+                "frame_info": {"warning": "Used existing warped cache because no raw frames were available."},
+            }
+        else:
+            required = {"front_left", "front", "front_right"}
+            missing = sorted(required - set(frames))
+            if missing:
+                QMessageBox.information(
+                    self,
+                    self.t("Layout Tuner"),
+                    self.t(
+                        "Missing frames for layout tuner: {cameras}",
+                        cameras=", ".join(missing),
+                    ),
+                )
+                return
+            try:
+                self.log_source_coordinate_warnings(frames)
+                self.layout_tuner_warped = self.stitcher.warp_all(frames)
+            except Exception as exc:
+                self.log(
+                    self.t("Layout tuner capture failed: {error}", error=exc)
+                    + f"\n{traceback.format_exc()}",
+                    level="ERROR",
+                )
+                QMessageBox.warning(self, self.t("Layout Tuner"), str(exc))
+                return
+            self.layout_tuner_source_info = {
+                "mode": (
+                    "live_latest"
+                    if self.preview_content_mode == PreviewContentMode.LIVE
+                    else "snapshot_preview"
+                ),
+                "frame_info": {
+                    "cameras": sorted(frames),
+                    "frame_age_seconds": frame_ages,
+                    "warped_keys": sorted(self.layout_tuner_warped),
+                    "projection_candidate_used": False,
+                },
+            }
+        self.refresh_layout_tuner_preview()
+
+    def refresh_layout_tuner_preview(self) -> None:
+        if not hasattr(self, "layout_tuner_view"):
+            return
+        if not self.layout_tuner_warped:
+            self.layout_tuner_view.set_placeholder(
+                self.t("Capture preview frame to tune layout.")
+            )
+            self.layout_tuner_metrics.setPlainText(
+                self.t("No cached warped images. Click Capture Preview Frame.")
+            )
+            return
+        start = time.perf_counter()
+        try:
+            result = render_front_priority_layout_preview(
+                self.layout_tuner_warped,
+                layout_tuner_pair_candidates(self.current_stitch_profile()),
+                self.current_layout_tuner_params(),
+            )
+        except Exception as exc:
+            self.log(
+                self.t("Layout tuner render failed: {error}", error=exc)
+                + f"\n{traceback.format_exc()}",
+                level="ERROR",
+            )
+            self.layout_tuner_view.set_placeholder(str(exc))
+            return
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self.layout_tuner_preview_result = result
+        self.layout_tuner_view.set_image(
+            result.image,
+            "Front-priority layout tuner preview",
+        )
+        metrics = result.metrics
+        lines = [
+            f"layout_id: {result.layout_id}",
+            f"render_ms: {elapsed_ms:.1f}",
+            f"vertical_safety_enabled: {result.vertical_safety_enabled}",
+        ]
+        for key in (
+            "front_preserved_ratio",
+            "side_visible_ratio",
+            "side_invasion_ratio",
+            "side_suppressed_ratio",
+            "side_suppressed_top_bottom_ratio",
+            "black_pixel_ratio",
+            "duplicate_risk_proxy",
+            "duplicate_risk_proxy_after",
+        ):
+            if key in metrics:
+                lines.append(f"{key}: {float(metrics[key]):.4f}")
+        warnings = metrics.get("warning_reasons", [])
+        if warnings:
+            lines.append("warnings: " + ", ".join(str(item) for item in warnings))
+        self.layout_tuner_metrics.setPlainText("\n".join(lines))
+        self.statusBar().showMessage(
+            self.t("Layout tuner preview rendered in {ms:.1f} ms", ms=elapsed_ms)
+        )
+
+    def save_layout_tuner_candidate(self) -> None:
+        if self.layout_tuner_preview_result is None:
+            self.refresh_layout_tuner_preview()
+        if self.layout_tuner_preview_result is None:
+            QMessageBox.information(
+                self,
+                self.t("Layout Tuner"),
+                self.t("Capture and render a preview before saving."),
+            )
+            return
+        try:
+            directory = save_layout_tuner_candidate(
+                default_layout_candidate_root(),
+                str(self.calibration_config.get("stitch_topology", "triple_front_panorama")),
+                self.current_layout_tuner_params(),
+                self.layout_tuner_preview_result,
+                source=self.layout_tuner_source_info,
+            )
+        except Exception as exc:
+            self.log(
+                self.t("Layout tuner candidate save failed: {error}", error=exc)
+                + f"\n{traceback.format_exc()}",
+                level="ERROR",
+            )
+            QMessageBox.warning(self, self.t("Layout Tuner"), str(exc))
+            return
+        self.layout_tuner_candidate_dir = directory
+        self.statusBar().showMessage(
+            self.t("Layout candidate saved: {path}", path=directory)
+        )
+        self.log(self.t("Layout candidate saved: {path}", path=directory))
+
+    def export_layout_tuner_preview_png(self) -> None:
+        if self.layout_tuner_preview_result is None:
+            self.refresh_layout_tuner_preview()
+        if self.layout_tuner_preview_result is None:
+            QMessageBox.information(
+                self,
+                self.t("Layout Tuner"),
+                self.t("Capture and render a preview before export."),
+            )
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            self.t("Export layout tuner preview"),
+            str(PROJECT_ROOT / "layout_tuner_preview.png"),
+            "PNG (*.png);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            save_image(path, self.layout_tuner_preview_result.image)
+        except Exception as exc:
+            QMessageBox.warning(self, self.t("Layout Tuner"), str(exc))
+            return
+        self.statusBar().showMessage(
+            self.t("Layout tuner preview exported: {path}", path=path)
+        )
+
+    def open_layout_tuner_candidate_folder(self) -> None:
+        directory = self.layout_tuner_candidate_dir or default_layout_candidate_root()
+        directory.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     def _build_camera_config_workspace(self) -> QWidget:
         page = QWidget()

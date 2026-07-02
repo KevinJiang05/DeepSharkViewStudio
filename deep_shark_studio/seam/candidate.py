@@ -64,6 +64,10 @@ class SeamCandidateStore:
         preview_files: dict[str, str],
         created_at: datetime | None = None,
         extra_report: dict[str, Any] | None = None,
+        mode: str = "pairwise",
+        pair_role: dict[str, Any] | None = None,
+        boundary_candidates: dict[str, Any] | None = None,
+        quality: dict[str, Any] | None = None,
     ) -> SavedSeamCandidate:
         before = file_revision(self.formal_calibration_path)
         created_at = created_at or datetime.now().astimezone()
@@ -87,6 +91,7 @@ class SeamCandidateStore:
             "schema_version": 1,
             "profile_id": profile_id,
             "pair_id": pair_id,
+            "mode": mode,
             "created_at": created_at.isoformat(timespec="milliseconds"),
             "x_range": [int(x_range[0]), int(x_range[1])],
             "coordinate_space": "panorama_canvas",
@@ -104,10 +109,20 @@ class SeamCandidateStore:
             "formal_profile_modified": False,
             "writes_calibration_yaml": False,
         }
+        if pair_role:
+            candidate["pair_role"] = pair_role
+        if boundary_candidates:
+            candidate["boundary_candidates"] = boundary_candidates
+            candidate["recommended_boundary_type"] = boundary_candidates.get(
+                "recommended_boundary_type"
+            )
+        if quality:
+            candidate["quality"] = quality
         report = {
             "schema_version": 1,
             "profile_id": profile_id,
             "pair_id": pair_id,
+            "mode": mode,
             "created_at": candidate["created_at"],
             "summary": {
                 "seam_point_count": len(seam_points),
@@ -124,6 +139,15 @@ class SeamCandidateStore:
             "formal_profile_modified": False,
             "writes_calibration_yaml": False,
         }
+        if pair_role:
+            report["pair_role"] = pair_role
+        if boundary_candidates:
+            report["boundary_candidates"] = boundary_candidates
+            report["recommended_boundary_type"] = boundary_candidates.get(
+                "recommended_boundary_type"
+            )
+        if quality:
+            report["quality"] = quality
         if extra_report:
             report["details"] = extra_report
 
