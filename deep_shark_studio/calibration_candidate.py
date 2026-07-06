@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from collections import Counter
+from itertools import combinations
 from copy import deepcopy
 from datetime import datetime
 import math
 from pathlib import Path
+import time
 from typing import Any
 
 import cv2
@@ -1306,8 +1308,12 @@ def latest_calibration_candidate(
 class CandidatePanoramaProcessor:
     """Apply a saved report-only candidate to live frames without write-back."""
 
-    def __init__(self, candidate_directory: str | Path):
+    def __init__(self, candidate_directory: str | Path, use_opencl: bool = False):
         self.directory = Path(candidate_directory)
+        self.requested_opencl = bool(use_opencl)
+        self.use_opencl = bool(use_opencl and cv2.ocl.haveOpenCL())
+        if self.use_opencl:
+            cv2.ocl.setUseOpenCL(True)
         self.candidate, _ = load_calibration_candidate(self.directory)
         if not self.candidate.get("rig", {}).get("complete"):
             raise ValueError("Candidate rig is incomplete.")
@@ -1329,6 +1335,7 @@ class CandidatePanoramaProcessor:
         )
         self.topology_name = str(self.candidate.get("topology", ""))
         self.experimental = bool(self.candidate.get("experimental"))
+        self.last_timings: dict[str, float | int | bool] = {}
         self._maps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._masks: dict[str, np.ndarray] = {}
         for camera, relative_path in panorama["files"]["remaps"].items():
@@ -1359,13 +1366,54 @@ class CandidatePanoramaProcessor:
                 forward,
                 -np.inf,
             )
+        self._selection_masks_by_available = self._build_selection_masks_by_available()
+        self._opencl_maps: dict[str, tuple[cv2.UMat, cv2.UMat]] = {}
+        self._opencl_selection_masks_by_available: dict[
+            tuple[str, ...],
+            dict[str, cv2.UMat],
+        ] = {}
+        if self.use_opencl:
+            self._opencl_maps = {
+                camera: (cv2.UMat(map_x), cv2.UMat(map_y))
+                for camera, (map_x, map_y) in self._maps.items()
+            }
+            self._opencl_selection_masks_by_available = {
+                available: {
+                    camera: cv2.UMat((mask.astype(np.uint8) * 255))
+                    for camera, mask in masks.items()
+                }
+                for available, masks in self._selection_masks_by_available.items()
+            }
 
-    def process(
+    def _build_selection_masks_by_available(
+        self,
+    ) -> dict[tuple[str, ...], dict[str, np.ndarray]]:
+        selection_masks: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
+        for count in range(1, len(self.camera_order) + 1):
+            for available in combinations(self.camera_order, count):
+                weights = np.stack(
+                    [self._weights[camera] for camera in available],
+                    axis=0,
+                )
+                selected = np.argmax(weights, axis=0)
+                valid_any = np.any(np.isfinite(weights), axis=0)
+                masks: dict[str, np.ndarray] = {}
+                for index, camera in enumerate(available):
+                    masks[camera] = (
+                        valid_any
+                        & (selected == index)
+                        & self._masks[camera]
+                    )
+                selection_masks[tuple(available)] = masks
+        return selection_masks
+
+    def warp_all(
         self,
         frames: dict[str, np.ndarray],
-    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    ) -> dict[str, np.ndarray]:
+        total_start = time.perf_counter()
         warped: dict[str, np.ndarray] = {}
-        expected_width, expected_height = self.input_resolution
+        remap_ms = 0.0
         for camera in self.camera_order:
             frame = frames.get(camera)
             if frame is None:
@@ -1377,6 +1425,7 @@ class CandidatePanoramaProcessor:
                     f"candidate resolution {self.input_resolution}."
                 )
             map_x, map_y = self._maps[camera]
+            remap_start = time.perf_counter()
             image = cv2.remap(
                 frame,
                 map_x,
@@ -1384,26 +1433,113 @@ class CandidatePanoramaProcessor:
                 cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
             )
+            remap_ms += (time.perf_counter() - remap_start) * 1000.0
             image[~self._masks[camera]] = 0
             warped[camera] = image
+        self.last_timings = {
+            "candidate_total_ms": (time.perf_counter() - total_start) * 1000.0,
+            "candidate_remap_ms": remap_ms,
+            "candidate_compose_ms": 0.0,
+            "candidate_available_cameras": len(warped),
+            "precomputed_selection_masks": True,
+        }
+        return warped
+
+    def process(
+        self,
+        frames: dict[str, np.ndarray],
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        if self.use_opencl:
+            return self._process_opencl(frames)
+        total_start = time.perf_counter()
+        warped = self.warp_all(frames)
+        remap_ms = float(self.last_timings.get("candidate_remap_ms", 0.0))
+        compose_start = time.perf_counter()
         canvas = np.zeros(
             (self.output_height, self.output_width, 3),
             dtype=np.uint8,
         )
         if not warped:
+            self.last_timings = {
+                "candidate_total_ms": (time.perf_counter() - total_start) * 1000.0,
+                "candidate_remap_ms": remap_ms,
+                "candidate_compose_ms": (time.perf_counter() - compose_start) * 1000.0,
+                "candidate_available_cameras": 0,
+                "precomputed_selection_masks": True,
+            }
             return warped, canvas
-        available = [camera for camera in self.camera_order if camera in warped]
-        weights = np.stack(
-            [self._weights[camera] for camera in available],
-            axis=0,
-        )
-        selected = np.argmax(weights, axis=0)
-        valid_any = np.any(np.isfinite(weights), axis=0)
-        for index, camera in enumerate(available):
-            selection = (
-                valid_any
-                & (selected == index)
-                & self._masks[camera]
-            )
+        available = tuple(camera for camera in self.camera_order if camera in warped)
+        selection_masks = self._selection_masks_by_available[available]
+        for camera in available:
+            selection = selection_masks[camera]
             canvas[selection] = warped[camera][selection]
+        compose_ms = (time.perf_counter() - compose_start) * 1000.0
+        self.last_timings = {
+            "candidate_total_ms": (time.perf_counter() - total_start) * 1000.0,
+            "candidate_remap_ms": remap_ms,
+            "candidate_compose_ms": compose_ms,
+            "candidate_available_cameras": len(available),
+            "precomputed_selection_masks": True,
+        }
         return warped, canvas
+
+    def _process_opencl(
+        self,
+        frames: dict[str, np.ndarray],
+    ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        total_start = time.perf_counter()
+        remap_ms = 0.0
+        compose_ms = 0.0
+        download_ms = 0.0
+        warped_umat: dict[str, cv2.UMat] = {}
+        warped_preview: dict[str, np.ndarray] = {}
+        for camera in self.camera_order:
+            frame = frames.get(camera)
+            if frame is None:
+                continue
+            actual_size = (int(frame.shape[1]), int(frame.shape[0]))
+            if actual_size != self.input_resolution:
+                raise ValueError(
+                    f"{camera} frame size {actual_size} does not match "
+                    f"candidate resolution {self.input_resolution}."
+                )
+            map_x, map_y = self._opencl_maps[camera]
+            remap_start = time.perf_counter()
+            warped_umat[camera] = cv2.remap(
+                cv2.UMat(frame),
+                map_x,
+                map_y,
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+            remap_ms += (time.perf_counter() - remap_start) * 1000.0
+
+        compose_start = time.perf_counter()
+        canvas_umat = cv2.UMat(
+            np.zeros(
+                (self.output_height, self.output_width, 3),
+                dtype=np.uint8,
+            )
+        )
+        if warped_umat:
+            available = tuple(
+                camera for camera in self.camera_order if camera in warped_umat
+            )
+            selection_masks = self._opencl_selection_masks_by_available[available]
+            for camera in available:
+                cv2.copyTo(warped_umat[camera], selection_masks[camera], canvas_umat)
+        compose_ms = (time.perf_counter() - compose_start) * 1000.0
+        download_start = time.perf_counter()
+        canvas = canvas_umat.get()
+        download_ms = (time.perf_counter() - download_start) * 1000.0
+        self.last_timings = {
+            "candidate_total_ms": (time.perf_counter() - total_start) * 1000.0,
+            "candidate_remap_ms": remap_ms,
+            "candidate_compose_ms": compose_ms,
+            "candidate_download_ms": download_ms,
+            "candidate_available_cameras": len(warped_umat),
+            "precomputed_selection_masks": True,
+            "opencl_enabled": True,
+            "opencl_requested": self.requested_opencl,
+        }
+        return warped_preview, canvas

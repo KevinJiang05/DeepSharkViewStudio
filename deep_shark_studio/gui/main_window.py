@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QProcess, QRectF, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -100,6 +100,12 @@ from deep_shark_studio.geometry_diagnostics import (
     run_geometry_diagnostics as compute_geometry_diagnostics,
 )
 from deep_shark_studio.project import backup_configs, export_runtime_config, load_project, save_project
+from deep_shark_studio.project_package import (
+    activate_project_package,
+    export_project_package,
+    validate_project_package,
+)
+from deep_shark_studio.qgc.video_output import FfmpegVideoSink, VideoOutputConfig
 from deep_shark_studio.pairwise_diagnostics import (
     PairDefinition,
     PairwiseCandidateResult,
@@ -403,7 +409,9 @@ ZH_CN = {
     "Corners": "角点数",
     "Project Management": "项目管理",
     "QGC Video Output": "QGC 视频输出",
-    "Output Type": "输出类型",
+    "Output Type": "输出方式",
+    "UDP Local Low Latency": "UDP 本机低延迟",
+    "RTSP Standard Service": "RTSP 标准服务",
     "RTSP publish URL": "RTSP 发布地址",
     "UDP MPEG-TS URL": "UDP MPEG-TS 地址",
     "Output URL": "输出地址",
@@ -421,13 +429,14 @@ ZH_CN = {
     "QGC output service already running.": "QGC 输出服务已在运行。",
     "QGC output service exited with code {code}.": "QGC 输出服务已退出，代码 {code}。",
     "QGC output service": "QGC 输出服务",
-    "Start the headless DeepShark video payload service with the current Far/Near runtime settings.": "使用当前 Far/Near runtime 设置启动独立 DeepShark 视频载荷服务。",
-    "Stop the running DeepShark video payload service process.": "停止正在运行的 DeepShark 视频载荷服务进程。",
+    "Current B-2 candidate view requires an available candidate directory.": "当前 B-2 候选视图需要可用的候选目录。",
+    "Start streaming the current GUI stitched canvas to QGC.": "将当前 GUI 拼接画面开始推流到 QGC。",
+    "Stop streaming the current GUI stitched canvas to QGC.": "停止向 QGC 推送当前 GUI 拼接画面。",
     "QGC output settings saved.": "QGC 输出设置已保存。",
     "QGC output settings are saved in cameras.yaml and do not modify calibration.yaml.": "QGC 输出设置保存在 cameras.yaml，不会修改 calibration.yaml。",
     "RTSP output publishes to an RTSP server. QGC should open the same stream URL.": "RTSP 输出会发布到 RTSP 服务端，QGC 应打开同一个流地址。",
-    "UDP MPEG-TS remains available for QGC builds or test links that prefer udp:// port input.": "UDP MPEG-TS 仍可用于偏好 udp:// 端口输入的 QGC 版本或测试链路。",
-    "Use this URL in QGC video settings when the RTSP server accepts publishing from DeepShark.": "当 RTSP 服务端接受 DeepShark 发布时，在 QGC 视频设置中使用这个地址。",
+    "UDP MPEG-TS sends directly to a UDP port and is usually better for same-machine low-latency QGC preview.": "UDP MPEG-TS 直接发送到 UDP 端口，通常更适合同机低延迟 QGC 预览。",
+    "Use udp://127.0.0.1:5600 for local low-latency bridge, or rtsp://127.0.0.1:8554/deepshark when using MediaMTX/RTSP service.": "同机低延迟桥接建议使用 udp://127.0.0.1:5600；使用 MediaMTX/RTSP 服务时使用 rtsp://127.0.0.1:8554/deepshark。",
     "Projection Research Overview": "投影研发概览",
     "Projection Research Note": "Projection 研发线用于 fisheye rectilinear / equirectangular / A-B comparison 等实验。Near-field Fisheye 只影响 Near-field；Far-field Default 不受影响；Far-field Custom 使用 B-2 per-camera projection 基底。",
     "Runtime projection controls remain in Realtime Monitor for current preview switching; layout-specific projection controls are in Layout Tuning.": "运行态投影切换仍在实时监看的拼接算法面板中；布局候选相关投影参数在布局调参中。",
@@ -436,7 +445,25 @@ ZH_CN = {
     "Open Project": "打开项目",
     "Backup Current Configs": "备份当前配置",
     "Export Runtime Config": "导出运行配置",
+    "Export Project Package": "导出项目包",
+    "Import Project Package": "导入项目包",
+    "Validate Project Package": "校验项目包",
+    "Project Package (*.yaml *.yml);;All Files (*)": "项目包 (*.yaml *.yml);;所有文件 (*)",
+    "Choose project package export folder": "选择项目包导出目录",
+    "Open project package manifest": "打开项目包 manifest",
+    "Validate project package manifest": "校验项目包 manifest",
+    "Export project package failed": "导出项目包失败",
+    "Import project package failed": "导入项目包失败",
+    "Validate project package failed": "校验项目包失败",
+    "Project package exported: {path}": "项目包已导出：{path}",
+    "Project package valid: {path}": "项目包校验通过：{path}",
+    "Project package invalid: {errors}": "项目包校验失败：{errors}",
+    "Activate project package?": "是否激活项目包？",
+    "The package is valid. Activate it now?\n\nThis will back up current configs, then replace active configs with the package configs. Candidate files remain inside the package and calibration.yaml is not edited during export/validation.": "项目包校验通过。现在激活吗？\n\n激活会先备份当前 configs，然后用项目包内的 configs 替换当前配置。候选文件仍保留在项目包内；导出/校验阶段不会编辑 calibration.yaml。",
+    "Project package activated: {path}": "项目包已激活：{path}",
+    "Project package validated but not activated: {path}": "项目包已校验，但未激活：{path}",
     "Project files bundle calibration.yaml, cameras.yaml, and network.yaml into one portable .dsvs.yaml file.\n\nUse backups before large calibration or seam edits. Runtime export is the compact configuration intended for a future service/QGC bridge.": "项目文件会把 calibration.yaml、cameras.yaml 和 network.yaml 打包成一个便携的 .dsvs.yaml 文件。\n\n大幅修改标定或拼接缝前建议先备份。运行配置导出用于后续独立服务或 QGC 桥接。",
+    "Project Package exports configs and active candidates into a folder with package-relative paths. Import validates first; activation backs up current configs before replacing them.": "项目包会把配置和当前候选导出到一个使用包内相对路径的目录。导入会先校验；激活前会备份当前 configs，再替换配置。",
     "No images": "没有图片",
     "No matching camera images were found.": "没有找到匹配相机名称的图片。",
     "Stitch failed": "拼接失败",
@@ -1592,7 +1619,10 @@ class MainWindow(QMainWindow):
         self.performance_config = self.camera_config.get("performance", {})
         self.stitcher = self.create_stitcher()
         self.stitch_processor = StitchProcessingManager()
-        self.qgc_output_process: QProcess | None = None
+        self.qgc_video_sink: FfmpegVideoSink | None = None
+        self.qgc_output_active = False
+        self.qgc_output_frames_written = 0
+        self.qgc_output_last_error = ""
         self.runtime_stitch_config = RuntimeStitchConfig()
         self.runtime_layout_candidate: LayoutRuntimeCandidate | None = None
         self.far_field_layout_candidate: FarFieldLayoutRuntimeCandidate | None = None
@@ -1617,6 +1647,8 @@ class MainWindow(QMainWindow):
         self.last_process_time = 0.0
         self.last_preview_time = 0.0
         self.last_health_time = 0.0
+        self.last_canvas_render_time = 0.0
+        self.last_qgc_output_status_time = 0.0
         self.last_stitch_ms = 0.0
         self.last_frame_signature: tuple[tuple[str, int], ...] = ()
         self.preview_session_id = 0
@@ -1689,14 +1721,22 @@ class MainWindow(QMainWindow):
     def t(self, text: str, **kwargs: Any) -> str:
         return i18n(self.language, text, **kwargs)
 
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        hint = super().minimumSizeHint()
+        return QSize(min(hint.width(), 1500), min(hint.height(), 700))
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self.ensure_window_frame_inside_available_screen()
+
     def fit_initial_window_to_available_screen(self) -> None:
         screen = QApplication.primaryScreen()
         if screen is None:
             self.resize(1280, 760)
             return
         available = screen.availableGeometry()
-        target_width = min(1500, max(720, int(available.width() * 0.92)))
-        target_height = min(920, max(560, int(available.height() * 0.90)))
+        target_width = min(1500, max(720, int(available.width() * 0.88)))
+        target_height = min(900, max(560, int(available.height() * 0.84)))
         target_width = min(target_width, available.width())
         target_height = min(target_height, available.height())
         self.resize(target_width, target_height)
@@ -1704,6 +1744,34 @@ class MainWindow(QMainWindow):
             available.x() + (available.width() - target_width) // 2,
             available.y() + (available.height() - target_height) // 2,
         )
+
+    def ensure_window_frame_inside_available_screen(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        frame = self.frameGeometry()
+        if frame.width() > available.width() or frame.height() > available.height():
+            width_delta = max(0, frame.width() - available.width() + 16)
+            height_delta = max(0, frame.height() - available.height() + 16)
+            self.resize(
+                max(720, self.width() - width_delta),
+                max(560, self.height() - height_delta),
+            )
+            frame = self.frameGeometry()
+        target_x = min(
+            max(frame.x(), available.x()),
+            available.x() + max(0, available.width() - frame.width()),
+        )
+        target_y = min(
+            max(frame.y(), available.y()),
+            available.y() + max(0, available.height() - frame.height()),
+        )
+        if target_x != frame.x() or target_y != frame.y():
+            self.move(
+                self.x() + target_x - frame.x(),
+                self.y() + target_y - frame.y(),
+            )
 
     def create_stitcher(self) -> SurroundStitcher:
         max_width = int(self.performance_config.get("max_input_width", 960))
@@ -1772,6 +1840,7 @@ class MainWindow(QMainWindow):
                 use_intrinsics,
                 processor_mode=processor_mode,
                 candidate_directory=candidate_directory,
+                candidate_use_opencl=self.b2_candidate_opencl_enabled(),
                 runtime_config=runtime_config,
             )
         except Exception as exc:
@@ -1792,6 +1861,11 @@ class MainWindow(QMainWindow):
                 runtime_config=RuntimeStitchConfig(),
             )
             self.apply_live_stitch_mode_controls()
+
+    def b2_candidate_opencl_enabled(self) -> bool:
+        if hasattr(self, "b2_candidate_opencl"):
+            return bool(self.b2_candidate_opencl.isChecked())
+        return bool(self.performance_config.get("b2_candidate_opencl", False))
 
     def current_runtime_profile_id(self) -> str:
         return str(
@@ -2391,6 +2465,18 @@ class MainWindow(QMainWindow):
                 f" / adjust {float(timing.get('camera_adjust_ms', 0.0)):.1f} ms"
                 f" / blend {float(timing.get('far_field_composition_ms', 0.0)):.1f} ms"
             )
+        if "candidate_total_ms" in timing:
+            suffix = (
+                f" | B-2 {float(timing.get('candidate_total_ms', 0.0)):.1f} ms"
+                f" / remap {float(timing.get('candidate_remap_ms', 0.0)):.1f} ms"
+                f" / compose {float(timing.get('candidate_compose_ms', 0.0)):.1f} ms"
+            )
+            if timing.get("opencl_enabled"):
+                suffix += (
+                    f" / dl {float(timing.get('candidate_download_ms', 0.0)):.1f} ms"
+                    " / OpenCL"
+                )
+            return suffix
         if "far_field_total_ms" in timing:
             return f" | far {float(timing.get('far_field_total_ms', 0.0)):.1f} ms"
         return ""
@@ -3728,10 +3814,10 @@ class MainWindow(QMainWindow):
         perf_group = QGroupBox(self.t("Performance"))
         perf_form = QFormLayout(perf_group)
         self.process_fps = NoWheelSpinBox()
-        self.process_fps.setRange(1, 30)
+        self.process_fps.setRange(1, 60)
         self.process_fps.setValue(int(self.performance_config.get("process_fps", 5)))
         self.preview_fps = NoWheelSpinBox()
-        self.preview_fps.setRange(1, 30)
+        self.preview_fps.setRange(1, 60)
         self.preview_fps.setValue(int(self.performance_config.get("preview_fps", 2)))
         self.max_input_width = NoWheelSpinBox()
         self.max_input_width.setRange(0, 4096)
@@ -3741,16 +3827,23 @@ class MainWindow(QMainWindow):
         self.refresh_warped_preview.setChecked(bool(self.performance_config.get("refresh_warped_preview", False)))
         self.use_intrinsics_live = QCheckBox()
         self.use_intrinsics_live.setChecked(bool(self.performance_config.get("use_intrinsics", False)))
+        self.b2_candidate_opencl = QCheckBox()
+        self.b2_candidate_opencl.setChecked(bool(self.performance_config.get("b2_candidate_opencl", False)))
+        self.b2_candidate_opencl.setToolTip(
+            "实验性：仅加速 B-2 Candidate View / QGC 当前画面输出；不修改 calibration.yaml。"
+        )
         self.process_fps.valueChanged.connect(self.mark_camera_config_dirty)
         self.preview_fps.valueChanged.connect(self.mark_camera_config_dirty)
         self.max_input_width.valueChanged.connect(self.mark_camera_config_dirty)
         self.refresh_warped_preview.toggled.connect(self.mark_camera_config_dirty)
         self.use_intrinsics_live.toggled.connect(self.mark_camera_config_dirty)
+        self.b2_candidate_opencl.toggled.connect(self.mark_camera_config_dirty)
         perf_form.addRow(self.t("Stitch FPS"), self.process_fps)
         perf_form.addRow(self.t("Preview FPS"), self.preview_fps)
         perf_form.addRow(self.t("Max input width"), self.max_input_width)
         perf_form.addRow(self.t("Refresh warped previews"), self.refresh_warped_preview)
         perf_form.addRow(self.t("Use undistort live"), self.use_intrinsics_live)
+        perf_form.addRow("B-2 OpenCL [Experimental]", self.b2_candidate_opencl)
         root.addWidget(perf_group)
         root.addStretch(1)
         return page
@@ -3770,6 +3863,9 @@ class MainWindow(QMainWindow):
         open_project_button = QPushButton(self.t("Open Project"))
         backup_button = QPushButton(self.t("Backup Current Configs"))
         export_runtime_button = QPushButton(self.t("Export Runtime Config"))
+        self.project_package_export_button = QPushButton(self.t("Export Project Package"))
+        self.project_package_import_button = QPushButton(self.t("Import Project Package"))
+        self.project_package_validate_button = QPushButton(self.t("Validate Project Package"))
         export_runtime_button.setText(
             f"{self.t('Export Runtime Config')} [{self.t('Experimental')}]"
         )
@@ -3781,9 +3877,15 @@ class MainWindow(QMainWindow):
         open_project_button.clicked.connect(self.open_project_file)
         backup_button.clicked.connect(self.backup_current_configs)
         export_runtime_button.clicked.connect(self.export_runtime_config_file)
+        self.project_package_export_button.clicked.connect(self.export_project_package_file)
+        self.project_package_import_button.clicked.connect(self.import_project_package_file)
+        self.project_package_validate_button.clicked.connect(self.validate_project_package_file)
         buttons.addWidget(save_project_button)
         buttons.addWidget(open_project_button)
         buttons.addWidget(backup_button)
+        buttons.addWidget(self.project_package_export_button)
+        buttons.addWidget(self.project_package_import_button)
+        buttons.addWidget(self.project_package_validate_button)
         buttons.addWidget(export_runtime_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
@@ -3794,6 +3896,8 @@ class MainWindow(QMainWindow):
         notes.setText(self.t(
             "Project files bundle calibration.yaml, cameras.yaml, and network.yaml into one portable .dsvs.yaml file.\n\n"
             "Use backups before large calibration or seam edits. Runtime export is the compact configuration intended for a future service/QGC bridge."
+        ) + "\n\n" + self.t(
+            "Project Package exports configs and active candidates into a folder with package-relative paths. Import validates first; activation backs up current configs before replacing them."
         ))
         root.addWidget(notes, 1)
         return page
@@ -3808,7 +3912,7 @@ class MainWindow(QMainWindow):
         raw = self.camera_config.get("qgc_video_output", {})
         if not isinstance(raw, dict):
             raw = {}
-        kind = str(raw.get("kind", "rtsp"))
+        kind = str(raw.get("kind", "udp_mpegts"))
         if kind not in {"rtsp", "udp_mpegts"}:
             kind = "rtsp"
         return {
@@ -3818,6 +3922,8 @@ class MainWindow(QMainWindow):
             "bitrate": str(raw.get("bitrate", "6000k")),
             "rtsp_transport": str(raw.get("rtsp_transport", "tcp")),
             "ffmpeg_path": str(raw.get("ffmpeg_path", "ffmpeg")),
+            "output_width": int(raw.get("output_width", 0) or 0),
+            "output_height": int(raw.get("output_height", 0) or 0),
         }
 
     def _build_qgc_video_output_workspace(self) -> QWidget:
@@ -3829,8 +3935,8 @@ class MainWindow(QMainWindow):
         config = self._qgc_video_output_config()
 
         self.qgc_output_kind = NoWheelComboBox()
-        self.qgc_output_kind.addItem("RTSP", "rtsp")
-        self.qgc_output_kind.addItem("UDP MPEG-TS", "udp_mpegts")
+        self.qgc_output_kind.addItem(self.t("UDP Local Low Latency"), "udp_mpegts")
+        self.qgc_output_kind.addItem(self.t("RTSP Standard Service"), "rtsp")
         self.qgc_output_kind.setCurrentIndex(
             max(0, self.qgc_output_kind.findData(config["kind"]))
         )
@@ -3840,7 +3946,7 @@ class MainWindow(QMainWindow):
         )
         self.qgc_output_url.setToolTip(
             self.t(
-                "Use this URL in QGC video settings when the RTSP server accepts publishing from DeepShark."
+                "Use udp://127.0.0.1:5600 for local low-latency bridge, or rtsp://127.0.0.1:8554/deepshark when using MediaMTX/RTSP service."
             )
         )
         self.qgc_output_fps = NoWheelDoubleSpinBox()
@@ -3881,7 +3987,7 @@ class MainWindow(QMainWindow):
             )
             + "\n"
             + self.t(
-                "UDP MPEG-TS remains available for QGC builds or test links that prefer udp:// port input."
+                "UDP MPEG-TS sends directly to a UDP port and is usually better for same-machine low-latency QGC preview."
             )
             + "\n"
             + self.t(
@@ -3897,12 +4003,12 @@ class MainWindow(QMainWindow):
         self.qgc_output_start_button = QPushButton(self.t("Start QGC Output Service"))
         self.qgc_output_start_button.setToolTip(
             self.t(
-                "Start the headless DeepShark video payload service with the current Far/Near runtime settings."
+                "Start streaming the current GUI stitched canvas to QGC."
             )
         )
         self.qgc_output_stop_button = QPushButton(self.t("Stop QGC Output Service"))
         self.qgc_output_stop_button.setToolTip(
-            self.t("Stop the running DeepShark video payload service process.")
+            self.t("Stop streaming the current GUI stitched canvas to QGC.")
         )
         self.qgc_output_stop_button.setEnabled(False)
         self.qgc_output_start_button.clicked.connect(self.start_qgc_output_service)
@@ -5356,6 +5462,8 @@ class MainWindow(QMainWindow):
             self.last_process_time = 0.0
             self.last_preview_time = 0.0
             self.last_health_time = 0.0
+            self.last_canvas_render_time = 0.0
+            self.last_qgc_output_status_time = 0.0
             self.preview_timer.start()
             self.statusBar().showMessage(self.t("Live preview running"))
         else:
@@ -5386,7 +5494,7 @@ class MainWindow(QMainWindow):
 
     def update_live_preview(self) -> None:
         now = time.perf_counter()
-        preview_interval = 1.0 / max(1, int(self.performance_config.get("preview_fps", 2)))
+        preview_interval = self.effective_preview_interval()
         process_interval = 1.0 / max(1, int(self.performance_config.get("process_fps", 5)))
         should_refresh_preview = (now - self.last_preview_time) >= preview_interval
         should_submit_stitch = (now - self.last_process_time) >= process_interval
@@ -5425,6 +5533,24 @@ class MainWindow(QMainWindow):
         self.apply_latest_stitch_result()
         if not self.stream_manager.has_active_workers():
             self.preview_timer.stop()
+
+    def effective_preview_interval(self) -> float:
+        configured_interval = 1.0 / max(1, int(self.performance_config.get("preview_fps", 2)))
+        if self.qgc_output_active:
+            return max(configured_interval, 1.0 / 5.0)
+        return configured_interval
+
+    def should_render_canvas_now(self, *, force: bool = False) -> bool:
+        if not self.should_render_canvas():
+            return False
+        if force or not self.qgc_output_active:
+            self.last_canvas_render_time = time.perf_counter()
+            return True
+        now = time.perf_counter()
+        if now - self.last_canvas_render_time >= 1.0 / 5.0:
+            self.last_canvas_render_time = now
+            return True
+        return False
 
     def refresh_raw_preview(self, force: bool = False) -> None:
         if hasattr(self, "root_tabs") and self.root_tabs.currentIndex() != 0:
@@ -5575,8 +5701,9 @@ class MainWindow(QMainWindow):
             self.log(warning_text, level="WARNING")
         self.warped = result.warped
         self.canvas = result.canvas
+        self.write_qgc_output_frame(self.canvas)
         self.refresh_warped_views()
-        if self.canvas is not None and self.should_render_canvas():
+        if self.canvas is not None and self.should_render_canvas_now():
             self.render_canvas_view()
         message = self.t(
             "{status}: {count} active frames | stitch {ms:.1f} ms",
@@ -5608,16 +5735,17 @@ class MainWindow(QMainWindow):
             self.log("; ".join(runtime_warnings), level="WARNING")
 
         now = time.perf_counter()
-        preview_interval = 1.0 / max(1, int(self.performance_config.get("preview_fps", 2)))
+        preview_interval = self.effective_preview_interval()
         should_refresh_preview = (now - self.last_preview_time) >= preview_interval or status_prefix != "Live frame"
         if should_refresh_preview:
             self.last_preview_time = now
             self.refresh_raw_preview(force=True)
             self.refresh_warped_views()
-        if self.canvas is not None and self.should_render_canvas():
+        if self.canvas is not None and self.should_render_canvas_now(force=status_prefix != "Live frame"):
             self.render_canvas_view()
             if hasattr(self, "seam_editor") and status_prefix != "Live frame":
                 self.refresh_seam_editor()
+        self.write_qgc_output_frame(self.canvas)
         self.last_stitch_ms = (time.perf_counter() - start_time) * 1000.0
         if now - self.last_health_time >= 1.0 or status_prefix != "Live frame":
             self.last_health_time = now
@@ -5689,6 +5817,7 @@ class MainWindow(QMainWindow):
             "max_input_width": int(self.max_input_width.value()),
             "refresh_warped_preview": self.refresh_warped_preview.isChecked(),
             "use_intrinsics": self.use_intrinsics_live.isChecked(),
+            "b2_candidate_opencl": self.b2_candidate_opencl.isChecked(),
         }
         self.camera_config["cameras"] = {key: row.to_config() for key, row in self.camera_rows.items()}
         if hasattr(self, "qgc_output_kind"):
@@ -5850,6 +5979,10 @@ class MainWindow(QMainWindow):
             self.use_intrinsics_live.setChecked(
                 bool(self.performance_config.get("use_intrinsics", False))
             )
+            if hasattr(self, "b2_candidate_opencl"):
+                self.b2_candidate_opencl.setChecked(
+                    bool(self.performance_config.get("b2_candidate_opencl", False))
+                )
 
             stitch_profile = self.current_stitch_profile()
             self.canvas_width.setValue(
@@ -5868,10 +6001,10 @@ class MainWindow(QMainWindow):
         self.refresh_camera_count()
 
     def qgc_video_output_config_from_widgets(self) -> dict[str, Any]:
-        kind = self.qgc_output_kind.currentData() or "rtsp"
+        kind = self.qgc_output_kind.currentData() or "udp_mpegts"
         kind = str(kind)
         url = self.qgc_output_url.text().strip() or self._default_qgc_output_url(kind)
-        return {
+        config = {
             "kind": kind,
             "url": url,
             "fps": float(self.qgc_output_fps.value()),
@@ -5879,6 +6012,13 @@ class MainWindow(QMainWindow):
             "rtsp_transport": str(self.qgc_rtsp_transport.currentData() or "tcp"),
             "ffmpeg_path": self.qgc_ffmpeg_path.text().strip() or "ffmpeg",
         }
+        raw = self.camera_config.get("qgc_video_output", {})
+        if isinstance(raw, dict):
+            for key in ("output_width", "output_height"):
+                value = int(raw.get(key, 0) or 0)
+                if value > 0:
+                    config[key] = value
+        return config
 
     def sync_qgc_video_output_widgets(self) -> None:
         config = self._qgc_video_output_config()
@@ -5895,9 +6035,10 @@ class MainWindow(QMainWindow):
             max(0, self.qgc_rtsp_transport.findData(config["rtsp_transport"]))
         )
         self.qgc_ffmpeg_path.setText(config["ffmpeg_path"])
+        self.update_qgc_output_mode_controls()
 
     def on_qgc_output_kind_changed(self, _index: int) -> None:
-        kind = str(self.qgc_output_kind.currentData() or "rtsp")
+        kind = str(self.qgc_output_kind.currentData() or "udp_mpegts")
         self.qgc_output_url.setPlaceholderText(self._default_qgc_output_url(kind))
         current_url = self.qgc_output_url.text().strip()
         default_urls = {
@@ -5907,6 +6048,13 @@ class MainWindow(QMainWindow):
         }
         if current_url in default_urls:
             self.qgc_output_url.setText(self._default_qgc_output_url(kind))
+        self.update_qgc_output_mode_controls()
+
+    def update_qgc_output_mode_controls(self) -> None:
+        if not hasattr(self, "qgc_rtsp_transport"):
+            return
+        kind = str(self.qgc_output_kind.currentData() or "udp_mpegts")
+        self.qgc_rtsp_transport.setEnabled(kind == "rtsp")
 
     def save_qgc_video_output_settings(self) -> None:
         if config_revision("cameras.yaml") != self._camera_config_revision:
@@ -5921,200 +6069,86 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self.t("QGC output settings saved."))
         self.log(self.t("QGC output settings saved."))
 
-    def qgc_output_service_arguments(self) -> list[str] | None:
-        output = self.qgc_video_output_config_from_widgets()
-        mode = self.selected_runtime_mode()
-        projection = (
-            self.selected_projection_source()
-            if mode == StitchRuntimeMode.NEAR_FIELD
-            else ProjectionSource.CURRENT_PERSPECTIVE
-        )
-        if mode == StitchRuntimeMode.NEAR_FIELD and self.runtime_layout_candidate is None:
-            QMessageBox.information(
-                self,
-                self.t("QGC output service"),
-                self.t("Near-field mode requires a loaded Layout Candidate V2."),
-            )
-            return None
-        if (
-            projection == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE
-            and self.runtime_fisheye_intrinsics_source is None
-        ):
-            QMessageBox.information(
-                self,
-                self.t("QGC output service"),
-                self.t("Fisheye Rectilinear projection requires a loaded fisheye intrinsics source."),
-            )
-            return None
-        use_far_field_custom = (
-            mode == StitchRuntimeMode.FAR_FIELD
-            and hasattr(self, "far_field_custom_layout_check")
-            and self.far_field_custom_layout_check.isChecked()
-        )
-        if use_far_field_custom and self.far_field_layout_candidate is None:
-            QMessageBox.information(
-                self,
-                self.t("QGC output service"),
-                self.t("Far-field custom layout requires a loaded Far-field Layout Candidate."),
-            )
-            return None
-        max_width, use_intrinsics = self.live_stitcher_options()
-        args = [
-            "-m",
-            "deep_shark_studio.qgc.runtime_service",
-            "--cameras-config",
-            str(CONFIG_DIR / "cameras.yaml"),
-            "--calibration-config",
-            str(CONFIG_DIR / "calibration.yaml"),
-            "--mode",
-            mode.value,
-            "--process-fps",
-            str(float(self.process_fps.value()) if hasattr(self, "process_fps") else 15.0),
-            "--output-kind",
-            output["kind"],
-            "--output-url",
-            output["url"],
-            "--output-fps",
-            str(float(output["fps"])),
-            "--output-bitrate",
-            output["bitrate"],
-            "--rtsp-transport",
-            output["rtsp_transport"],
-            "--ffmpeg",
-            output["ffmpeg_path"],
-            "--max-input-width",
-            str(0 if max_width is None else int(max_width)),
-        ]
-        if use_intrinsics:
-            args.append("--use-intrinsics")
-        if use_far_field_custom and self.far_field_layout_candidate is not None:
-            args.extend(
-                [
-                    "--far-field-layout-candidate",
-                    str(self.far_field_layout_candidate.path),
-                ]
-            )
-        if mode == StitchRuntimeMode.NEAR_FIELD and self.runtime_layout_candidate is not None:
-            balance, fov_scale = self.selected_runtime_fisheye_params()
-            args.extend(
-                [
-                    "--near-field-layout-candidate",
-                    str(self.runtime_layout_candidate.path),
-                    "--projection-source",
-                    projection.value,
-                    "--fisheye-balance",
-                    str(float(balance)),
-                    "--fisheye-fov-scale",
-                    str(float(fov_scale)),
-                ]
-            )
-            if self.runtime_fisheye_intrinsics_source is not None:
-                args.extend(
-                    [
-                        "--projection-intrinsics-source",
-                        str(self.runtime_fisheye_intrinsics_source.path),
-                    ]
-                )
-        return args
-
     def start_qgc_output_service(self) -> None:
-        if (
-            self.qgc_output_process is not None
-            and self.qgc_output_process.state() != QProcess.ProcessState.NotRunning
-        ):
+        if self.qgc_output_active:
             QMessageBox.information(
                 self,
                 self.t("QGC output service"),
                 self.t("QGC output service already running."),
             )
             return
-        args = self.qgc_output_service_arguments()
-        if args is None:
-            return
-        process = QProcess(self)
-        process.setProgram(sys.executable)
-        process.setArguments(args)
-        process.setWorkingDirectory(str(PROJECT_ROOT))
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        process.readyReadStandardOutput.connect(self.on_qgc_output_service_output)
-        process.errorOccurred.connect(self.on_qgc_output_service_error)
-        process.finished.connect(self.on_qgc_output_service_finished)
-        self.qgc_output_process = process
-        process.start()
-        if not process.waitForStarted(3000):
-            self.qgc_output_process = None
-            self.qgc_output_start_button.setEnabled(True)
-            self.qgc_output_stop_button.setEnabled(False)
-            QMessageBox.warning(
-                self,
-                self.t("QGC output service"),
-                self.t("QGC output service failed to start."),
-            )
-            return
         output = self.qgc_video_output_config_from_widgets()
+        self.qgc_video_sink = FfmpegVideoSink(
+            VideoOutputConfig(
+                kind=output["kind"],
+                url=output["url"],
+                fps=float(output["fps"]),
+                bitrate=output["bitrate"],
+                rtsp_transport=output["rtsp_transport"],
+                ffmpeg_path=output["ffmpeg_path"],
+                output_width=output.get("output_width") or None,
+                output_height=output.get("output_height") or None,
+            )
+        )
+        self.qgc_output_active = True
+        self.qgc_output_frames_written = 0
+        self.qgc_output_last_error = ""
+        self.last_qgc_output_status_time = 0.0
         status = self.t(
             "QGC output service started: {url}",
             url=output["url"],
         )
         if hasattr(self, "qgc_output_service_status"):
-            self.qgc_output_service_status.setText(
-                f"{status}\nPID: {process.processId()}"
-            )
+            self.qgc_output_service_status.setText(status)
         self.qgc_output_start_button.setEnabled(False)
         self.qgc_output_stop_button.setEnabled(True)
         self.statusBar().showMessage(status)
         self.log(status)
+        self.write_qgc_output_frame(self.canvas)
 
     def stop_qgc_output_service(self) -> None:
-        process = self.qgc_output_process
-        if process is None or process.state() == QProcess.ProcessState.NotRunning:
-            self.qgc_output_process = None
-            if hasattr(self, "qgc_output_start_button"):
-                self.qgc_output_start_button.setEnabled(True)
-            if hasattr(self, "qgc_output_stop_button"):
-                self.qgc_output_stop_button.setEnabled(False)
-            if hasattr(self, "qgc_output_service_status"):
-                self.qgc_output_service_status.setText(
-                    self.t("QGC output service is stopped.")
-                )
-            return
-        process.terminate()
-        QTimer.singleShot(3000, self.kill_qgc_output_service_if_running)
-
-    def kill_qgc_output_service_if_running(self) -> None:
-        process = self.qgc_output_process
-        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
-            process.kill()
-
-    def on_qgc_output_service_output(self) -> None:
-        process = self.qgc_output_process
-        if process is None:
-            return
-        data = bytes(process.readAllStandardOutput()).decode(
-            "utf-8",
-            errors="replace",
-        ).strip()
-        if data:
-            self.log(f"QGC output service: {data}")
-
-    def on_qgc_output_service_error(self, error) -> None:
-        self.log(f"QGC output service error: {error}", level="ERROR")
-
-    def on_qgc_output_service_finished(self, exit_code: int, _exit_status) -> None:
-        message = (
-            self.t("QGC output service stopped.")
-            if int(exit_code) == 0
-            else self.t("QGC output service exited with code {code}.", code=exit_code)
-        )
+        sink = self.qgc_video_sink
+        self.qgc_video_sink = None
+        self.qgc_output_active = False
+        if sink is not None:
+            sink.close()
+        message = self.t("QGC output service stopped.")
         if hasattr(self, "qgc_output_service_status"):
             self.qgc_output_service_status.setText(message)
         if hasattr(self, "qgc_output_start_button"):
             self.qgc_output_start_button.setEnabled(True)
         if hasattr(self, "qgc_output_stop_button"):
             self.qgc_output_stop_button.setEnabled(False)
-        self.qgc_output_process = None
         self.statusBar().showMessage(message)
         self.log(message)
+
+    def write_qgc_output_frame(self, canvas: np.ndarray | None) -> None:
+        if not self.qgc_output_active or self.qgc_video_sink is None or canvas is None:
+            return
+        try:
+            self.qgc_video_sink.write(canvas)
+        except Exception as exc:
+            self.qgc_output_last_error = str(exc)
+            self.log(f"QGC output service error: {exc}", level="ERROR")
+            self.stop_qgc_output_service()
+            return
+        self.qgc_output_frames_written += 1
+        now = time.perf_counter()
+        if (
+            hasattr(self, "qgc_output_service_status")
+            and (
+                self.qgc_output_frames_written == 1
+                or now - self.last_qgc_output_status_time >= 1.0
+            )
+        ):
+            self.last_qgc_output_status_time = now
+            output = self.qgc_video_output_config_from_widgets()
+            timing_suffix = self.runtime_timing_status_suffix(self.last_runtime_metrics)
+            self.qgc_output_service_status.setText(
+                f"{self.t('QGC output service started: {url}', url=output['url'])}\n"
+                f"Frames: {self.qgc_output_frames_written} | stitch {self.last_stitch_ms:.1f} ms"
+                f"{timing_suffix}"
+            )
 
     def save_project_as(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -6176,6 +6210,138 @@ class MainWindow(QMainWindow):
             return
         self.project_status.setText(f"Runtime config exported: {saved_path}")
         self.log(f"Runtime config exported: {saved_path}")
+
+    def export_project_package_file(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            self.t("Choose project package export folder"),
+            str(PROJECT_ROOT / "projects"),
+        )
+        if not directory:
+            return
+        try:
+            result = export_project_package(
+                directory,
+                project_name=str(
+                    self.calibration_config.get(
+                        "stitch_topology",
+                        "triple_front_panorama",
+                    )
+                ),
+                far_field_candidate_path=(
+                    self.far_field_layout_candidate.path
+                    if self.far_field_layout_candidate is not None
+                    else None
+                ),
+                near_field_candidate_path=(
+                    self.runtime_layout_candidate.path
+                    if self.runtime_layout_candidate is not None
+                    else None
+                ),
+                b2_candidate_path=self.current_b2_candidate_directory(),
+                fisheye_intrinsics_path=self._current_fisheye_intrinsics_path(),
+                default_stitch_mode=self.runtime_stitch_config.mode.value,
+                use_far_field_custom=self.runtime_stitch_config.use_far_field_custom_layout,
+                near_field_projection_source=self.runtime_stitch_config.projection_source.value,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, self.t("Export project package failed"), str(exc))
+            return
+        self.project_status.setText(
+            self.t("Project package exported: {path}", path=result.package_root)
+        )
+        self.log(f"Project package exported: {result.package_root}")
+        if result.warnings:
+            self.log(
+                "Project package export warnings: " + "; ".join(result.warnings),
+                level="WARNING",
+            )
+
+    def import_project_package_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.t("Open project package manifest"),
+            str(PROJECT_ROOT / "projects"),
+            self.t("Project Package (*.yaml *.yml);;All Files (*)"),
+        )
+        if not path:
+            return
+        try:
+            validation = validate_project_package(path)
+        except Exception as exc:
+            QMessageBox.critical(self, self.t("Import project package failed"), str(exc))
+            return
+        if not validation.valid:
+            message = "; ".join(validation.errors)
+            QMessageBox.critical(
+                self,
+                self.t("Import project package failed"),
+                self.t("Project package invalid: {errors}", errors=message),
+            )
+            self.project_status.setText(
+                self.t("Project package invalid: {errors}", errors=message)
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            self.t("Activate project package?"),
+            self.t(
+                "The package is valid. Activate it now?\n\nThis will back up current configs, then replace active configs with the package configs. Candidate files remain inside the package and calibration.yaml is not edited during export/validation."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self.project_status.setText(
+                self.t("Project package validated but not activated: {path}", path=validation.package_root)
+            )
+            self.log(f"Project package validated but not activated: {validation.package_root}")
+            return
+        try:
+            result = activate_project_package(path)
+            self.reload_runtime_state()
+        except Exception as exc:
+            QMessageBox.critical(self, self.t("Import project package failed"), str(exc))
+            return
+        self.project_status.setText(
+            self.t("Project package activated: {path}", path=result.package_root)
+        )
+        self.log(f"Project package activated: {result.package_root}")
+
+    def validate_project_package_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.t("Validate project package manifest"),
+            str(PROJECT_ROOT / "projects"),
+            self.t("Project Package (*.yaml *.yml);;All Files (*)"),
+        )
+        if not path:
+            return
+        try:
+            validation = validate_project_package(path)
+        except Exception as exc:
+            QMessageBox.critical(self, self.t("Validate project package failed"), str(exc))
+            return
+        if validation.valid:
+            self.project_status.setText(
+                self.t("Project package valid: {path}", path=validation.package_root)
+            )
+            self.log(f"Project package valid: {validation.package_root}")
+        else:
+            message = "; ".join(validation.errors)
+            self.project_status.setText(
+                self.t("Project package invalid: {errors}", errors=message)
+            )
+            self.log(f"Project package invalid: {message}", level="ERROR")
+
+    def _current_fisheye_intrinsics_path(self) -> Path | None:
+        source = (
+            self.runtime_fisheye_intrinsics_source
+            or self.layout_tuner_fisheye_intrinsics_source
+        )
+        if source is None:
+            return None
+        return source.path
 
     def save_board_settings(self) -> None:
         board = self.calibration_config.setdefault("calibration_board", {})

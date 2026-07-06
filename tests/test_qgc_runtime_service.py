@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -9,6 +10,7 @@ from deep_shark_studio.qgc.runtime_service import (
     DeepSharkRuntimeService,
     DeepSharkRuntimeServiceConfig,
     _configured_video_output,
+    build_runtime_service_config,
     build_stream_configs,
 )
 from deep_shark_studio.qgc.video_output import (
@@ -145,6 +147,54 @@ class QGCRuntimeServiceTests(unittest.TestCase):
         self.assertEqual(0, controller.calls)
         self.assertIn("Missing active camera frames", service.status().last_error)
 
+    def test_candidate_processor_mode_outputs_b2_candidate_canvas(self) -> None:
+        frames = {
+            "front_left": np.zeros((8, 8, 3), dtype=np.uint8),
+            "front": np.zeros((8, 8, 3), dtype=np.uint8),
+            "front_right": np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+        candidate_canvas = np.full((24, 64, 3), 33, dtype=np.uint8)
+
+        class FakeCandidateProcessor:
+            def __init__(self, _directory, use_opencl=False):
+                self.last_timings = {}
+                self.use_opencl = use_opencl
+                pass
+
+            def process(self, _frames):
+                self.last_timings = {
+                    "candidate_remap_ms": 3.0,
+                    "candidate_compose_ms": 1.0,
+                }
+                return {}, candidate_canvas
+
+        with patch(
+            "deep_shark_studio.qgc.runtime_service.CandidatePanoramaProcessor",
+            FakeCandidateProcessor,
+        ):
+            sink = NullVideoSink()
+            service = DeepSharkRuntimeService(
+                _camera_config(),
+                _calibration_config(),
+                DeepSharkRuntimeServiceConfig(
+                    mode=StitchRuntimeMode.FAR_FIELD,
+                    processor_mode="candidate",
+                    candidate_directory="D:/tmp/fake-candidate",
+                ),
+                stream_manager=FakeStreamManager(frames),
+                video_sink=sink,
+            )
+
+            self.assertTrue(service.process_once())
+
+        self.assertEqual(1, len(sink.frames))
+        self.assertTrue(np.array_equal(candidate_canvas, sink.frames[0]))
+        self.assertEqual("b2_candidate_view", service.status().last_runtime_status)
+        self.assertEqual(
+            3.0,
+            service.status().last_runtime_metrics["timing"]["candidate_remap_ms"],
+        )
+
     def test_ffmpeg_command_is_low_latency_mpegts_udp(self) -> None:
         config = VideoOutputConfig(
             kind="udp_mpegts",
@@ -160,6 +210,12 @@ class QGCRuntimeServiceTests(unittest.TestCase):
         self.assertIn("bgr24", command)
         self.assertIn("libx264", command)
         self.assertIn("zerolatency", command)
+        self.assertIn("-use_wallclock_as_timestamps", command)
+        self.assertIn("-framerate", command)
+        self.assertNotIn("-r", command)
+        self.assertIn("-fflags", command)
+        self.assertIn("nobuffer", command)
+        self.assertIn("-flush_packets", command)
         self.assertIn("mpegts", command)
         self.assertEqual("udp://192.168.1.50:5600?pkt_size=1316", command[-1])
 
@@ -179,6 +235,8 @@ class QGCRuntimeServiceTests(unittest.TestCase):
         self.assertIn("bgr24", command)
         self.assertIn("libx264", command)
         self.assertIn("zerolatency", command)
+        self.assertIn("-use_wallclock_as_timestamps", command)
+        self.assertIn("-framerate", command)
         self.assertIn("rtsp", command)
         self.assertIn("-rtsp_transport", command)
         self.assertIn("tcp", command)
@@ -201,7 +259,10 @@ class QGCRuntimeServiceTests(unittest.TestCase):
                 "bitrate": "5000k",
                 "ffmpeg_path": "custom-ffmpeg",
                 "rtsp_transport": "tcp",
-            }
+                "output_width": 1800,
+                "output_height": 600,
+            },
+            "performance": {"b2_candidate_opencl": True},
         }
 
         config = _configured_video_output(args, camera_config)
@@ -211,6 +272,82 @@ class QGCRuntimeServiceTests(unittest.TestCase):
         self.assertEqual(12.0, config.fps)
         self.assertEqual("5000k", config.bitrate)
         self.assertEqual("custom-ffmpeg", config.ffmpeg_path)
+        self.assertEqual(1800, config.output_width)
+        self.assertEqual(600, config.output_height)
+
+    def test_video_output_config_defaults_to_udp_local_bridge(self) -> None:
+        args = SimpleNamespace(
+            output_kind=None,
+            output_url=None,
+            output_fps=None,
+            output_bitrate=None,
+            ffmpeg=None,
+            rtsp_transport=None,
+        )
+
+        config = _configured_video_output(args, {})
+
+        self.assertEqual("udp_mpegts", config.kind)
+        self.assertEqual("udp://127.0.0.1:5600?pkt_size=1316", config.url)
+
+    def test_runtime_config_accepts_candidate_processor_mode(self) -> None:
+        args = SimpleNamespace(
+            mode=StitchRuntimeMode.FAR_FIELD.value,
+            output_kind=None,
+            output_url=None,
+            output_fps=None,
+            output_bitrate=None,
+            ffmpeg=None,
+            rtsp_transport=None,
+            far_field_layout_candidate="",
+            near_field_layout_candidate="",
+            processor_mode="candidate",
+            candidate_directory="D:/tmp/fake-candidate",
+            projection_source="current_perspective",
+            projection_intrinsics_source="",
+            fisheye_balance=0.6,
+            fisheye_fov_scale=1.0,
+            max_input_width=960,
+            use_intrinsics=False,
+            process_fps=15.0,
+            allow_partial_frames=False,
+        )
+
+        config = build_runtime_service_config(args, _camera_config())
+
+        self.assertEqual("candidate", config.processor_mode)
+        self.assertEqual("D:\\tmp\\fake-candidate", str(config.candidate_directory))
+
+    def test_runtime_config_reads_candidate_opencl_from_performance(self) -> None:
+        args = SimpleNamespace(
+            mode=StitchRuntimeMode.FAR_FIELD.value,
+            output_kind=None,
+            output_url=None,
+            output_fps=None,
+            output_bitrate=None,
+            ffmpeg=None,
+            rtsp_transport=None,
+            far_field_layout_candidate="",
+            near_field_layout_candidate="",
+            processor_mode="candidate",
+            candidate_directory="D:/tmp/fake-candidate",
+            candidate_opencl=False,
+            projection_source="current_perspective",
+            projection_intrinsics_source="",
+            fisheye_balance=0.6,
+            fisheye_fov_scale=1.0,
+            max_input_width=960,
+            use_intrinsics=False,
+            process_fps=15.0,
+            allow_partial_frames=False,
+        )
+
+        config = build_runtime_service_config(
+            args,
+            {"performance": {"b2_candidate_opencl": True}},
+        )
+
+        self.assertTrue(config.candidate_use_opencl)
 
 
 if __name__ == "__main__":

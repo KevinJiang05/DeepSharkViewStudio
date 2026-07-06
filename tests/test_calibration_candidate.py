@@ -323,6 +323,31 @@ class CalibrationCandidateTests(unittest.TestCase):
             )
             self.assertEqual((600, 1800, 3), canvas.shape)
             self.assertGreater(np.count_nonzero(canvas), 0)
+            self.assertIn(
+                tuple(processor.camera_order),
+                processor._selection_masks_by_available,
+            )
+            self.assertTrue(processor.last_timings["precomputed_selection_masks"])
+            self.assertGreaterEqual(processor.last_timings["candidate_remap_ms"], 0.0)
+            self.assertGreaterEqual(processor.last_timings["candidate_compose_ms"], 0.0)
+            if cv2.ocl.haveOpenCL():
+                opencl_processor = CandidatePanoramaProcessor(output, use_opencl=True)
+                _opencl_warped, opencl_canvas = opencl_processor.process(frames)
+                self.assertEqual(canvas.shape, opencl_canvas.shape)
+                mean_abs_diff = float(
+                    np.mean(
+                        np.abs(
+                            canvas.astype(np.int16)
+                            - opencl_canvas.astype(np.int16)
+                        )
+                    )
+                )
+                self.assertLess(mean_abs_diff, 1.0)
+                self.assertTrue(opencl_processor.last_timings["opencl_enabled"])
+                self.assertGreaterEqual(
+                    opencl_processor.last_timings["candidate_download_ms"],
+                    0.0,
+                )
 
             manager = StitchProcessingManager()
             try:
@@ -345,6 +370,11 @@ class CalibrationCandidateTests(unittest.TestCase):
                 self.assertIsNotNone(result)
                 self.assertEqual("", result.error)
                 self.assertEqual((600, 1800, 3), result.canvas.shape)
+                self.assertEqual("b2_candidate_view", result.runtime_status)
+                self.assertIn(
+                    "candidate_remap_ms",
+                    result.runtime_metrics["timing"],
+                )
             finally:
                 self.assertTrue(manager.shutdown())
 

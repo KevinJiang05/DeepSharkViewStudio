@@ -157,6 +157,22 @@ Fisheye Rectilinear requires a read-only intrinsics source with all three camera
 
 Future provider ideas such as `CurrentUndistortProjectionProvider` or equirectangular runtime should be added behind the same ProjectionProvider boundary, but they should not change Far-field behavior by default.
 
+## Project Packages
+
+Project package export/import is a distribution layer only. It copies configs
+and candidate resources into a relative-path package so another machine can
+load the same Far-field Default, Far-field Custom, Near-field, and projection
+research inputs.
+
+It does not change runtime algorithms:
+
+- Far-field Default remains the original runtime path.
+- Far-field Custom remains B-2 per-camera projection plus camera adjust plus
+  B-2 weight selection.
+- Near-field remains front-priority layout candidate based.
+- Fisheye Rectilinear remains experimental and Near-field only.
+- Equirectangular remains research-only.
+
 ## Candidate Versions
 
 - Layout Candidate V2 has no projection block and is interpreted as `current_perspective`.

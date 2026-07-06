@@ -12,8 +12,9 @@ from typing import Any, Mapping
 import numpy as np
 
 from deep_shark_studio.config import CONFIG_DIR, load_yaml
+from deep_shark_studio.calibration_candidate import CandidatePanoramaProcessor
 from deep_shark_studio.stream_manager import CameraStreamConfig, CameraStreamManager
-from deep_shark_studio.stitch_runtime_controller import RuntimeStitchController
+from deep_shark_studio.stitch_runtime_controller import RuntimeStitchController, RuntimeStitchResult
 from deep_shark_studio.stitch_runtime_modes import (
     ProjectionSource,
     RuntimeStitchConfig,
@@ -33,6 +34,9 @@ class DeepSharkRuntimeServiceConfig:
     output: VideoOutputConfig = field(default_factory=VideoOutputConfig)
     far_field_layout_candidate_path: Path | None = None
     near_field_layout_candidate_path: Path | None = None
+    processor_mode: str = "runtime"
+    candidate_directory: Path | None = None
+    candidate_use_opencl: bool = False
     projection_source: ProjectionSource = ProjectionSource.CURRENT_PERSPECTIVE
     projection_intrinsics_source_path: Path | None = None
     fisheye_balance: float = 0.6
@@ -89,15 +93,25 @@ class DeepSharkRuntimeService:
         self.stream_manager = stream_manager or CameraStreamManager()
         self.video_sink = video_sink or FfmpegVideoSink(service_config.output)
         if controller is None:
-            stitcher = SurroundStitcher(
-                self.calibration_config,
-                max_input_width=service_config.max_input_width,
-                use_intrinsics=service_config.use_intrinsics,
-            )
-            controller = RuntimeStitchController(
-                stitcher,
-                service_config.runtime_stitch_config(),
-            )
+            if service_config.processor_mode == "candidate":
+                if service_config.candidate_directory is None:
+                    raise ValueError(
+                        "Candidate output mode requires a candidate directory."
+                    )
+                controller = CandidateRuntimeController(
+                    service_config.candidate_directory,
+                    use_opencl=service_config.candidate_use_opencl,
+                )
+            else:
+                stitcher = SurroundStitcher(
+                    self.calibration_config,
+                    max_input_width=service_config.max_input_width,
+                    use_intrinsics=service_config.use_intrinsics,
+                )
+                controller = RuntimeStitchController(
+                    stitcher,
+                    service_config.runtime_stitch_config(),
+                )
         self.controller = controller
         self._running = False
         self._frames_written = 0
@@ -174,6 +188,33 @@ class DeepSharkRuntimeService:
         )
 
 
+class CandidateRuntimeController:
+    """Expose the B-2 candidate live view through the same service controller API."""
+
+    def __init__(self, candidate_directory: str | Path, use_opencl: bool = False):
+        self.processor = CandidatePanoramaProcessor(
+            candidate_directory,
+            use_opencl=use_opencl,
+        )
+
+    def process(self, frames: Mapping[str, np.ndarray]) -> RuntimeStitchResult:
+        warped, canvas = self.processor.process(dict(frames))
+        timing = getattr(self.processor, "last_timings", {})
+        return RuntimeStitchResult(
+            warped=warped,
+            canvas=canvas,
+            mode=StitchRuntimeMode.FAR_FIELD,
+            status="b2_candidate_view",
+            warnings=(
+                "B-2 candidate view is experimental and read-only; it does not write calibration.yaml.",
+            ),
+            metrics={
+                "runtime_mode": "b2_candidate_view",
+                "timing": timing if isinstance(timing, dict) else {},
+            },
+        )
+
+
 def build_stream_configs(
     camera_config: Mapping[str, Any],
     calibration_config: Mapping[str, Any],
@@ -215,7 +256,7 @@ def _configured_video_output(
     raw = (camera_config or {}).get("qgc_video_output", {})
     if not isinstance(raw, dict):
         raw = {}
-    kind = str(args.output_kind or raw.get("kind", "rtsp"))
+    kind = str(args.output_kind or raw.get("kind", "udp_mpegts"))
     url = str(
         args.output_url
         or raw.get(
@@ -227,6 +268,19 @@ def _configured_video_output(
             ),
         )
     )
+
+    def _optional_positive_int(*values: Any) -> int | None:
+        for value in values:
+            if value in (None, ""):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                return parsed
+        return None
+
     return VideoOutputConfig(
         kind=kind,
         url=url,
@@ -234,6 +288,16 @@ def _configured_video_output(
         bitrate=str(args.output_bitrate or raw.get("bitrate", "6000k")),
         ffmpeg_path=str(args.ffmpeg or raw.get("ffmpeg_path", "ffmpeg")),
         rtsp_transport=str(args.rtsp_transport or raw.get("rtsp_transport", "tcp")),
+        output_width=_optional_positive_int(
+            getattr(args, "output_width", None),
+            raw.get("output_width"),
+            raw.get("width"),
+        ),
+        output_height=_optional_positive_int(
+            getattr(args, "output_height", None),
+            raw.get("output_height"),
+            raw.get("height"),
+        ),
     )
 
 
@@ -243,6 +307,9 @@ def build_runtime_service_config(
 ) -> DeepSharkRuntimeServiceConfig:
     mode = StitchRuntimeMode(str(args.mode))
     projection_source = ProjectionSource(str(args.projection_source))
+    performance = (camera_config or {}).get("performance", {})
+    if not isinstance(performance, Mapping):
+        performance = {}
     return DeepSharkRuntimeServiceConfig(
         mode=mode,
         output=_configured_video_output(args, camera_config),
@@ -255,6 +322,16 @@ def build_runtime_service_config(
             Path(args.near_field_layout_candidate)
             if args.near_field_layout_candidate
             else None
+        ),
+        processor_mode=str(args.processor_mode),
+        candidate_directory=(
+            Path(args.candidate_directory)
+            if args.candidate_directory
+            else None
+        ),
+        candidate_use_opencl=bool(
+            getattr(args, "candidate_opencl", False)
+            or performance.get("b2_candidate_opencl", False)
         ),
         projection_source=projection_source,
         projection_intrinsics_source_path=(
@@ -307,6 +384,17 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--far-field-layout-candidate", default="")
     parser.add_argument("--near-field-layout-candidate", default="")
     parser.add_argument(
+        "--processor-mode",
+        choices=["runtime", "candidate"],
+        default="runtime",
+    )
+    parser.add_argument("--candidate-directory", default="")
+    parser.add_argument(
+        "--candidate-opencl",
+        action="store_true",
+        help="Use experimental OpenCL acceleration for B-2 candidate processor.",
+    )
+    parser.add_argument(
         "--projection-source",
         choices=[
             ProjectionSource.CURRENT_PERSPECTIVE.value,
@@ -326,6 +414,8 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-url", default=None)
     parser.add_argument("--output-fps", type=float, default=None)
     parser.add_argument("--output-bitrate", default=None)
+    parser.add_argument("--output-width", type=int, default=None)
+    parser.add_argument("--output-height", type=int, default=None)
     parser.add_argument("--rtsp-transport", choices=["tcp", "udp"], default=None)
     parser.add_argument("--ffmpeg", default=None)
     parser.add_argument("--max-input-width", type=int, default=960)

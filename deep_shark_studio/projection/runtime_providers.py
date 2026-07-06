@@ -93,8 +93,12 @@ class B2CandidateProjectionProvider:
     def project(self, frames: Mapping[str, np.ndarray]) -> ProjectionResult:
         total_start = time.perf_counter()
         process_start = time.perf_counter()
-        warped, _canvas = self.processor.process(dict(frames))
+        if hasattr(self.processor, "warp_all"):
+            warped = self.processor.warp_all(dict(frames))
+        else:
+            warped, _canvas = self.processor.process(dict(frames))
         process_ms = _elapsed_ms(process_start)
+        processor_timing = getattr(self.processor, "last_timings", {})
         valid_masks = self._valid_masks_for_warped(warped)
         metadata = {
             "projection_source": B2_FAR_FIELD_PROJECTION_SOURCE,
@@ -123,6 +127,12 @@ class B2CandidateProjectionProvider:
             timings={
                 "projection_total_ms": _elapsed_ms(total_start),
                 "b2_candidate_process_ms": process_ms,
+                "b2_candidate_remap_ms": float(
+                    processor_timing.get("candidate_remap_ms", 0.0)
+                ) if isinstance(processor_timing, dict) else 0.0,
+                "b2_candidate_compose_ms": float(
+                    processor_timing.get("candidate_compose_ms", 0.0)
+                ) if isinstance(processor_timing, dict) else 0.0,
             },
         )
 
@@ -135,7 +145,7 @@ class B2CandidateProjectionProvider:
         for camera, image in warped.items():
             mask = processor_masks.get(camera)
             if mask is not None and mask.shape == image.shape[:2]:
-                masks[camera] = np.asarray(mask, dtype=bool).copy()
+                masks[camera] = np.asarray(mask, dtype=bool)
             else:
                 masks[camera] = np.any(image != 0, axis=2).astype(bool)
         return masks
@@ -149,7 +159,7 @@ class B2CandidateProjectionProvider:
         for camera, image in warped.items():
             weight = processor_weights.get(camera)
             if weight is not None and weight.shape == image.shape[:2]:
-                weights[camera] = np.asarray(weight, dtype=np.float32).copy()
+                weights[camera] = np.asarray(weight, dtype=np.float32)
         return weights
 
 

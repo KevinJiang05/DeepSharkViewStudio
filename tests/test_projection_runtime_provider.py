@@ -142,16 +142,25 @@ class FakeB2CandidateProcessor:
             "front_right": np.ones((6, 12), dtype=bool),
         }
         self.process_calls = 0
+        self.warp_all_calls = 0
+        self.last_timings = {}
 
-    def process(self, frames):
-        self.process_calls += 1
-        warped = {
+    def warp_all(self, frames):
+        self.warp_all_calls += 1
+        self.last_timings = {
+            "candidate_remap_ms": 2.0,
+            "candidate_compose_ms": 0.0,
+        }
+        return {
             "front_left": np.full((6, 12, 3), 11, dtype=np.uint8),
             "front": np.full((6, 12, 3), 22, dtype=np.uint8),
             "front_right": np.full((6, 12, 3), 33, dtype=np.uint8),
         }
+
+    def process(self, frames):
+        self.process_calls += 1
         canvas = np.full((6, 12, 3), 44, dtype=np.uint8)
-        return warped, canvas
+        return self.warp_all(frames), canvas
 
 
 class CurrentPerspectiveProjectionProviderTests(unittest.TestCase):
@@ -212,9 +221,12 @@ class B2CandidateProjectionProviderTests(unittest.TestCase):
                 "deep_shark_studio.projection.runtime_providers.CandidatePanoramaProcessor",
                 FakeB2CandidateProcessor,
             ):
-                result = B2CandidateProjectionProvider(Path(temp)).project({})
+                provider = B2CandidateProjectionProvider(Path(temp))
+                result = provider.project({})
 
         self.assertIsInstance(result, ProjectionResult)
+        self.assertEqual(1, provider.processor.warp_all_calls)
+        self.assertEqual(0, provider.processor.process_calls)
         self.assertEqual(B2_FAR_FIELD_PROJECTION_SOURCE, result.metadata["projection_source"])
         self.assertEqual("B2CandidateProjectionProvider", result.metadata["provider_name"])
         self.assertTrue(result.metadata["uses_fisheye"])
@@ -223,6 +235,8 @@ class B2CandidateProjectionProviderTests(unittest.TestCase):
         self.assertEqual({"front_left", "front", "front_right"}, set(result.warped_images))
         self.assertEqual({"front_left", "front", "front_right"}, set(result.valid_masks))
         self.assertIn("b2_candidate_process_ms", result.timings)
+        self.assertEqual(2.0, result.timings["b2_candidate_remap_ms"])
+        self.assertEqual(0.0, result.timings["b2_candidate_compose_ms"])
 
 
 class FisheyeRuntimeProviderTests(unittest.TestCase):

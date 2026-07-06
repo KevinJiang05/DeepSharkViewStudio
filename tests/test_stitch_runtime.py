@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +23,7 @@ from deep_shark_studio.gui.main_window import (
     NoWheelSlider,
     NoWheelSpinBox,
     PreviewContentMode,
+    PreviewLayoutMode,
 )
 from deep_shark_studio.gui.panels import StitchRuntimeModePanel
 from deep_shark_studio.projection.runtime_providers import ProjectionResult
@@ -376,22 +378,89 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         self.assertTrue(hasattr(self.window, "far_field_layout_candidate_status"))
         self.assertTrue(hasattr(self.window, "runtime_apply_button"))
 
-    def test_qgc_output_service_controls_exist_and_build_rtsp_command(self) -> None:
+    def test_qgc_output_service_controls_start_direct_canvas_sink(self) -> None:
         self.assertTrue(hasattr(self.window, "qgc_output_start_button"))
         self.assertTrue(hasattr(self.window, "qgc_output_stop_button"))
         self.assertFalse(self.window.qgc_output_stop_button.isEnabled())
-        self.assertEqual("rtsp", self.window.qgc_output_kind.currentData())
+        output_modes = [
+            self.window.qgc_output_kind.itemData(index)
+            for index in range(self.window.qgc_output_kind.count())
+        ]
+        self.assertEqual(["udp_mpegts", "rtsp"], output_modes)
 
         self.window.qgc_output_url.setText("rtsp://127.0.0.1:8554/deepshark")
-        args = self.window.qgc_output_service_arguments()
+        self.window.canvas = np.full((24, 32, 3), 9, dtype=np.uint8)
+        writes: list[np.ndarray] = []
 
-        self.assertIsNotNone(args)
-        assert args is not None
-        self.assertIn("deep_shark_studio.qgc.runtime_service", args)
-        self.assertIn("--output-kind", args)
-        self.assertIn("rtsp", args)
-        self.assertIn("--output-url", args)
-        self.assertIn("rtsp://127.0.0.1:8554/deepshark", args)
+        class FakeSink:
+            def __init__(self, config):
+                self.config = config
+
+            def write(self, frame):
+                writes.append(np.asarray(frame).copy())
+
+            def close(self):
+                pass
+
+        with patch("deep_shark_studio.gui.main_window.FfmpegVideoSink", FakeSink):
+            self.window.start_qgc_output_service()
+
+        self.assertTrue(self.window.qgc_output_active)
+        self.assertFalse(self.window.qgc_output_start_button.isEnabled())
+        self.assertTrue(self.window.qgc_output_stop_button.isEnabled())
+        self.assertEqual(1, len(writes))
+        self.assertTrue(np.array_equal(self.window.canvas, writes[0]))
+
+    def test_qgc_output_writes_current_canvas_after_stitch_result(self) -> None:
+        writes: list[np.ndarray] = []
+
+        class FakeSink:
+            def write(self, frame):
+                writes.append(np.asarray(frame).copy())
+
+            def close(self):
+                pass
+
+        self.window.qgc_video_sink = FakeSink()
+        self.window.qgc_output_active = True
+        canvas = np.full((24, 32, 3), 17, dtype=np.uint8)
+
+        self.window.write_qgc_output_frame(canvas)
+
+        self.assertEqual(1, len(writes))
+        self.assertTrue(np.array_equal(canvas, writes[0]))
+
+    def test_qgc_output_priority_reduces_gui_preview_refresh_rate(self) -> None:
+        self.window.performance_config["preview_fps"] = 30
+
+        self.window.qgc_output_active = False
+        self.assertLess(self.window.effective_preview_interval(), 0.1)
+
+        self.window.qgc_output_active = True
+        self.assertGreaterEqual(self.window.effective_preview_interval(), 0.2)
+
+    def test_qgc_output_priority_throttles_canvas_render_only(self) -> None:
+        self.window.preview_layout_mode = PreviewLayoutMode.STITCHED
+        self.window.qgc_output_active = True
+        self.window.last_canvas_render_time = time.perf_counter()
+
+        self.assertFalse(self.window.should_render_canvas_now())
+
+        self.window.last_canvas_render_time -= 0.25
+        self.assertTrue(self.window.should_render_canvas_now())
+
+    def test_stitch_fps_limit_allows_higher_qgc_rates(self) -> None:
+        self.assertGreaterEqual(self.window.process_fps.maximum(), 60)
+
+    def test_b2_opencl_performance_toggle_is_saved(self) -> None:
+        self.assertTrue(hasattr(self.window, "b2_candidate_opencl"))
+
+        self.window.b2_candidate_opencl.setChecked(True)
+        self.window.collect_camera_config_from_widgets()
+
+        self.assertTrue(
+            self.window.camera_config["performance"]["b2_candidate_opencl"]
+        )
 
     def test_root_workflow_tabs_exist(self) -> None:
         tab_texts = [
@@ -406,6 +475,18 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         self.assertTrue(any("投影" in text or "Projection" in text for text in tab_texts))
         self.assertTrue(any("项目" in text or "Project" in text for text in tab_texts))
         self.assertTrue(any("诊断" in text or "Diagnostics" in text for text in tab_texts))
+
+    def test_project_package_buttons_exist(self) -> None:
+        self.assertTrue(hasattr(self.window, "project_package_export_button"))
+        self.assertTrue(hasattr(self.window, "project_package_import_button"))
+        self.assertTrue(hasattr(self.window, "project_package_validate_button"))
+        texts = {
+            self.window.project_package_export_button.text(),
+            self.window.project_package_import_button.text(),
+            self.window.project_package_validate_button.text(),
+        }
+
+        self.assertTrue(any("Package" in text or "项目包" in text for text in texts))
 
     def test_layout_tuner_is_top_level_workspace_not_preview_subtab(self) -> None:
         preview_tab_texts = [

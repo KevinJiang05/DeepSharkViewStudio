@@ -9,32 +9,46 @@ selection.
 
 ```text
 front_left / front / front_right cameras
-  -> DeepShark headless runtime service
-  -> RuntimeStitchController
+  -> DeepShark GUI Realtime Monitor or headless runtime service
   -> stitched BGR canvas
-  -> FFmpeg H.264 RTSP publish stream
-  -> RTSP server
-  -> QGC standard RTSP video source
+  -> FFmpeg H.264 stream
+  -> UDP MPEG-TS or RTSP
+  -> QGC standard video source
 ```
 
 This does not embed Python/PySide into QGC and does not make QGC perform
 stitching.
 
-The default output is an RTSP publish URL:
+DeepShark supports two QGC output modes:
 
 ```text
-rtsp://127.0.0.1:8554/deepshark
+UDP Local Low Latency:
+  udp://127.0.0.1:5600?pkt_size=1316
+
+RTSP Standard Service:
+  rtsp://127.0.0.1:8554/deepshark
 ```
 
-DeepShark publishes to that URL. A local or onboard RTSP server, for example
-MediaMTX, must accept the published stream. QGC should then open the same RTSP
-stream URL as a standard video source. UDP MPEG-TS remains available as a
-compatibility option for QGC builds or test networks that prefer `udp://` input.
+Use UDP for same-machine low-latency bridge testing. Use RTSP when a local or
+onboard RTSP server, for example MediaMTX, should accept the published stream
+and QGC should open a standard RTSP URL.
+
+FFmpeg uses wall-clock timestamps for raw stdin frames and disables MPEG-TS
+mux buffering where possible. This keeps QGC latency reporting closer to the
+actual DeepShark frame production cadence when the stitcher cannot sustain the
+configured nominal output FPS.
+
+For B-2 Candidate View, DeepShark can optionally use an experimental OpenCL
+processor. It keeps B-2 remap and weight-selection composition on the OpenCL
+device and downloads only the final stitched canvas for FFmpeg. This is enabled
+from the UI performance settings or by setting
+`configs/cameras.yaml -> performance.b2_candidate_opencl: true`; it remains
+off by default and does not modify `calibration.yaml`.
 
 When the command line does not provide `--output-kind` / `--output-url`, the
 headless service reads the saved UI settings from
 `configs/cameras.yaml -> qgc_video_output`. If that block is missing, it falls
-back to the RTSP default above.
+back to the UDP local bridge default above.
 
 ## Runtime Modes
 
@@ -71,8 +85,8 @@ Far-field Default to local QGC:
 ```powershell
 D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
   --mode far_field `
-  --output-kind rtsp `
-  --output-url "rtsp://127.0.0.1:8554/deepshark" `
+  --output-kind udp_mpegts `
+  --output-url "udp://127.0.0.1:5600?pkt_size=1316" `
   --process-fps 15 `
   --output-fps 15
 ```
@@ -97,27 +111,28 @@ D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.q
   --output-url "rtsp://<rtsp-server-ip>:8554/deepshark"
 ```
 
-UDP MPEG-TS compatibility output:
+RTSP service output:
 
 ```powershell
 D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
   --mode far_field `
-  --output-kind udp_mpegts `
-  --output-url "udp://<qgc-ip>:5600?pkt_size=1316"
+  --output-kind rtsp `
+  --output-url "rtsp://<rtsp-server-ip>:8554/deepshark"
 ```
 
 ## QGC Side
 
-For the default path, configure QGC to open the RTSP stream URL, for example:
+For UDP local bridge mode, configure QGC to receive UDP/H.264 or MPEG-TS video
+on port 5600.
+
+For RTSP service mode, configure QGC to open the RTSP stream URL, for example:
 
 ```text
 rtsp://<rtsp-server-ip>:8554/deepshark
 ```
 
-If using the compatibility UDP MPEG-TS output, configure QGC to receive the UDP
-video stream on the same port, commonly 5600. The exact QGC label depends on the
-QGC build, but use the standard UDP/H.264 or MPEG-TS video source option and
-point it at the selected port.
+The exact QGC labels depend on the QGC build, but keep the DeepShark output mode
+and QGC video source type matched: UDP with UDP, RTSP with RTSP.
 
 ## UI Settings
 
@@ -137,10 +152,18 @@ Start QGC Output Service
 Stop QGC Output Service
 ```
 
-These buttons launch or stop the headless DeepShark payload service as a
-separate process using the current Far-field / Near-field runtime selection and
-the configured QGC output URL. The GUI remains responsive while the service is
-running.
+These buttons open or close an FFmpeg video sink inside the GUI process. Each
+new stitched canvas produced by Realtime Monitor is written to the QGC output
+stream, so the QGC stream follows the same Far-field Default, Far-field Custom,
+Near-field, or B-2 Candidate View canvas that the GUI is already producing. The
+buttons do not start a second camera capture or stitching pipeline.
+
+The command-line headless service remains available for deployment scenarios
+where DeepShark runs without the PySide UI.
+
+For headless B-2 candidate output, pass `--candidate-opencl` to request the
+experimental OpenCL processor. If OpenCL is not available in the current OpenCV
+runtime, DeepShark falls back to the CPU candidate processor.
 
 ## Safety Boundaries
 

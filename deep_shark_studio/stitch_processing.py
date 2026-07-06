@@ -73,6 +73,7 @@ class StitchProcessingWorker:
         use_intrinsics: bool,
         processor_mode: str = "template",
         candidate_directory: str | None = None,
+        candidate_use_opencl: bool = False,
         runtime_config: RuntimeStitchConfig | None = None,
     ) -> None:
         with self._condition:
@@ -86,7 +87,8 @@ class StitchProcessingWorker:
                         "Candidate processor requires a candidate directory."
                     )
                 self._stitcher = CandidatePanoramaProcessor(
-                    candidate_directory
+                    candidate_directory,
+                    use_opencl=candidate_use_opencl,
                 )
             else:
                 stitcher = SurroundStitcher(
@@ -171,6 +173,17 @@ class StitchProcessingWorker:
                     runtime_metrics = processed.metrics
                 else:
                     warped, canvas = processed
+                    if isinstance(stitcher, CandidatePanoramaProcessor):
+                        timing = getattr(stitcher, "last_timings", {})
+                        runtime_mode = "far_field"
+                        runtime_status = "b2_candidate_view"
+                        runtime_warnings = (
+                            "B-2 candidate view is experimental and read-only; it does not write calibration.yaml.",
+                        )
+                        runtime_metrics = {
+                            "runtime_mode": "b2_candidate_view",
+                            "timing": timing if isinstance(timing, dict) else {},
+                        }
             except Exception as exc:
                 error = str(exc)
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
@@ -209,6 +222,7 @@ class StitchProcessingManager:
         use_intrinsics: bool,
         processor_mode: str = "template",
         candidate_directory: str | None = None,
+        candidate_use_opencl: bool = False,
         runtime_config: RuntimeStitchConfig | None = None,
     ) -> None:
         self.start()
@@ -219,6 +233,7 @@ class StitchProcessingManager:
             use_intrinsics,
             processor_mode=processor_mode,
             candidate_directory=candidate_directory,
+            candidate_use_opencl=candidate_use_opencl,
             runtime_config=runtime_config,
         )
 

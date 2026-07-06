@@ -56,6 +56,10 @@ Configuration and distribution workspace.
 
 - Camera and runtime configuration remains available here.
 - Project files bundle configuration YAMLs.
+- Project packages export configs and currently loaded candidates into a
+  directory with package-relative paths for team handoff.
+- Import validates first. Activation backs up current configs before replacing
+  them with package configs.
 - Runtime export remains an experimental/config distribution path and does not
   deploy or apply a runtime automatically.
 
