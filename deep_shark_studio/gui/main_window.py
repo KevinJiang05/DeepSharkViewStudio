@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QTimer, Qt, QUrl, Signal
+from PySide6.QtCore import QPointF, QProcess, QRectF, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -57,6 +57,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from deep_shark_studio.gui.panels import StitchRuntimeModePanel
 from deep_shark_studio.calibration import (
     calibrate_camera_from_images,
     draw_chessboard_detection,
@@ -120,17 +121,43 @@ from deep_shark_studio.stream_manager import (
     STREAM_STOPPING,
 )
 from deep_shark_studio.stitch_processing import StitchProcessingManager
+from deep_shark_studio.stitch_runtime_controller import RuntimeStitchController
+from deep_shark_studio.stitch_runtime_modes import (
+    ProjectionSource,
+    RuntimeStitchConfig,
+    StitchRuntimeMode,
+)
 from deep_shark_studio.stitcher import SurroundStitcher, load_images_from_directory, save_image
+from deep_shark_studio.projection import (
+    B2CandidateProjectionProvider,
+    B2_FAR_FIELD_PROJECTION_SOURCE,
+    CurrentPerspectiveProjectionProvider,
+    FisheyeIntrinsicsRuntimeError,
+    FisheyeIntrinsicsRuntimeSource,
+    FisheyeRectilinearParams,
+    FisheyeRectilinearProjectionProvider,
+    ProjectionResult,
+    load_fisheye_intrinsics_source,
+)
 from deep_shark_studio.seam import (
     LAYOUT_TUNER_PRESETS_V2,
     CameraAdjustParams,
+    FarFieldLayoutCandidateError,
+    FarFieldLayoutRuntimeCandidate,
+    LayoutCandidateRuntimeError,
     LayoutPreviewParamsV2,
+    LayoutRuntimeCandidate,
     PairLayoutParams,
+    default_far_field_layout_candidate_root,
     LayoutTunerParams,
     default_layout_candidate_root,
     layout_tuner_pair_candidates,
+    load_far_field_layout_candidate,
+    load_layout_candidate_for_runtime,
     normalize_layout_tuner_params,
+    render_far_field_custom_from_projection,
     render_front_priority_layout_preview,
+    save_far_field_layout_candidate,
     save_layout_tuner_candidate,
 )
 from deep_shark_studio.topology import (
@@ -150,6 +177,13 @@ ZH_CN = {
     "Chinese": "中文",
     "Ready": "就绪",
     "Realtime Preview": "实时预览",
+    "Realtime Monitor": "实时监看",
+    "Layout Tuning": "布局调参",
+    "Calibration & Candidates": "标定与候选",
+    "Projection Research": "投影研发",
+    "Diagnostics & Logs": "诊断与日志",
+    "Camera & Runtime Config": "相机与运行配置",
+    "Project Files": "项目文件",
     "Camera Config": "相机配置",
     "Calibration": "标定与调参",
     "Project": "项目管理",
@@ -167,10 +201,78 @@ ZH_CN = {
     "Stitched View": "拼接视图",
     "Candidate Stitch": "候选拼接",
     "Template Stitch": "模板拼接",
+    "B-2 Candidate View [Advanced]": "B-2 候选视图 [高级]",
+    "Current Profile Template": "当前正式 Profile 模板",
+    "Stitch Runtime Mode": "拼接算法模式",
+    "Runtime stitching algorithm, independent from Grid / Focus / Stitched layout.": "拼接算法模式独立于 Grid / Focus / Stitched 显示布局。",
+    "Mode": "模式",
+    "Far-field / distance priority": "远景优先 / Far-field",
+    "Near-field / front priority": "近景优先 / Near-field",
+    "Auto / experimental disabled": "自动 / 实验占位",
+    "Projection Source": "投影来源",
+    "Current Perspective Runtime": "当前 Perspective Runtime",
+    "Projection Source: Current Perspective Runtime": "投影来源：当前 Perspective Runtime",
+    "Near-field Projection Source": "近景投影来源",
+    "Current Perspective": "当前 Perspective",
+    "Fisheye Rectilinear [Experimental]": "鱼眼 Rectilinear [实验]",
+    "Far-field uses current runtime projection.": "Far-field 使用当前正式 runtime 投影。",
+    "Far-field Custom uses B-2 candidate projection.": "Far-field Custom 使用 B-2 候选投影。",
+    "Load Fisheye Intrinsics Source...": "加载鱼眼内参来源...",
+    "Clear Fisheye Intrinsics Source": "清除鱼眼内参来源",
+    "No fisheye intrinsics source loaded.": "未加载鱼眼内参来源。",
+    "Loaded fisheye intrinsics source": "已加载鱼眼内参来源",
+    "Choose Fisheye Intrinsics Source": "选择鱼眼内参来源",
+    "Fisheye source (*.yaml);;All Files (*)": "鱼眼来源 (*.yaml);;所有文件 (*)",
+    "Fisheye intrinsics source load failed": "鱼眼内参来源加载失败",
+    "Fisheye Rectilinear is experimental and only affects Near-field preview/runtime.": "鱼眼 Rectilinear 是实验功能，只影响 Near-field 预览/runtime。",
+    "Fisheye Rectilinear projection requires a loaded fisheye intrinsics source.": "鱼眼 Rectilinear 投影需要先加载鱼眼内参来源。",
+    "Fisheye Balance": "鱼眼 Balance",
+    "Fisheye FOV Scale": "鱼眼 FOV Scale",
+    "Fisheye Rectilinear Candidate - Research Only": "鱼眼 Rectilinear 候选 - 仅研发",
+    "Equirectangular Candidate - Research Only": "Equirectangular 候选 - 仅研发",
+    "Layout Candidate": "Layout 候选",
+    "Near-field Layout Candidate": "近景 Layout 候选",
+    "Load Candidate...": "加载候选...",
+    "Load Near-field Layout Candidate": "加载近景 Layout 候选",
+    "Use Far-field Custom Layout": "使用远景自定义布局",
+    "Load Far-field Layout Candidate": "加载远景 Layout 候选",
+    "Clear Far-field Layout Candidate": "清除远景 Layout 候选",
+    "No Far-field Layout Candidate loaded.": "未加载远景 Layout 候选。",
+    "Loaded Far-field Layout Candidate": "已加载远景 Layout 候选",
+    "Choose Far-field Layout Candidate": "选择远景 Layout 候选",
+    "Far-field layout candidate load failed": "远景 Layout 候选加载失败",
+    "Far-field custom layout requires a loaded Far-field Layout Candidate.": "远景自定义布局需要先加载远景 Layout 候选。",
+    "Far-field Layout": "远景 Layout",
+    "Near-field Layout": "近景 Layout",
+    "Layout Tuner Target": "布局调参目标",
+    "Near-field Layout Tuner Note": "近景 Layout 调参：使用当前捕获的投影/warp 图，保存 front-priority Layout 候选；不写正式 calibration.yaml。",
+    "Far-field Layout Tuner Note": "远景 Layout 调参：基于 B-2 候选的每路投影/warp 图，再做三路 x/y/scale 与 B-2 权重选择合成；不使用近景 side suppression，也不写正式 calibration.yaml。",
+    "Far-field layout tuning requires a B-2 candidate projection. Generate or load a B-2 candidate first.": "远景 Layout 调参需要先有 B-2 候选投影。请先生成或加载 B-2 候选。",
+    "Save Far-field Layout Candidate": "保存远景 Layout 候选",
+    "Clear Candidate": "清除候选",
+    "Open Candidate Folder": "打开候选目录",
+    "Apply to Preview Runtime": "应用到预览 Runtime",
+    "Use for Current Preview Only": "仅用于当前预览",
+    "Clear Near-field Layout Candidate": "清除近景 Layout 候选",
+    "Apply Near-field Preview": "应用近景预览",
+    "Only applies to the current preview worker; does not write calibration.yaml or the formal profile.": "只应用到当前预览 worker；不写 calibration.yaml，也不写正式 profile。",
+    "No Layout Candidate V2 loaded.": "未加载 Layout Candidate V2。",
+    "Loaded Layout Candidate V2": "已加载 Layout Candidate V2",
+    "Projection candidate is research-only and not connected to runtime yet.": "Projection 候选仍是研发线，尚未接入 runtime。",
+    "Near-field mode requires a loaded Layout Candidate V2.": "Near-field 模式需要先加载 Layout Candidate V2。",
+    "Auto stitch runtime mode is not implemented; falling back to Far-field.": "Auto 拼接算法模式尚未实现；当前回退 Far-field。",
+    "Choose Layout Candidate V2": "选择 Layout Candidate V2",
+    "Layout Candidate (*.yaml);;All Files (*)": "Layout Candidate (*.yaml);;所有文件 (*)",
+    "Runtime layout candidate load failed": "Runtime layout candidate 加载失败",
+    "Runtime mode applied. Open the Canvas tab to see the effect.": "Runtime 模式已应用。打开 Canvas 拼接画布可看到效果。",
+    "Near-field runtime uses current perspective warp; experimental candidate stitch was switched back to template.": "Near-field runtime 使用当前 perspective warp；已从实验候选拼接切回模板拼接。",
+    "Near-field stitched view": "近景优先拼接画面",
+    "Far-field stitched view": "远景优先拼接画面",
     "Experimental": "实验性",
     "Advanced": "高级",
     "Experimental candidate live view": "实验性候选实时画面",
     "Template stitching": "模板拼接",
+    "B-2 candidate view": "B-2 候选视图",
     "Back to Grid": "返回多路",
     "Multi-camera monitoring": "多路监看",
     "Single-camera view: {camera}": "单路查看：{camera}",
@@ -300,6 +402,35 @@ ZH_CN = {
     "Readable": "可读取",
     "Corners": "角点数",
     "Project Management": "项目管理",
+    "QGC Video Output": "QGC 视频输出",
+    "Output Type": "输出类型",
+    "RTSP publish URL": "RTSP 发布地址",
+    "UDP MPEG-TS URL": "UDP MPEG-TS 地址",
+    "Output URL": "输出地址",
+    "Output FPS": "输出帧率",
+    "Output Bitrate": "输出码率",
+    "RTSP Transport": "RTSP 传输",
+    "FFmpeg Path": "FFmpeg 路径",
+    "Save QGC Output Settings": "保存 QGC 输出设置",
+    "Start QGC Output Service": "启动 QGC 输出服务",
+    "Stop QGC Output Service": "停止 QGC 输出服务",
+    "QGC output service is stopped.": "QGC 输出服务未运行。",
+    "QGC output service started: {url}": "QGC 输出服务已启动：{url}",
+    "QGC output service stopped.": "QGC 输出服务已停止。",
+    "QGC output service failed to start.": "QGC 输出服务启动失败。",
+    "QGC output service already running.": "QGC 输出服务已在运行。",
+    "QGC output service exited with code {code}.": "QGC 输出服务已退出，代码 {code}。",
+    "QGC output service": "QGC 输出服务",
+    "Start the headless DeepShark video payload service with the current Far/Near runtime settings.": "使用当前 Far/Near runtime 设置启动独立 DeepShark 视频载荷服务。",
+    "Stop the running DeepShark video payload service process.": "停止正在运行的 DeepShark 视频载荷服务进程。",
+    "QGC output settings saved.": "QGC 输出设置已保存。",
+    "QGC output settings are saved in cameras.yaml and do not modify calibration.yaml.": "QGC 输出设置保存在 cameras.yaml，不会修改 calibration.yaml。",
+    "RTSP output publishes to an RTSP server. QGC should open the same stream URL.": "RTSP 输出会发布到 RTSP 服务端，QGC 应打开同一个流地址。",
+    "UDP MPEG-TS remains available for QGC builds or test links that prefer udp:// port input.": "UDP MPEG-TS 仍可用于偏好 udp:// 端口输入的 QGC 版本或测试链路。",
+    "Use this URL in QGC video settings when the RTSP server accepts publishing from DeepShark.": "当 RTSP 服务端接受 DeepShark 发布时，在 QGC 视频设置中使用这个地址。",
+    "Projection Research Overview": "投影研发概览",
+    "Projection Research Note": "Projection 研发线用于 fisheye rectilinear / equirectangular / A-B comparison 等实验。Near-field Fisheye 只影响 Near-field；Far-field Default 不受影响；Far-field Custom 使用 B-2 per-camera projection 基底。",
+    "Runtime projection controls remain in Realtime Monitor for current preview switching; layout-specific projection controls are in Layout Tuning.": "运行态投影切换仍在实时监看的拼接算法面板中；布局候选相关投影参数在布局调参中。",
     "No project file loaded. Current configs are stored in configs/*.yaml.": "尚未加载项目文件。当前配置保存在 configs/*.yaml。",
     "Save Project As": "项目另存为",
     "Open Project": "打开项目",
@@ -440,6 +571,7 @@ ZH_CN = {
     "Refresh Preview": "刷新预览",
     "Reset to Baseline": "恢复基准",
     "Save Layout Candidate": "保存布局候选",
+    "Save Near-field Layout Candidate": "保存近景 Layout 候选",
     "Export Preview PNG": "导出预览 PNG",
     "Open Candidate Folder": "打开候选目录",
     "Capture preview frame to tune layout.": "请先捕获预览帧，再调整布局。",
@@ -534,6 +666,34 @@ class PreviewContentMode(Enum):
     STOPPED = "stopped"
     LIVE = "live"
     STILL = "still"
+
+
+class NoWheelSpinBox(QSpinBox):
+    """Spin box that ignores mouse-wheel value changes."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        event.ignore()
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """Double spin box that ignores mouse-wheel value changes."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        event.ignore()
+
+
+class NoWheelComboBox(QComboBox):
+    """Combo box that ignores mouse-wheel selection changes."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        event.ignore()
+
+
+class NoWheelSlider(QSlider):
+    """Slider that ignores mouse-wheel value changes."""
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        event.ignore()
 
 
 class ImageView(QLabel):
@@ -1388,7 +1548,7 @@ class CameraRow:
 
         self.name = QLineEdit(str(config.get("display_name", camera_key)))
 
-        self.source_type = QComboBox()
+        self.source_type = NoWheelComboBox()
         self.source_type.addItems(SOURCE_TYPES)
         source_type = str(config.get("source_type", "image_dir"))
         self.source_type.setCurrentText(source_type if source_type in SOURCE_TYPES else "image_dir")
@@ -1432,15 +1592,23 @@ class MainWindow(QMainWindow):
         self.performance_config = self.camera_config.get("performance", {})
         self.stitcher = self.create_stitcher()
         self.stitch_processor = StitchProcessingManager()
+        self.qgc_output_process: QProcess | None = None
+        self.runtime_stitch_config = RuntimeStitchConfig()
+        self.runtime_layout_candidate: LayoutRuntimeCandidate | None = None
+        self.far_field_layout_candidate: FarFieldLayoutRuntimeCandidate | None = None
+        self.runtime_fisheye_intrinsics_source: FisheyeIntrinsicsRuntimeSource | None = None
         self.language = str(self.camera_config.get("language", "en"))
 
         self.frames: dict[str, np.ndarray] = {}
         self.warped: dict[str, np.ndarray] = {}
         self.canvas: np.ndarray | None = None
         self.layout_tuner_warped: dict[str, np.ndarray] = {}
+        self.layout_tuner_valid_masks: dict[str, np.ndarray] = {}
         self.layout_tuner_preview_result: Any | None = None
         self.layout_tuner_candidate_dir: Path | None = None
         self.layout_tuner_source_info: dict[str, Any] = {}
+        self.layout_tuner_projection_metadata: dict[str, Any] = {}
+        self.layout_tuner_fisheye_intrinsics_source: FisheyeIntrinsicsRuntimeSource | None = None
         self.stream_manager = CameraStreamManager()
         self.stream_snapshots = {}
         self.stream_error_log_counts: dict[str, int] = {}
@@ -1463,6 +1631,10 @@ class MainWindow(QMainWindow):
         self.last_stitched_raw_preview_time = 0.0
         self.source_contract_log_messages: set[str] = set()
         self.last_stitch_ui_error = ""
+        self.last_runtime_stitch_status = ""
+        self.last_runtime_warnings: list[str] = []
+        self.last_runtime_metrics: dict[str, Any] | None = None
+        self.last_runtime_warning_log_text = ""
         self.calibration_session: CalibrationSession | None = None
         self.live_candidate_directory = latest_calibration_candidate(
             topology=str(
@@ -1580,6 +1752,12 @@ class MainWindow(QMainWindow):
     def configure_live_stitch_processor(self) -> None:
         max_width, use_intrinsics = self.live_stitcher_options()
         processor_mode = self.live_stitch_mode
+        runtime_config = self.runtime_stitch_config
+        if (
+            runtime_config.mode == StitchRuntimeMode.NEAR_FIELD
+            or runtime_config.use_far_field_custom_layout
+        ):
+            processor_mode = "template"
         candidate_directory = (
             str(self.live_candidate_directory)
             if processor_mode == "candidate"
@@ -1594,6 +1772,7 @@ class MainWindow(QMainWindow):
                 use_intrinsics,
                 processor_mode=processor_mode,
                 candidate_directory=candidate_directory,
+                runtime_config=runtime_config,
             )
         except Exception as exc:
             if processor_mode != "candidate":
@@ -1610,8 +1789,611 @@ class MainWindow(QMainWindow):
                 max_width,
                 use_intrinsics,
                 processor_mode="template",
+                runtime_config=RuntimeStitchConfig(),
             )
             self.apply_live_stitch_mode_controls()
+
+    def current_runtime_profile_id(self) -> str:
+        return str(
+            self.calibration_config.get(
+                "stitch_topology",
+                "triple_front_panorama",
+            )
+        )
+
+    def choose_runtime_layout_candidate(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.t("Choose Layout Candidate V2"),
+            str(default_layout_candidate_root()),
+            self.t("Layout Candidate (*.yaml);;All Files (*)"),
+        )
+        if not path:
+            return
+        try:
+            self.load_runtime_layout_candidate_path(Path(path))
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                self.t("Runtime layout candidate load failed"),
+                str(exc),
+            )
+
+    def load_runtime_layout_candidate_path(self, path: str | Path) -> LayoutRuntimeCandidate:
+        candidate = load_layout_candidate_for_runtime(
+            Path(path),
+            expected_profile_id=self.current_runtime_profile_id(),
+        )
+        self.runtime_layout_candidate = candidate
+        projection = candidate.projection
+        if projection.source == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE:
+            if projection.intrinsics_source_path is None:
+                raise LayoutCandidateRuntimeError(
+                    "Fisheye Rectilinear candidate is missing intrinsics_source_path."
+                )
+            self.runtime_fisheye_intrinsics_source = load_fisheye_intrinsics_source(
+                projection.intrinsics_source_path
+            )
+            self.layout_tuner_fisheye_intrinsics_source = self.runtime_fisheye_intrinsics_source
+        self.runtime_stitch_config = RuntimeStitchConfig(
+            mode=self.runtime_stitch_config.mode,
+            projection_source=projection.source,
+            layout_candidate_path=candidate.path,
+            use_far_field_custom_layout=self.runtime_stitch_config.use_far_field_custom_layout,
+            far_field_layout_candidate_path=self.runtime_stitch_config.far_field_layout_candidate_path,
+            projection_intrinsics_source_path=projection.intrinsics_source_path,
+            fisheye_balance=projection.balance,
+            fisheye_fov_scale=projection.fov_scale,
+            auto_enabled=self.runtime_stitch_config.auto_enabled,
+        )
+        self.refresh_stitch_runtime_controls()
+        self.update_preview_status_summary()
+        self.log(f"Loaded runtime layout candidate: {candidate.path}")
+        return candidate
+
+    def clear_runtime_layout_candidate(self) -> None:
+        self.runtime_layout_candidate = None
+        mode = self.runtime_stitch_config.mode
+        if mode == StitchRuntimeMode.NEAR_FIELD:
+            mode = StitchRuntimeMode.FAR_FIELD
+        self.runtime_stitch_config = RuntimeStitchConfig(
+            mode=mode,
+            projection_source=ProjectionSource.CURRENT_PERSPECTIVE,
+            layout_candidate_path=None,
+            use_far_field_custom_layout=self.runtime_stitch_config.use_far_field_custom_layout,
+            far_field_layout_candidate_path=self.runtime_stitch_config.far_field_layout_candidate_path,
+            projection_intrinsics_source_path=None,
+            fisheye_balance=self.runtime_stitch_config.fisheye_balance,
+            fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
+            auto_enabled=False,
+        )
+        self.refresh_stitch_runtime_controls()
+        self.update_preview_status_summary()
+
+    def choose_far_field_layout_candidate(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.t("Choose Far-field Layout Candidate"),
+            str(default_far_field_layout_candidate_root()),
+            self.t("Layout Candidate (*.yaml);;All Files (*)"),
+        )
+        if not path:
+            return
+        try:
+            self.load_far_field_layout_candidate_path(Path(path))
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                self.t("Far-field layout candidate load failed"),
+                str(exc),
+            )
+
+    def load_far_field_layout_candidate_path(
+        self,
+        path: str | Path,
+    ) -> FarFieldLayoutRuntimeCandidate:
+        candidate = load_far_field_layout_candidate(
+            Path(path),
+            expected_profile_id=self.current_runtime_profile_id(),
+        )
+        self.far_field_layout_candidate = candidate
+        self.runtime_stitch_config = RuntimeStitchConfig(
+            mode=self.runtime_stitch_config.mode,
+            projection_source=self.runtime_stitch_config.projection_source,
+            layout_candidate_path=self.runtime_stitch_config.layout_candidate_path,
+            use_far_field_custom_layout=True,
+            far_field_layout_candidate_path=candidate.path,
+            projection_intrinsics_source_path=self.runtime_stitch_config.projection_intrinsics_source_path,
+            fisheye_balance=self.runtime_stitch_config.fisheye_balance,
+            fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
+            auto_enabled=self.runtime_stitch_config.auto_enabled,
+        )
+        if hasattr(self, "far_field_custom_layout_check"):
+            self.far_field_custom_layout_check.setChecked(True)
+        self.refresh_stitch_runtime_controls()
+        self.update_preview_status_summary()
+        self.log(f"Loaded Far-field layout candidate: {candidate.path}")
+        return candidate
+
+    def clear_far_field_layout_candidate(self) -> None:
+        self.far_field_layout_candidate = None
+        self.runtime_stitch_config = RuntimeStitchConfig(
+            mode=self.runtime_stitch_config.mode,
+            projection_source=self.runtime_stitch_config.projection_source,
+            layout_candidate_path=self.runtime_stitch_config.layout_candidate_path,
+            use_far_field_custom_layout=False,
+            far_field_layout_candidate_path=None,
+            projection_intrinsics_source_path=self.runtime_stitch_config.projection_intrinsics_source_path,
+            fisheye_balance=self.runtime_stitch_config.fisheye_balance,
+            fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
+            auto_enabled=self.runtime_stitch_config.auto_enabled,
+        )
+        self.refresh_stitch_runtime_controls()
+        self.update_preview_status_summary()
+
+    def choose_runtime_fisheye_intrinsics_source(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.t("Choose Fisheye Intrinsics Source"),
+            str(PROJECT_ROOT / "projects" / "calibration_candidates"),
+            self.t("Fisheye source (*.yaml);;All Files (*)"),
+        )
+        if not path:
+            return
+        try:
+            source = load_fisheye_intrinsics_source(Path(path))
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                self.t("Fisheye intrinsics source load failed"),
+                str(exc),
+            )
+            return
+        self.runtime_fisheye_intrinsics_source = source
+        self.layout_tuner_fisheye_intrinsics_source = source
+        self.runtime_stitch_config = RuntimeStitchConfig(
+            mode=self.runtime_stitch_config.mode,
+            projection_source=self.runtime_stitch_config.projection_source,
+            layout_candidate_path=self.runtime_stitch_config.layout_candidate_path,
+            use_far_field_custom_layout=self.runtime_stitch_config.use_far_field_custom_layout,
+            far_field_layout_candidate_path=self.runtime_stitch_config.far_field_layout_candidate_path,
+            projection_intrinsics_source_path=source.path,
+            fisheye_balance=float(getattr(self, "runtime_fisheye_balance", None).value())
+            if hasattr(self, "runtime_fisheye_balance")
+            else self.runtime_stitch_config.fisheye_balance,
+            fisheye_fov_scale=float(getattr(self, "runtime_fisheye_fov_scale", None).value())
+            if hasattr(self, "runtime_fisheye_fov_scale")
+            else self.runtime_stitch_config.fisheye_fov_scale,
+            auto_enabled=self.runtime_stitch_config.auto_enabled,
+        )
+        self.refresh_stitch_runtime_controls()
+        self.update_preview_status_summary()
+
+    def clear_runtime_fisheye_intrinsics_source(self) -> None:
+        self.runtime_fisheye_intrinsics_source = None
+        self.layout_tuner_fisheye_intrinsics_source = None
+        projection = self.runtime_stitch_config.projection_source
+        if projection == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE:
+            projection = ProjectionSource.CURRENT_PERSPECTIVE
+        self.runtime_stitch_config = RuntimeStitchConfig(
+            mode=self.runtime_stitch_config.mode,
+            projection_source=projection,
+            layout_candidate_path=self.runtime_stitch_config.layout_candidate_path,
+            use_far_field_custom_layout=self.runtime_stitch_config.use_far_field_custom_layout,
+            far_field_layout_candidate_path=self.runtime_stitch_config.far_field_layout_candidate_path,
+            projection_intrinsics_source_path=None,
+            fisheye_balance=self.runtime_stitch_config.fisheye_balance,
+            fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
+            auto_enabled=self.runtime_stitch_config.auto_enabled,
+        )
+        self.refresh_stitch_runtime_controls()
+        self.update_preview_status_summary()
+
+    def open_runtime_layout_candidate_folder(self) -> None:
+        if self.runtime_layout_candidate is not None:
+            directory = self.runtime_layout_candidate.candidate_directory
+        else:
+            directory = default_layout_candidate_root()
+        directory.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+
+    def selected_runtime_mode(self) -> StitchRuntimeMode:
+        if not hasattr(self, "runtime_mode_combo"):
+            return self.runtime_stitch_config.mode
+        return StitchRuntimeMode(str(self.runtime_mode_combo.currentData()))
+
+    def selected_projection_source(self) -> ProjectionSource:
+        if not hasattr(self, "runtime_projection_combo"):
+            return self.runtime_stitch_config.projection_source
+        return ProjectionSource(str(self.runtime_projection_combo.currentData()))
+
+    def selected_runtime_fisheye_params(self) -> tuple[float, float]:
+        balance = (
+            float(self.runtime_fisheye_balance.value())
+            if hasattr(self, "runtime_fisheye_balance")
+            else self.runtime_stitch_config.fisheye_balance
+        )
+        fov_scale = (
+            float(self.runtime_fisheye_fov_scale.value())
+            if hasattr(self, "runtime_fisheye_fov_scale")
+            else self.runtime_stitch_config.fisheye_fov_scale
+        )
+        return balance, fov_scale
+
+    def selected_layout_tuner_projection_source(self) -> ProjectionSource:
+        if not hasattr(self, "layout_tuner_projection_combo"):
+            return ProjectionSource.CURRENT_PERSPECTIVE
+        return ProjectionSource(str(self.layout_tuner_projection_combo.currentData()))
+
+    def selected_layout_tuner_target(self) -> str:
+        if not hasattr(self, "layout_tuner_target_combo"):
+            return "near_field"
+        return str(self.layout_tuner_target_combo.currentData() or "near_field")
+
+    def selected_layout_tuner_fisheye_params(self) -> tuple[float, float]:
+        balance = (
+            float(self.layout_tuner_fisheye_balance.value())
+            if hasattr(self, "layout_tuner_fisheye_balance")
+            else 0.6
+        )
+        fov_scale = (
+            float(self.layout_tuner_fisheye_fov_scale.value())
+            if hasattr(self, "layout_tuner_fisheye_fov_scale")
+            else 1.0
+        )
+        return balance, fov_scale
+
+    def fisheye_intrinsics_source_status_text(self, source_path: Path) -> str:
+        parts = source_path.parts
+        if len(parts) >= 2:
+            short_path = str(Path("...", parts[-2], parts[-1]))
+        else:
+            short_path = source_path.name
+        return self.t("Loaded fisheye intrinsics source") + f"\n{short_path}"
+
+    def current_layout_tuner_projection_block(self) -> dict[str, Any] | None:
+        source = self.layout_tuner_projection_metadata.get(
+            "projection_source",
+            self.selected_layout_tuner_projection_source().value,
+        )
+        if source != ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value:
+            return None
+        intrinsics = self.layout_tuner_fisheye_intrinsics_source or self.runtime_fisheye_intrinsics_source
+        if intrinsics is None:
+            return None
+        selected_balance, selected_fov_scale = self.selected_layout_tuner_fisheye_params()
+        balance = float(self.layout_tuner_projection_metadata.get("balance", selected_balance))
+        fov_scale = float(
+            self.layout_tuner_projection_metadata.get("fov_scale", selected_fov_scale)
+        )
+        return {
+            "source": "fisheye_rectilinear",
+            "intrinsics_source_path": str(intrinsics.path),
+            "balance": float(balance),
+            "fov_scale": float(fov_scale),
+            "projection_pipeline": "fisheye_rectilinear_then_template_perspective_warp",
+        }
+
+    def project_layout_tuner_frames(self, frames: dict[str, np.ndarray]) -> Any:
+        if self.selected_layout_tuner_target() == "far_field":
+            candidate_directory = self.current_b2_candidate_directory()
+            if candidate_directory is None:
+                raise RuntimeError(
+                    self.t(
+                        "Far-field layout tuning requires a B-2 candidate projection. Generate or load a B-2 candidate first."
+                    )
+                )
+            return B2CandidateProjectionProvider(candidate_directory).project(frames)
+        projection_source = self.selected_layout_tuner_projection_source()
+        if projection_source == ProjectionSource.CURRENT_PERSPECTIVE:
+            return CurrentPerspectiveProjectionProvider(self.stitcher).project(frames)
+        if projection_source == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE:
+            source = self.layout_tuner_fisheye_intrinsics_source or self.runtime_fisheye_intrinsics_source
+            if source is None:
+                raise RuntimeError(
+                    self.t("Fisheye Rectilinear projection requires a loaded fisheye intrinsics source.")
+                )
+            balance, fov_scale = self.selected_layout_tuner_fisheye_params()
+            return FisheyeRectilinearProjectionProvider(
+                self.stitcher,
+                source,
+                FisheyeRectilinearParams(balance=balance, fov_scale=fov_scale),
+            ).project(frames)
+        raise RuntimeError(
+            self.t("Projection candidate is research-only and not connected to runtime yet.")
+        )
+
+    def current_b2_candidate_directory(self) -> Path | None:
+        if self.live_candidate_directory is not None:
+            return self.live_candidate_directory
+        candidate_directory = latest_calibration_candidate(
+            topology=str(
+                self.calibration_config.get(
+                    "stitch_topology",
+                    "triple_front_panorama",
+                )
+            )
+        )
+        self.live_candidate_directory = candidate_directory
+        return candidate_directory
+
+    def apply_stitch_runtime_config(self) -> None:
+        mode = self.selected_runtime_mode()
+        projection = (
+            self.selected_projection_source()
+            if mode == StitchRuntimeMode.NEAR_FIELD
+            else ProjectionSource.CURRENT_PERSPECTIVE
+        )
+        if projection == ProjectionSource.EQUIRECTANGULAR_CANDIDATE:
+            QMessageBox.information(
+                self,
+                self.t("Stitch Runtime Mode"),
+                self.t("Projection candidate is research-only and not connected to runtime yet."),
+            )
+            return
+        if (
+            projection == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE
+            and self.runtime_fisheye_intrinsics_source is None
+        ):
+            QMessageBox.information(
+                self,
+                self.t("Stitch Runtime Mode"),
+                self.t("Fisheye Rectilinear projection requires a loaded fisheye intrinsics source."),
+            )
+            return
+        if mode == StitchRuntimeMode.NEAR_FIELD and self.runtime_layout_candidate is None:
+            QMessageBox.information(
+                self,
+                self.t("Stitch Runtime Mode"),
+                self.t("Near-field mode requires a loaded Layout Candidate V2."),
+            )
+            return
+        use_far_field_custom = (
+            mode == StitchRuntimeMode.FAR_FIELD
+            and hasattr(self, "far_field_custom_layout_check")
+            and self.far_field_custom_layout_check.isChecked()
+        )
+        if use_far_field_custom and self.far_field_layout_candidate is None:
+            QMessageBox.information(
+                self,
+                self.t("Stitch Runtime Mode"),
+                self.t("Far-field custom layout requires a loaded Far-field Layout Candidate."),
+            )
+            return
+        if mode == StitchRuntimeMode.AUTO:
+            QMessageBox.information(
+                self,
+                self.t("Stitch Runtime Mode"),
+                self.t("Auto stitch runtime mode is not implemented; falling back to Far-field."),
+            )
+        if mode == StitchRuntimeMode.NEAR_FIELD and self.live_stitch_mode == "candidate":
+            self.live_stitch_mode = "template"
+            self.apply_live_stitch_mode_controls()
+            self.log(
+                self.t(
+                    "Near-field runtime uses current perspective warp; experimental candidate stitch was switched back to template."
+                )
+            )
+        balance, fov_scale = self.selected_runtime_fisheye_params()
+        self.runtime_stitch_config = RuntimeStitchConfig(
+            mode=mode,
+            projection_source=projection,
+            layout_candidate_path=(
+                self.runtime_layout_candidate.path
+                if self.runtime_layout_candidate is not None
+                else None
+            ),
+            use_far_field_custom_layout=use_far_field_custom,
+            far_field_layout_candidate_path=(
+                self.far_field_layout_candidate.path
+                if self.far_field_layout_candidate is not None
+                else None
+            ),
+            projection_intrinsics_source_path=(
+                self.runtime_fisheye_intrinsics_source.path
+                if self.runtime_fisheye_intrinsics_source is not None
+                else None
+            ),
+            fisheye_balance=balance,
+            fisheye_fov_scale=fov_scale,
+            auto_enabled=False,
+        )
+        self.last_runtime_warning_log_text = ""
+        self.refresh_stitch_runtime_controls()
+        self.update_preview_status_summary()
+        if self.preview_content_mode == PreviewContentMode.LIVE:
+            self.bump_preview_session()
+            try:
+                self.configure_live_stitch_processor()
+            except Exception as exc:
+                QMessageBox.warning(self, self.t("Stitch Runtime Mode"), str(exc))
+                return
+            self.warped.clear()
+            self.canvas = None
+            self.last_process_time = 0.0
+        elif self.preview_content_mode == PreviewContentMode.STILL and self.frames:
+            self._process_and_render_frames("Static preview")
+        if self.preview_layout_mode != PreviewLayoutMode.STITCHED:
+            self.statusBar().showMessage(
+                self.t("Runtime mode applied. Open the Canvas tab to see the effect.")
+            )
+        else:
+            self.statusBar().showMessage(self.t("Stitch Runtime Mode"))
+
+    def refresh_stitch_runtime_controls(self, sync_selection: bool = True) -> None:
+        if not hasattr(self, "runtime_candidate_status"):
+            return
+        if sync_selection and hasattr(self, "runtime_mode_combo"):
+            index = self.runtime_mode_combo.findData(self.runtime_stitch_config.mode.value)
+            if index >= 0:
+                self.runtime_mode_combo.blockSignals(True)
+                self.runtime_mode_combo.setCurrentIndex(index)
+                self.runtime_mode_combo.blockSignals(False)
+        if hasattr(self, "runtime_projection_combo"):
+            if sync_selection:
+                index = self.runtime_projection_combo.findData(
+                    self.runtime_stitch_config.projection_source.value
+                )
+                if index >= 0:
+                    self.runtime_projection_combo.blockSignals(True)
+                    self.runtime_projection_combo.setCurrentIndex(index)
+                    self.runtime_projection_combo.blockSignals(False)
+            near_enabled = self.selected_runtime_mode() == StitchRuntimeMode.NEAR_FIELD
+            self.runtime_projection_combo.setEnabled(near_enabled)
+            if hasattr(self, "runtime_projection_note"):
+                far_custom_enabled = (
+                    self.selected_runtime_mode() == StitchRuntimeMode.FAR_FIELD
+                    and hasattr(self, "far_field_custom_layout_check")
+                    and self.far_field_custom_layout_check.isChecked()
+                )
+                self.runtime_projection_note.setText(
+                    self.t("Near-field Projection Source")
+                    if near_enabled
+                    else self.t("Far-field Custom uses B-2 candidate projection.")
+                    if far_custom_enabled
+                    else self.t("Far-field uses current runtime projection.")
+                )
+        if sync_selection and hasattr(self, "runtime_fisheye_balance"):
+            self.runtime_fisheye_balance.blockSignals(True)
+            self.runtime_fisheye_balance.setValue(float(self.runtime_stitch_config.fisheye_balance))
+            self.runtime_fisheye_balance.blockSignals(False)
+        if sync_selection and hasattr(self, "runtime_fisheye_fov_scale"):
+            self.runtime_fisheye_fov_scale.blockSignals(True)
+            self.runtime_fisheye_fov_scale.setValue(float(self.runtime_stitch_config.fisheye_fov_scale))
+            self.runtime_fisheye_fov_scale.blockSignals(False)
+        if sync_selection and hasattr(self, "far_field_custom_layout_check"):
+            self.far_field_custom_layout_check.blockSignals(True)
+            self.far_field_custom_layout_check.setChecked(
+                bool(self.runtime_stitch_config.use_far_field_custom_layout)
+            )
+            self.far_field_custom_layout_check.blockSignals(False)
+        if hasattr(self, "far_field_layout_candidate_status"):
+            if self.far_field_layout_candidate is None:
+                self.far_field_layout_candidate_status.setText(
+                    self.t("No Far-field Layout Candidate loaded.")
+                )
+                self.far_field_layout_candidate_status.setToolTip("")
+            else:
+                lines = [
+                    self.t("Loaded Far-field Layout Candidate"),
+                    f"schema_version: {self.far_field_layout_candidate.schema_version}",
+                    f"profile_id: {self.far_field_layout_candidate.profile_id}",
+                    f"projection: {self.far_field_layout_candidate.projection_source}",
+                    f"output: {self.far_field_layout_candidate.output_width_px}x{self.far_field_layout_candidate.output_height_px}",
+                ]
+                self.far_field_layout_candidate_status.setText("\n".join(lines))
+                self.far_field_layout_candidate_status.setToolTip(
+                    str(self.far_field_layout_candidate.path)
+                )
+        if hasattr(self, "runtime_fisheye_source_status"):
+            if self.runtime_fisheye_intrinsics_source is None:
+                self.runtime_fisheye_source_status.setText(
+                    self.t("No fisheye intrinsics source loaded.")
+                )
+                self.runtime_fisheye_source_status.setToolTip("")
+            else:
+                text = self.fisheye_intrinsics_source_status_text(
+                    self.runtime_fisheye_intrinsics_source.path
+                )
+                self.runtime_fisheye_source_status.setText(text)
+                self.runtime_fisheye_source_status.setToolTip(
+                    str(self.runtime_fisheye_intrinsics_source.path)
+                )
+        if hasattr(self, "layout_tuner_fisheye_source_status"):
+            if self.layout_tuner_fisheye_intrinsics_source is None:
+                self.layout_tuner_fisheye_source_status.setText(
+                    self.t("No fisheye intrinsics source loaded.")
+                )
+                self.layout_tuner_fisheye_source_status.setToolTip("")
+            else:
+                text = self.fisheye_intrinsics_source_status_text(
+                    self.layout_tuner_fisheye_intrinsics_source.path
+                )
+                self.layout_tuner_fisheye_source_status.setText(text)
+                self.layout_tuner_fisheye_source_status.setToolTip(
+                    str(self.layout_tuner_fisheye_intrinsics_source.path)
+                )
+        if self.runtime_layout_candidate is None:
+            self.runtime_candidate_status.setText(self.t("No Layout Candidate V2 loaded."))
+            self.runtime_candidate_status.setToolTip("")
+            return
+        candidate = self.runtime_layout_candidate
+        lines = [
+            self.t("Loaded Layout Candidate V2"),
+            f"path: {candidate.path}",
+            f"schema_version: {candidate.schema_version}",
+            f"profile_id: {candidate.profile_id}",
+            f"projection: {candidate.projection.source.value}",
+            (
+                "left_pair: "
+                f"shift={candidate.left_pair.side_shift_px}, "
+                f"side={candidate.left_pair.side_visible_fraction:.2f}, "
+                f"feather={candidate.left_pair.feather_width_px}"
+            ),
+            (
+                "right_pair: "
+                f"shift={candidate.right_pair.side_shift_px}, "
+                f"side={candidate.right_pair.side_visible_fraction:.2f}, "
+                f"feather={candidate.right_pair.feather_width_px}"
+            ),
+            (
+                "camera_adjust: "
+                f"front scale={candidate.camera_adjust['front'].scale:.2f}, "
+                f"x={candidate.camera_adjust['front'].x_offset_px}, "
+                f"y={candidate.camera_adjust['front'].y_offset_px}"
+            ),
+        ]
+        if candidate.warnings:
+            lines.append("warnings: " + "; ".join(candidate.warnings))
+        visible_lines = lines[:6]
+        if candidate.warnings:
+            visible_lines.append("warnings: " + "; ".join(candidate.warnings))
+        self.runtime_candidate_status.setText("\n".join(visible_lines))
+        self.runtime_candidate_status.setToolTip("\n".join(lines))
+
+    def process_frames_with_runtime_controller(
+        self,
+        frames: dict[str, np.ndarray],
+    ) -> tuple[dict[str, np.ndarray], np.ndarray | None, list[str]]:
+        controller = RuntimeStitchController(
+            self.stitcher,
+            self.runtime_stitch_config,
+            layout_candidate=self.runtime_layout_candidate,
+            far_field_layout_candidate=self.far_field_layout_candidate,
+        )
+        result = controller.process(frames)
+        self.last_runtime_stitch_status = result.status
+        self.last_runtime_warnings = list(result.warnings)
+        self.last_runtime_metrics = result.metrics
+        return result.warped, result.canvas, list(result.warnings)
+
+    def runtime_timing_status_suffix(
+        self,
+        metrics: dict[str, Any] | None,
+    ) -> str:
+        timing = metrics.get("timing", {}) if isinstance(metrics, dict) else {}
+        if not isinstance(timing, dict):
+            return ""
+        if "near_field_compositor_ms" in timing:
+            suffix = (
+                f" | near {float(timing.get('near_field_compositor_ms', 0.0)):.1f} ms"
+                f" / warp {float(timing.get('warp_all_ms', 0.0)):.1f} ms"
+            )
+            if "fisheye_remap_ms" in timing:
+                suffix += (
+                    f" / remap {float(timing.get('fisheye_remap_ms', 0.0)):.1f} ms"
+                    f" / tmpl {float(timing.get('template_warp_ms', 0.0)):.1f} ms"
+                )
+            return suffix
+        if "far_field_custom_total_ms" in timing:
+            return (
+                f" | far custom {float(timing.get('far_field_custom_total_ms', 0.0)):.1f} ms"
+                f" / adjust {float(timing.get('camera_adjust_ms', 0.0)):.1f} ms"
+                f" / blend {float(timing.get('far_field_composition_ms', 0.0)):.1f} ms"
+            )
+        if "far_field_total_ms" in timing:
+            return f" | far {float(timing.get('far_field_total_ms', 0.0)):.1f} ms"
+        return ""
 
     def frame_signature(self, snapshots: dict[str, Any]) -> tuple[tuple[str, int], ...]:
         return tuple(
@@ -1630,7 +2412,7 @@ class MainWindow(QMainWindow):
         language_bar = QHBoxLayout()
         language_bar.addStretch(1)
         language_bar.addWidget(QLabel(self.t("Language")))
-        self.language_combo = QComboBox()
+        self.language_combo = NoWheelComboBox()
         self.language_combo.addItem(self.t("English"), "en")
         self.language_combo.addItem(self.t("Chinese"), "zh_CN")
         self.language_combo.setCurrentIndex(1 if self.language == "zh_CN" else 0)
@@ -1639,11 +2421,12 @@ class MainWindow(QMainWindow):
         central_layout.addLayout(language_bar)
 
         self.root_tabs = QTabWidget()
-        self.root_tabs.addTab(self._build_preview_workspace(), self.t("Realtime Preview"))
-        self.root_tabs.addTab(self._build_camera_config_workspace(), self.t("Camera Config"))
-        self.root_tabs.addTab(self._build_calibration_workspace(), self.t("Calibration"))
-        self.root_tabs.addTab(self._build_project_workspace(), self.t("Project"))
-        self.root_tabs.addTab(self._build_log_workspace(), self.t("Logs"))
+        self.root_tabs.addTab(self._build_preview_workspace(), self.t("Realtime Monitor"))
+        self.root_tabs.addTab(self._build_layout_tuner_workspace(), self.t("Layout Tuning"))
+        self.root_tabs.addTab(self._build_calibration_workspace(), self.t("Calibration & Candidates"))
+        self.root_tabs.addTab(self._build_projection_research_workspace(), self.t("Projection Research"))
+        self.root_tabs.addTab(self._build_project_management_workspace(), self.t("Project Management"))
+        self.root_tabs.addTab(self._build_diagnostics_workspace(), self.t("Diagnostics & Logs"))
         self.root_tabs.currentChanged.connect(self.on_root_tab_changed)
         central_layout.addWidget(self.root_tabs, 1)
         self.setCentralWidget(central)
@@ -1704,10 +2487,10 @@ class MainWindow(QMainWindow):
         self.grid_view_button.setCheckable(True)
         self.stitched_view_button.setCheckable(True)
         self.candidate_stitch_button = QPushButton(
-            f"{self.t('Candidate Stitch')} [{self.t('Experimental')}]"
+            self.t("B-2 Candidate View [Advanced]")
         )
         self.template_stitch_button = QPushButton(
-            self.t("Template Stitch")
+            self.t("Current Profile Template")
         )
         self.candidate_stitch_button.setCheckable(True)
         self.template_stitch_button.setCheckable(True)
@@ -1745,16 +2528,15 @@ class MainWindow(QMainWindow):
         source_toolbar.addWidget(self.stop_live_button)
         source_toolbar.addWidget(self.save_results_button)
         source_toolbar.addStretch(1)
-        view_toolbar.addWidget(self.grid_view_button)
-        view_toolbar.addWidget(self.stitched_view_button)
         view_toolbar.addWidget(self.back_to_grid_button)
         view_toolbar.addWidget(self.candidate_stitch_button)
-        view_toolbar.addWidget(self.template_stitch_button)
+        self.template_stitch_button.setVisible(False)
         view_toolbar.addWidget(self.stitch_strategy_label)
         view_toolbar.addWidget(self.preview_mode_label)
         view_toolbar.addWidget(self.input_path_label, 1)
         root.addLayout(source_toolbar)
         root.addLayout(view_toolbar)
+        root.addWidget(self._build_stitch_runtime_mode_panel())
         self.preview_status_summary = QLabel()
         self.preview_status_summary.setWordWrap(True)
         self.preview_status_summary.setTextInteractionFlags(
@@ -1794,10 +2576,6 @@ class MainWindow(QMainWindow):
         self._layout_camera_views(self.warped_views, self.warped_grid_layout)
         self.canvas_tab_index = self.preview_tabs.addTab(self.canvas_view, self.t("Canvas"))
         self.warped_tab_index = self.preview_tabs.addTab(self.warped_page, self.t("Warped Views"))
-        self.layout_tuner_tab_index = self.preview_tabs.addTab(
-            self._build_layout_tuner_page(),
-            self.t("Layout Tuner"),
-        )
         self.preview_tabs.currentChanged.connect(self.on_preview_tab_changed)
 
         self.preview_splitter.addWidget(self.camera_grid)
@@ -1820,6 +2598,98 @@ class MainWindow(QMainWindow):
         self.apply_live_stitch_mode_controls()
         return page
 
+    def _build_layout_tuner_workspace(self) -> QWidget:
+        return self._build_layout_tuner_page()
+
+    def _build_projection_research_workspace(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(6, 6, 6, 6)
+        overview = QGroupBox(self.t("Projection Research Overview"))
+        layout = QVBoxLayout(overview)
+        note = QLabel(self.t("Projection Research Note"))
+        note.setWordWrap(True)
+        note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(note)
+        location_note = QLabel(
+            self.t(
+                "Runtime projection controls remain in Realtime Monitor for current preview switching; layout-specific projection controls are in Layout Tuning."
+            )
+        )
+        location_note.setWordWrap(True)
+        location_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(location_note)
+        root.addWidget(overview)
+        root.addStretch(1)
+        return page
+
+    def _build_project_management_workspace(self) -> QWidget:
+        tabs = QTabWidget()
+        tabs.addTab(self._build_camera_config_workspace(), self.t("Camera & Runtime Config"))
+        tabs.addTab(self._build_project_workspace(), self.t("Project Files"))
+        tabs.addTab(self._build_qgc_video_output_workspace(), self.t("QGC Video Output"))
+        return tabs
+
+    def _build_diagnostics_workspace(self) -> QWidget:
+        return self._build_log_workspace()
+
+    def _build_stitch_runtime_mode_panel(self) -> QGroupBox:
+        panel = StitchRuntimeModePanel(
+            self.t,
+            combo_box_class=NoWheelComboBox,
+            double_spin_box_class=NoWheelDoubleSpinBox,
+            parent=self,
+        )
+        self.stitch_runtime_mode_panel = panel
+        self.runtime_mode_combo = panel.runtime_mode_combo
+        self.runtime_projection_label = panel.runtime_projection_label
+        self.runtime_projection_note = panel.runtime_projection_note
+        self.runtime_projection_combo = panel.runtime_projection_combo
+        self.runtime_fisheye_balance = panel.runtime_fisheye_balance
+        self.runtime_fisheye_fov_scale = panel.runtime_fisheye_fov_scale
+        self.runtime_load_fisheye_button = panel.runtime_load_fisheye_button
+        self.runtime_clear_fisheye_button = panel.runtime_clear_fisheye_button
+        self.runtime_fisheye_source_status = panel.runtime_fisheye_source_status
+        self.far_field_custom_layout_check = panel.far_field_custom_layout_check
+        self.far_field_layout_candidate_status = panel.far_field_layout_candidate_status
+        self.far_field_load_candidate_button = panel.far_field_load_candidate_button
+        self.far_field_clear_candidate_button = panel.far_field_clear_candidate_button
+        self.runtime_candidate_status = panel.runtime_candidate_status
+        self.runtime_load_candidate_button = panel.runtime_load_candidate_button
+        self.runtime_clear_candidate_button = panel.runtime_clear_candidate_button
+        self.runtime_open_candidate_button = panel.runtime_open_candidate_button
+        self.runtime_apply_button = panel.runtime_apply_button
+        self.runtime_mode_combo.currentIndexChanged.connect(
+            lambda _index: self.refresh_stitch_runtime_controls(sync_selection=False)
+        )
+        self.runtime_load_candidate_button.clicked.connect(
+            self.choose_runtime_layout_candidate
+        )
+        self.runtime_clear_candidate_button.clicked.connect(
+            self.clear_runtime_layout_candidate
+        )
+        self.runtime_open_candidate_button.clicked.connect(
+            self.open_runtime_layout_candidate_folder
+        )
+        self.runtime_load_fisheye_button.clicked.connect(
+            self.choose_runtime_fisheye_intrinsics_source
+        )
+        self.runtime_clear_fisheye_button.clicked.connect(
+            self.clear_runtime_fisheye_intrinsics_source
+        )
+        self.far_field_load_candidate_button.clicked.connect(
+            self.choose_far_field_layout_candidate
+        )
+        self.far_field_clear_candidate_button.clicked.connect(
+            self.clear_far_field_layout_candidate
+        )
+        self.far_field_custom_layout_check.toggled.connect(
+            lambda _checked: self.refresh_stitch_runtime_controls(sync_selection=False)
+        )
+        self.runtime_apply_button.clicked.connect(self.apply_stitch_runtime_config)
+        self.refresh_stitch_runtime_controls()
+        return panel
+
     def _build_layout_tuner_page(self) -> QWidget:
         page = QWidget()
         root = QHBoxLayout(page)
@@ -1831,23 +2701,87 @@ class MainWindow(QMainWindow):
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(8)
 
-        note = QLabel(
-            self.t(
-                "Experimental front-priority layout tuner. Uses current "
-                "perspective/template warped images only; projection candidates "
-                "are not used here and formal calibration.yaml is never written."
-            )
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet(
+        self.layout_tuner_note = QLabel(self.t("Near-field Layout Tuner Note"))
+        self.layout_tuner_note.setWordWrap(True)
+        self.layout_tuner_note.setStyleSheet(
             "QLabel { color: #92400e; background: #fffbeb; "
             "border: 1px solid #fcd34d; padding: 6px; }"
         )
-        controls_layout.addWidget(note)
+        controls_layout.addWidget(self.layout_tuner_note)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel(self.t("Layout Tuner Target")))
+        self.layout_tuner_target_combo = NoWheelComboBox()
+        self.layout_tuner_target_combo.addItem(
+            self.t("Near-field Layout"),
+            "near_field",
+        )
+        self.layout_tuner_target_combo.addItem(
+            self.t("Far-field Layout"),
+            "far_field",
+        )
+        self.layout_tuner_target_combo.currentIndexChanged.connect(
+            self.on_layout_tuner_target_changed
+        )
+        target_row.addWidget(self.layout_tuner_target_combo, 1)
+        controls_layout.addLayout(target_row)
+
+        self.layout_tuner_projection_group = QGroupBox(self.t("Near-field Projection Source"))
+        projection_group = self.layout_tuner_projection_group
+        projection_form = QFormLayout(projection_group)
+        self.layout_tuner_projection_combo = NoWheelComboBox()
+        self.layout_tuner_projection_combo.addItem(
+            self.t("Current Perspective"),
+            ProjectionSource.CURRENT_PERSPECTIVE.value,
+        )
+        self.layout_tuner_projection_combo.addItem(
+            self.t("Fisheye Rectilinear [Experimental]"),
+            ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value,
+        )
+        self.layout_tuner_projection_combo.setToolTip(
+            self.t("Fisheye Rectilinear is experimental and only affects Near-field preview/runtime.")
+        )
+        self.layout_tuner_fisheye_balance = NoWheelDoubleSpinBox()
+        self.layout_tuner_fisheye_balance.setRange(0.0, 1.0)
+        self.layout_tuner_fisheye_balance.setSingleStep(0.05)
+        self.layout_tuner_fisheye_balance.setDecimals(2)
+        self.layout_tuner_fisheye_balance.setValue(0.6)
+        self.layout_tuner_fisheye_fov_scale = NoWheelDoubleSpinBox()
+        self.layout_tuner_fisheye_fov_scale.setRange(0.8, 1.2)
+        self.layout_tuner_fisheye_fov_scale.setSingleStep(0.05)
+        self.layout_tuner_fisheye_fov_scale.setDecimals(2)
+        self.layout_tuner_fisheye_fov_scale.setValue(1.0)
+        self.layout_tuner_load_fisheye_button = QPushButton(
+            self.t("Load Fisheye Intrinsics Source...")
+        )
+        self.layout_tuner_clear_fisheye_button = QPushButton(
+            self.t("Clear Fisheye Intrinsics Source")
+        )
+        self.layout_tuner_fisheye_source_status = QLabel(
+            self.t("No fisheye intrinsics source loaded.")
+        )
+        self.layout_tuner_fisheye_source_status.setWordWrap(True)
+        self.layout_tuner_fisheye_source_status.setMaximumHeight(48)
+        self.layout_tuner_fisheye_source_status.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Preferred,
+        )
+        self.layout_tuner_load_fisheye_button.clicked.connect(
+            self.choose_runtime_fisheye_intrinsics_source
+        )
+        self.layout_tuner_clear_fisheye_button.clicked.connect(
+            self.clear_runtime_fisheye_intrinsics_source
+        )
+        projection_form.addRow(self.t("Projection Source"), self.layout_tuner_projection_combo)
+        projection_form.addRow(self.t("Fisheye Balance"), self.layout_tuner_fisheye_balance)
+        projection_form.addRow(self.t("Fisheye FOV Scale"), self.layout_tuner_fisheye_fov_scale)
+        projection_form.addRow(self.layout_tuner_load_fisheye_button, self.layout_tuner_clear_fisheye_button)
+        projection_form.addRow(self.layout_tuner_fisheye_source_status)
+        controls_layout.addWidget(projection_group)
 
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel(self.t("Preset")))
-        self.layout_tuner_preset = QComboBox()
+        self.layout_tuner_preset = NoWheelComboBox()
         for name in LAYOUT_TUNER_PRESETS_V2:
             self.layout_tuner_preset.addItem(self.t(name), name)
         self.layout_tuner_preset.currentIndexChanged.connect(
@@ -1866,9 +2800,18 @@ class MainWindow(QMainWindow):
             self.t("Final width crop only; no scaling."),
         )
         params_form.addRow(self.t("Width"), self.layout_tuner_output_width["widget"])
+        self.layout_tuner_output_height = self._layout_tuner_int_control(
+            520,
+            700,
+            20,
+            700,
+            self.t("Final height crop only; no scaling."),
+        )
+        params_form.addRow(self.t("Height"), self.layout_tuner_output_height["widget"])
         controls_layout.addWidget(params_group)
 
-        pair_group = QGroupBox(self.t("Pair Boundary Params"))
+        self.layout_tuner_pair_group = QGroupBox(self.t("Pair Boundary Params"))
+        pair_group = self.layout_tuner_pair_group
         pair_layout = QVBoxLayout(pair_group)
         self.layout_tuner_pair_syncing = False
         self.layout_tuner_lock_pairs = QCheckBox(self.t("Lock Left/Right Pair Params"))
@@ -1999,15 +2942,9 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(camera_group)
         self._connect_layout_tuner_camera_adjust_controls()
 
-        advanced_group = QGroupBox(self.t("Advanced Vertical Safety"))
+        self.layout_tuner_advanced_group = QGroupBox(self.t("Advanced Vertical Safety"))
+        advanced_group = self.layout_tuner_advanced_group
         advanced_form = QFormLayout(advanced_group)
-        self.layout_tuner_output_height = self._layout_tuner_int_control(
-            520,
-            700,
-            20,
-            700,
-            self.t("Final height crop only; no scaling."),
-        )
         self.layout_tuner_vertical_safe = self._layout_tuner_float_control(
             0.70,
             1.00,
@@ -2022,7 +2959,6 @@ class MainWindow(QMainWindow):
             0,
             self.t("Smooth fade width for side top/bottom suppression."),
         )
-        advanced_form.addRow(self.t("Height"), self.layout_tuner_output_height["widget"])
         advanced_form.addRow(self.t("Vertical Safe Ratio"), self.layout_tuner_vertical_safe["widget"])
         advanced_form.addRow(self.t("Side Vertical Fade"), self.layout_tuner_vertical_fade["widget"])
         controls_layout.addWidget(advanced_group)
@@ -2031,7 +2967,9 @@ class MainWindow(QMainWindow):
         self.layout_tuner_capture_button = QPushButton(self.t("Capture Preview Frame"))
         self.layout_tuner_refresh_button = QPushButton(self.t("Refresh Preview"))
         self.layout_tuner_reset_button = QPushButton(self.t("Reset to Baseline"))
-        self.layout_tuner_save_button = QPushButton(self.t("Save Layout Candidate"))
+        self.layout_tuner_save_button = QPushButton(
+            self.t("Save Near-field Layout Candidate")
+        )
         self.layout_tuner_export_button = QPushButton(self.t("Export Preview PNG"))
         self.layout_tuner_open_button = QPushButton(self.t("Open Candidate Folder"))
         self.layout_tuner_capture_button.clicked.connect(
@@ -2071,7 +3009,12 @@ class MainWindow(QMainWindow):
         controls_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        controls_scroll.setMinimumWidth(420)
         controls_scroll.setMaximumWidth(450)
+        controls_scroll.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding,
+        )
         controls_scroll.setWidget(controls)
 
         self.layout_tuner_view = ImageView(self.t("Capture preview frame to tune layout."))
@@ -2079,6 +3022,7 @@ class MainWindow(QMainWindow):
         root.addWidget(controls_scroll)
         root.addWidget(self.layout_tuner_view, 1)
         self.reset_layout_tuner_to_baseline(schedule=False)
+        self.on_layout_tuner_target_changed(0)
         return page
 
     def _layout_tuner_int_control(
@@ -2092,12 +3036,12 @@ class MainWindow(QMainWindow):
         container = QWidget()
         layout = QHBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
-        slider = QSlider(Qt.Orientation.Horizontal)
+        slider = NoWheelSlider(Qt.Orientation.Horizontal)
         slider.setRange(int(minimum), int(maximum))
         slider.setSingleStep(int(step))
         slider.setPageStep(int(step))
         slider.setValue(int(value))
-        spin = QSpinBox()
+        spin = NoWheelSpinBox()
         spin.setRange(int(minimum), int(maximum))
         spin.setSingleStep(int(step))
         spin.setValue(int(value))
@@ -2131,12 +3075,12 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         scale = 100
-        slider = QSlider(Qt.Orientation.Horizontal)
+        slider = NoWheelSlider(Qt.Orientation.Horizontal)
         slider.setRange(int(round(minimum * scale)), int(round(maximum * scale)))
         slider.setSingleStep(max(1, int(round(step * scale))))
         slider.setPageStep(max(1, int(round(step * scale * 5))))
         slider.setValue(int(round(value * scale)))
-        spin = QDoubleSpinBox()
+        spin = NoWheelDoubleSpinBox()
         spin.setRange(float(minimum), float(maximum))
         spin.setSingleStep(float(step))
         spin.setDecimals(2)
@@ -2358,6 +3302,29 @@ class MainWindow(QMainWindow):
             LAYOUT_TUNER_PRESETS_V2.get(name, LAYOUT_TUNER_PRESETS_V2["Balanced"])
         )
 
+    def on_layout_tuner_target_changed(self, _index: int) -> None:
+        far_field = self.selected_layout_tuner_target() == "far_field"
+        if hasattr(self, "layout_tuner_projection_group"):
+            self.layout_tuner_projection_group.setVisible(not far_field)
+        if hasattr(self, "layout_tuner_pair_group"):
+            self.layout_tuner_pair_group.setVisible(not far_field)
+        if hasattr(self, "layout_tuner_advanced_group"):
+            self.layout_tuner_advanced_group.setVisible(not far_field)
+        if hasattr(self, "layout_tuner_save_button"):
+            self.layout_tuner_save_button.setText(
+                self.t("Save Far-field Layout Candidate")
+                if far_field
+                else self.t("Save Near-field Layout Candidate")
+            )
+        if hasattr(self, "layout_tuner_note"):
+            self.layout_tuner_note.setText(
+                self.t("Far-field Layout Tuner Note")
+                if far_field
+                else self.t("Near-field Layout Tuner Note")
+            )
+        self.layout_tuner_preview_result = None
+        self.schedule_layout_tuner_preview()
+
     def reset_layout_tuner_to_baseline(self, schedule: bool = True) -> None:
         if hasattr(self, "layout_tuner_preset"):
             self.layout_tuner_preset.blockSignals(True)
@@ -2419,14 +3386,32 @@ class MainWindow(QMainWindow):
                 if key in active and frame is not None
             }
         if not frames and self.warped:
+            if self.selected_layout_tuner_target() == "far_field":
+                QMessageBox.information(
+                    self,
+                    self.t("Layout Tuner"),
+                    self.t(
+                        "Far-field layout tuning requires a B-2 candidate projection. Generate or load a B-2 candidate first."
+                    ),
+                )
+                return
             self.layout_tuner_warped = {
                 key: image.copy()
                 for key, image in self.warped.items()
                 if key in active
             }
+            self.layout_tuner_valid_masks = {
+                key: np.any(image != 0, axis=2)
+                for key, image in self.layout_tuner_warped.items()
+            }
+            self.layout_tuner_projection_metadata = {
+                "projection_source": ProjectionSource.CURRENT_PERSPECTIVE.value,
+                "valid_mask_source": "nonzero_pixels_runtime_compatible",
+            }
             self.layout_tuner_source_info = {
                 "mode": "current_warped_cache",
                 "frame_info": {"warning": "Used existing warped cache because no raw frames were available."},
+                "projection": dict(self.layout_tuner_projection_metadata),
             }
         else:
             required = {"front_left", "front", "front_right"}
@@ -2443,7 +3428,10 @@ class MainWindow(QMainWindow):
                 return
             try:
                 self.log_source_coordinate_warnings(frames)
-                self.layout_tuner_warped = self.stitcher.warp_all(frames)
+                projection = self.project_layout_tuner_frames(frames)
+                self.layout_tuner_warped = projection.warped_images
+                self.layout_tuner_valid_masks = projection.valid_masks
+                self.layout_tuner_projection_metadata = projection.metadata
             except Exception as exc:
                 self.log(
                     self.t("Layout tuner capture failed: {error}", error=exc)
@@ -2462,8 +3450,12 @@ class MainWindow(QMainWindow):
                     "cameras": sorted(frames),
                     "frame_age_seconds": frame_ages,
                     "warped_keys": sorted(self.layout_tuner_warped),
-                    "projection_candidate_used": False,
+                    "projection_source": self.layout_tuner_projection_metadata.get(
+                        "projection_source",
+                        ProjectionSource.CURRENT_PERSPECTIVE.value,
+                    ),
                 },
+                "projection": dict(self.layout_tuner_projection_metadata),
             }
         self.refresh_layout_tuner_preview()
 
@@ -2480,11 +3472,57 @@ class MainWindow(QMainWindow):
             return
         start = time.perf_counter()
         try:
-            result = render_front_priority_layout_preview(
-                self.layout_tuner_warped,
-                layout_tuner_pair_candidates(self.current_stitch_profile()),
-                self.current_layout_tuner_params(),
-            )
+            tuner_params = self.current_layout_tuner_params()
+            if self.selected_layout_tuner_target() == "far_field":
+                projection = ProjectionResult(
+                    warped_images=self.layout_tuner_warped,
+                    valid_masks=self.layout_tuner_valid_masks or {
+                        key: np.any(image != 0, axis=2)
+                        for key, image in self.layout_tuner_warped.items()
+                    },
+                    metadata={
+                        **dict(self.layout_tuner_projection_metadata),
+                        "projection_source": self.layout_tuner_projection_metadata.get(
+                            "projection_source",
+                            B2_FAR_FIELD_PROJECTION_SOURCE,
+                        ),
+                        "provider_name": "LayoutTunerCachedProjection",
+                        "valid_mask_source": self.layout_tuner_projection_metadata.get(
+                            "valid_mask_source",
+                            "layout_tuner_cached_masks",
+                        ),
+                        "warning_reasons": self.layout_tuner_projection_metadata.get(
+                            "warning_reasons",
+                            [],
+                        ),
+                    },
+                    timings={"projection_total_ms": 0.0},
+                )
+                preview_candidate = FarFieldLayoutRuntimeCandidate(
+                    path=Path("layout_tuner_preview"),
+                    schema_version=1,
+                    profile_id=self.current_runtime_profile_id(),
+                    camera_adjust=tuner_params.camera_adjust or {},
+                    output_width_px=int(tuner_params.output_width_px),
+                    output_height_px=int(tuner_params.output_height_px),
+                    feather_width_override_px=None,
+                    calibration_hash=None,
+                    current_calibration_hash=None,
+                    warnings=(),
+                    raw={},
+                )
+                result = render_far_field_custom_from_projection(
+                    projection,
+                    preview_candidate,
+                    self.stitcher,
+                )
+            else:
+                result = render_front_priority_layout_preview(
+                    self.layout_tuner_warped,
+                    layout_tuner_pair_candidates(self.current_stitch_profile()),
+                    tuner_params,
+                    valid_masks=self.layout_tuner_valid_masks or None,
+                )
         except Exception as exc:
             self.log(
                 self.t("Layout tuner render failed: {error}", error=exc)
@@ -2497,14 +3535,26 @@ class MainWindow(QMainWindow):
         self.layout_tuner_preview_result = result
         self.layout_tuner_view.set_image(
             result.image,
-            "Front-priority layout tuner preview",
+            "Far-field layout tuner preview"
+            if self.selected_layout_tuner_target() == "far_field"
+            else "Front-priority layout tuner preview",
         )
         metrics = result.metrics
         lines = [
-            f"layout_id: {result.layout_id}",
+            "target: " + self.selected_layout_tuner_target(),
             f"render_ms: {elapsed_ms:.1f}",
-            f"vertical_safety_enabled: {result.vertical_safety_enabled}",
+            "projection_source: "
+            + str(
+                self.layout_tuner_projection_metadata.get(
+                    "projection_source",
+                    ProjectionSource.CURRENT_PERSPECTIVE.value,
+                )
+            ),
         ]
+        if hasattr(result, "layout_id"):
+            lines.insert(1, f"layout_id: {result.layout_id}")
+        if hasattr(result, "vertical_safety_enabled"):
+            lines.append(f"vertical_safety_enabled: {result.vertical_safety_enabled}")
         for key in (
             "front_preserved_ratio",
             "side_visible_ratio",
@@ -2512,6 +3562,7 @@ class MainWindow(QMainWindow):
             "side_suppressed_ratio",
             "side_suppressed_top_bottom_ratio",
             "black_pixel_ratio",
+            "valid_pixel_ratio",
             "duplicate_risk_proxy",
             "duplicate_risk_proxy_after",
         ):
@@ -2536,13 +3587,26 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            directory = save_layout_tuner_candidate(
-                default_layout_candidate_root(),
-                str(self.calibration_config.get("stitch_topology", "triple_front_panorama")),
-                self.current_layout_tuner_params(),
-                self.layout_tuner_preview_result,
-                source=self.layout_tuner_source_info,
-            )
+            tuner_params = self.current_layout_tuner_params()
+            if self.selected_layout_tuner_target() == "far_field":
+                directory = save_far_field_layout_candidate(
+                    default_far_field_layout_candidate_root(),
+                    str(self.calibration_config.get("stitch_topology", "triple_front_panorama")),
+                    tuner_params.camera_adjust or {},
+                    int(tuner_params.output_width_px),
+                    int(tuner_params.output_height_px),
+                    self.layout_tuner_preview_result,
+                    source=self.layout_tuner_source_info,
+                )
+            else:
+                directory = save_layout_tuner_candidate(
+                    default_layout_candidate_root(),
+                    str(self.calibration_config.get("stitch_topology", "triple_front_panorama")),
+                    tuner_params,
+                    self.layout_tuner_preview_result,
+                    source=self.layout_tuner_source_info,
+                    projection=self.current_layout_tuner_projection_block(),
+                )
         except Exception as exc:
             self.log(
                 self.t("Layout tuner candidate save failed: {error}", error=exc)
@@ -2595,7 +3659,7 @@ class MainWindow(QMainWindow):
 
         top = QHBoxLayout()
         top.addWidget(QLabel(self.t("Active camera count")))
-        self.camera_count = QSpinBox()
+        self.camera_count = NoWheelSpinBox()
         topology_keys = [
             key
             for key in active_topology_camera_keys(self.calibration_config)
@@ -2649,10 +3713,10 @@ class MainWindow(QMainWindow):
         output_group = QGroupBox(self.t("Canvas"))
         form = QFormLayout(output_group)
         stitch_profile = self.current_stitch_profile()
-        self.canvas_width = QSpinBox()
+        self.canvas_width = NoWheelSpinBox()
         self.canvas_width.setRange(320, 8192)
         self.canvas_width.setValue(int(stitch_profile.get("canvas", {}).get("width", 2440)))
-        self.canvas_height = QSpinBox()
+        self.canvas_height = NoWheelSpinBox()
         self.canvas_height.setRange(240, 8192)
         self.canvas_height.setValue(int(stitch_profile.get("canvas", {}).get("height", 1800)))
         self.canvas_width.valueChanged.connect(self.mark_camera_config_dirty)
@@ -2663,13 +3727,13 @@ class MainWindow(QMainWindow):
 
         perf_group = QGroupBox(self.t("Performance"))
         perf_form = QFormLayout(perf_group)
-        self.process_fps = QSpinBox()
+        self.process_fps = NoWheelSpinBox()
         self.process_fps.setRange(1, 30)
         self.process_fps.setValue(int(self.performance_config.get("process_fps", 5)))
-        self.preview_fps = QSpinBox()
+        self.preview_fps = NoWheelSpinBox()
         self.preview_fps.setRange(1, 30)
         self.preview_fps.setValue(int(self.performance_config.get("preview_fps", 2)))
-        self.max_input_width = QSpinBox()
+        self.max_input_width = NoWheelSpinBox()
         self.max_input_width.setRange(0, 4096)
         self.max_input_width.setSpecialValueText(self.t("Original"))
         self.max_input_width.setValue(int(self.performance_config.get("max_input_width", 960)))
@@ -2732,6 +3796,131 @@ class MainWindow(QMainWindow):
             "Use backups before large calibration or seam edits. Runtime export is the compact configuration intended for a future service/QGC bridge."
         ))
         root.addWidget(notes, 1)
+        return page
+
+    @staticmethod
+    def _default_qgc_output_url(kind: str) -> str:
+        if kind == "udp_mpegts":
+            return "udp://127.0.0.1:5600?pkt_size=1316"
+        return "rtsp://127.0.0.1:8554/deepshark"
+
+    def _qgc_video_output_config(self) -> dict[str, Any]:
+        raw = self.camera_config.get("qgc_video_output", {})
+        if not isinstance(raw, dict):
+            raw = {}
+        kind = str(raw.get("kind", "rtsp"))
+        if kind not in {"rtsp", "udp_mpegts"}:
+            kind = "rtsp"
+        return {
+            "kind": kind,
+            "url": str(raw.get("url", self._default_qgc_output_url(kind))),
+            "fps": float(raw.get("fps", 15.0)),
+            "bitrate": str(raw.get("bitrate", "6000k")),
+            "rtsp_transport": str(raw.get("rtsp_transport", "tcp")),
+            "ffmpeg_path": str(raw.get("ffmpeg_path", "ffmpeg")),
+        }
+
+    def _build_qgc_video_output_workspace(self) -> QWidget:
+        page = QWidget()
+        root = QVBoxLayout(page)
+
+        group = QGroupBox(self.t("QGC Video Output"))
+        form = QFormLayout(group)
+        config = self._qgc_video_output_config()
+
+        self.qgc_output_kind = NoWheelComboBox()
+        self.qgc_output_kind.addItem("RTSP", "rtsp")
+        self.qgc_output_kind.addItem("UDP MPEG-TS", "udp_mpegts")
+        self.qgc_output_kind.setCurrentIndex(
+            max(0, self.qgc_output_kind.findData(config["kind"]))
+        )
+        self.qgc_output_url = QLineEdit(config["url"])
+        self.qgc_output_url.setPlaceholderText(
+            self._default_qgc_output_url(config["kind"])
+        )
+        self.qgc_output_url.setToolTip(
+            self.t(
+                "Use this URL in QGC video settings when the RTSP server accepts publishing from DeepShark."
+            )
+        )
+        self.qgc_output_fps = NoWheelDoubleSpinBox()
+        self.qgc_output_fps.setRange(1.0, 60.0)
+        self.qgc_output_fps.setSingleStep(1.0)
+        self.qgc_output_fps.setDecimals(1)
+        self.qgc_output_fps.setValue(float(config["fps"]))
+        self.qgc_output_bitrate = QLineEdit(config["bitrate"])
+        self.qgc_rtsp_transport = NoWheelComboBox()
+        self.qgc_rtsp_transport.addItem("TCP", "tcp")
+        self.qgc_rtsp_transport.addItem("UDP", "udp")
+        self.qgc_rtsp_transport.setCurrentIndex(
+            max(0, self.qgc_rtsp_transport.findData(config["rtsp_transport"]))
+        )
+        self.qgc_ffmpeg_path = QLineEdit(config["ffmpeg_path"])
+
+        self.qgc_output_kind.currentIndexChanged.connect(
+            self.on_qgc_output_kind_changed
+        )
+        self.qgc_output_kind.currentIndexChanged.connect(self.mark_camera_config_dirty)
+        self.qgc_output_url.textChanged.connect(self.mark_camera_config_dirty)
+        self.qgc_output_fps.valueChanged.connect(self.mark_camera_config_dirty)
+        self.qgc_output_bitrate.textChanged.connect(self.mark_camera_config_dirty)
+        self.qgc_rtsp_transport.currentIndexChanged.connect(self.mark_camera_config_dirty)
+        self.qgc_ffmpeg_path.textChanged.connect(self.mark_camera_config_dirty)
+
+        form.addRow(self.t("Output Type"), self.qgc_output_kind)
+        form.addRow(self.t("Output URL"), self.qgc_output_url)
+        form.addRow(self.t("Output FPS"), self.qgc_output_fps)
+        form.addRow(self.t("Output Bitrate"), self.qgc_output_bitrate)
+        form.addRow(self.t("RTSP Transport"), self.qgc_rtsp_transport)
+        form.addRow(self.t("FFmpeg Path"), self.qgc_ffmpeg_path)
+        root.addWidget(group)
+
+        note = QLabel(
+            self.t(
+                "RTSP output publishes to an RTSP server. QGC should open the same stream URL."
+            )
+            + "\n"
+            + self.t(
+                "UDP MPEG-TS remains available for QGC builds or test links that prefer udp:// port input."
+            )
+            + "\n"
+            + self.t(
+                "QGC output settings are saved in cameras.yaml and do not modify calibration.yaml."
+            )
+        )
+        note.setWordWrap(True)
+        note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(note)
+
+        save_button = QPushButton(self.t("Save QGC Output Settings"))
+        save_button.clicked.connect(self.save_qgc_video_output_settings)
+        self.qgc_output_start_button = QPushButton(self.t("Start QGC Output Service"))
+        self.qgc_output_start_button.setToolTip(
+            self.t(
+                "Start the headless DeepShark video payload service with the current Far/Near runtime settings."
+            )
+        )
+        self.qgc_output_stop_button = QPushButton(self.t("Stop QGC Output Service"))
+        self.qgc_output_stop_button.setToolTip(
+            self.t("Stop the running DeepShark video payload service process.")
+        )
+        self.qgc_output_stop_button.setEnabled(False)
+        self.qgc_output_start_button.clicked.connect(self.start_qgc_output_service)
+        self.qgc_output_stop_button.clicked.connect(self.stop_qgc_output_service)
+        row = QHBoxLayout()
+        row.addWidget(save_button)
+        row.addWidget(self.qgc_output_start_button)
+        row.addWidget(self.qgc_output_stop_button)
+        row.addStretch(1)
+        root.addLayout(row)
+        self.qgc_output_service_status = QLabel(
+            self.t("QGC output service is stopped.")
+        )
+        self.qgc_output_service_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        root.addWidget(self.qgc_output_service_status)
+        root.addStretch(1)
         return page
 
     def _build_log_workspace(self) -> QWidget:
@@ -2818,13 +4007,13 @@ class MainWindow(QMainWindow):
         board_group = QGroupBox(self.t("Chessboard"))
         board_form = QFormLayout(board_group)
         board = self.calibration_config.get("calibration_board", {})
-        self.board_columns = QSpinBox()
+        self.board_columns = NoWheelSpinBox()
         self.board_columns.setRange(3, 40)
         self.board_columns.setValue(int(board.get("total_columns", 12)))
-        self.board_rows = QSpinBox()
+        self.board_rows = NoWheelSpinBox()
         self.board_rows.setRange(3, 40)
         self.board_rows.setValue(int(board.get("total_rows", 9)))
-        self.square_size = QSpinBox()
+        self.square_size = NoWheelSpinBox()
         self.square_size.setRange(1, 500)
         self.square_size.setValue(int(float(board.get("square_size_mm", 25.0))))
         board_form.addRow(self.t("Total square columns"), self.board_columns)
@@ -2834,7 +4023,7 @@ class MainWindow(QMainWindow):
 
         calibration_toolbar_primary = QHBoxLayout()
         calibration_toolbar_secondary = QHBoxLayout()
-        self.calibration_camera = QComboBox()
+        self.calibration_camera = NoWheelComboBox()
         self.calibration_camera.addItems(active_topology_camera_keys(self.calibration_config))
         load_image = QPushButton(self.t("Load Calibration Image"))
         detect_board = QPushButton(self.t("Detect Chessboard"))
@@ -2912,7 +4101,7 @@ class MainWindow(QMainWindow):
         refresh_seam = QPushButton(self.t("Refresh Seam Canvas"))
         save_seam = QPushButton(self.t("Save Seam Points"))
         center_seams = QPushButton(self.t("Center Seams in Overlaps"))
-        self.feather_width = QSpinBox()
+        self.feather_width = NoWheelSpinBox()
         self.feather_width.setRange(1, 1000)
         self.feather_width.setValue(self.current_feather_width())
         refresh_seam.clicked.connect(self.refresh_seam_editor)
@@ -2994,7 +4183,7 @@ class MainWindow(QMainWindow):
         refresh_geometry = QPushButton(
             self.t("Refresh Geometry Diagnostics")
         )
-        self.geometry_pair_mode = QComboBox()
+        self.geometry_pair_mode = NoWheelComboBox()
         self.geometry_pair_mode.addItem(self.t("50% Alpha"), ALPHA_50)
         self.geometry_pair_mode.addItem(self.t("No Feather"), NO_FEATHER)
         self.run_pairwise_button = QPushButton(
@@ -3003,7 +4192,7 @@ class MainWindow(QMainWindow):
         self.manual_pairwise_button = QPushButton(
             self.t("Manual Correspondences")
         )
-        self.pairwise_pair_combo = QComboBox()
+        self.pairwise_pair_combo = NoWheelComboBox()
         refresh_geometry.clicked.connect(self.refresh_geometry_diagnostics)
         self.run_pairwise_button.clicked.connect(
             self.run_pairwise_candidate_diagnostics
@@ -3095,13 +4284,13 @@ class MainWindow(QMainWindow):
 
         setup_group = QGroupBox(self.t("Fisheye Sample Session"))
         setup_layout = QFormLayout(setup_group)
-        self.session_board_type = QComboBox()
+        self.session_board_type = NoWheelComboBox()
         self.session_board_type.addItem("Chessboard", "chessboard")
         self.session_board_type.addItem("ArUco Grid", "aruco_grid")
         self.session_board_type.addItem("Charuco", "charuco")
-        self.session_board_columns = QSpinBox()
+        self.session_board_columns = NoWheelSpinBox()
         self.session_board_columns.setRange(2, 40)
-        self.session_board_rows = QSpinBox()
+        self.session_board_rows = NoWheelSpinBox()
         self.session_board_rows.setRange(2, 40)
         board = self.calibration_config.get("calibration_board", {})
         self.session_board_columns.setValue(
@@ -3110,24 +4299,24 @@ class MainWindow(QMainWindow):
         self.session_board_rows.setValue(
             max(2, int(board.get("total_rows", 9)) - 1)
         )
-        self.session_square_length = QDoubleSpinBox()
+        self.session_square_length = NoWheelDoubleSpinBox()
         self.session_square_length.setRange(0.1, 1000.0)
         self.session_square_length.setDecimals(3)
         self.session_square_length.setSuffix(" mm")
         self.session_square_length.setValue(
             float(board.get("square_size_mm", 25.0))
         )
-        self.session_marker_length = QDoubleSpinBox()
+        self.session_marker_length = NoWheelDoubleSpinBox()
         self.session_marker_length.setRange(0.1, 1000.0)
         self.session_marker_length.setDecimals(3)
         self.session_marker_length.setSuffix(" mm")
         self.session_marker_length.setValue(18.0)
-        self.session_marker_separation = QDoubleSpinBox()
+        self.session_marker_separation = NoWheelDoubleSpinBox()
         self.session_marker_separation.setRange(0.0, 1000.0)
         self.session_marker_separation.setDecimals(3)
         self.session_marker_separation.setSuffix(" mm")
         self.session_marker_separation.setValue(5.0)
-        self.session_dictionary = QComboBox()
+        self.session_dictionary = NoWheelComboBox()
         self.session_dictionary.addItems(supported_aruco_dictionaries())
         self.session_board_confirmed = QCheckBox(
             self.t("Board definition confirmed")
@@ -3168,16 +4357,16 @@ class MainWindow(QMainWindow):
 
         quality_group = QGroupBox(self.t("Quality gates"))
         quality_form = QFormLayout(quality_group)
-        self.session_min_area_percent = QDoubleSpinBox()
+        self.session_min_area_percent = NoWheelDoubleSpinBox()
         self.session_min_area_percent.setRange(0.1, 50.0)
         self.session_min_area_percent.setDecimals(2)
         self.session_min_area_percent.setSuffix(" %")
         self.session_min_area_percent.setValue(1.5)
-        self.session_blur_threshold = QDoubleSpinBox()
+        self.session_blur_threshold = NoWheelDoubleSpinBox()
         self.session_blur_threshold.setRange(0.0, 100000.0)
         self.session_blur_threshold.setDecimals(1)
         self.session_blur_threshold.setValue(60.0)
-        self.session_sync_threshold_ms = QSpinBox()
+        self.session_sync_threshold_ms = NoWheelSpinBox()
         self.session_sync_threshold_ms.setRange(1, 5000)
         self.session_sync_threshold_ms.setSuffix(" ms")
         self.session_sync_threshold_ms.setValue(100)
@@ -3228,7 +4417,7 @@ class MainWindow(QMainWindow):
         capture_layout = QVBoxLayout(capture_group)
         capture_primary = QHBoxLayout()
         capture_board = QHBoxLayout()
-        self.session_capture_target = QComboBox()
+        self.session_capture_target = NoWheelComboBox()
         for camera in ("front_left", "front", "front_right"):
             self.session_capture_target.addItem(
                 f"{self.t('Intrinsic')}: {camera}",
@@ -3375,32 +4564,32 @@ class MainWindow(QMainWindow):
         )
         board_layout.addWidget(self.wizard_board_hint)
         board_form = QFormLayout()
-        self.wizard_board_type = QComboBox()
+        self.wizard_board_type = NoWheelComboBox()
         self.wizard_board_type.addItem("Chessboard", "chessboard")
         self.wizard_board_type.addItem("ArUco Grid", "aruco_grid")
         self.wizard_board_type.addItem("Charuco", "charuco")
-        self.wizard_board_columns = QSpinBox()
+        self.wizard_board_columns = NoWheelSpinBox()
         self.wizard_board_columns.setRange(2, 40)
         self.wizard_board_columns.setValue(11)
-        self.wizard_board_rows = QSpinBox()
+        self.wizard_board_rows = NoWheelSpinBox()
         self.wizard_board_rows.setRange(2, 40)
         self.wizard_board_rows.setValue(8)
-        self.wizard_square_length = QDoubleSpinBox()
+        self.wizard_square_length = NoWheelDoubleSpinBox()
         self.wizard_square_length.setRange(0.1, 1000.0)
         self.wizard_square_length.setDecimals(3)
         self.wizard_square_length.setSuffix(" mm")
         self.wizard_square_length.setValue(25.0)
-        self.wizard_marker_length = QDoubleSpinBox()
+        self.wizard_marker_length = NoWheelDoubleSpinBox()
         self.wizard_marker_length.setRange(0.1, 1000.0)
         self.wizard_marker_length.setDecimals(3)
         self.wizard_marker_length.setSuffix(" mm")
         self.wizard_marker_length.setValue(18.0)
-        self.wizard_marker_separation = QDoubleSpinBox()
+        self.wizard_marker_separation = NoWheelDoubleSpinBox()
         self.wizard_marker_separation.setRange(0.0, 1000.0)
         self.wizard_marker_separation.setDecimals(3)
         self.wizard_marker_separation.setSuffix(" mm")
         self.wizard_marker_separation.setValue(5.0)
-        self.wizard_dictionary = QComboBox()
+        self.wizard_dictionary = NoWheelComboBox()
         self.wizard_dictionary.addItems(supported_aruco_dictionaries())
         self.wizard_board_confirmed = QCheckBox(
             "我已核对标定板类型、行列数、尺寸和字典"
@@ -3467,7 +4656,7 @@ class MainWindow(QMainWindow):
         intrinsic_intro.setWordWrap(True)
         intrinsic_layout.addWidget(intrinsic_intro)
         intrinsic_controls = QHBoxLayout()
-        self.wizard_intrinsic_camera = QComboBox()
+        self.wizard_intrinsic_camera = NoWheelComboBox()
         for camera in ("front_left", "front", "front_right"):
             self.wizard_intrinsic_camera.addItem(camera, camera)
         self.wizard_capture_intrinsic_button = QPushButton("采集当前相机样本")
@@ -3500,7 +4689,7 @@ class MainWindow(QMainWindow):
         pair_intro.setWordWrap(True)
         pair_layout.addWidget(pair_intro)
         pair_controls = QHBoxLayout()
-        self.wizard_pair = QComboBox()
+        self.wizard_pair = NoWheelComboBox()
         self.wizard_pair.addItem(
             "front_left ↔ front",
             "front_left__front",
@@ -3739,6 +4928,8 @@ class MainWindow(QMainWindow):
             warnings.append("当前 profile 的 overlap/seam 校验未通过")
         if self.last_stitch_ui_error:
             warnings.append(f"最近一次拼接失败：{self.last_stitch_ui_error}")
+        warnings.extend(self.last_runtime_warnings)
+        warnings.extend(self.runtime_stitch_config.runtime_warnings())
         candidate = self.current_candidate_metadata()
         if self.calibration_candidate_state() == "experimental":
             warnings.append("当前候选为 experimental，仅供诊断")
@@ -3765,6 +4956,13 @@ class MainWindow(QMainWindow):
             return "实时预览已停止。当前布局偏好已保留，启动后才会继续刷新。"
         if self.preview_content_mode == PreviewContentMode.STILL:
             return "静态拼接画面：用于检查图片，不代表实时流状态。"
+        if self.runtime_stitch_config.mode == StitchRuntimeMode.NEAR_FIELD:
+            return (
+                "近景优先拼接：使用只读 Layout Candidate V2、当前 perspective warp、"
+                "front-priority layout。适合近景物体靠近接缝时手动对比。"
+            )
+        if self.runtime_stitch_config.mode == StitchRuntimeMode.AUTO:
+            return "Auto 拼接算法仍是占位；当前回退 Far-field，不会自动切换。"
         if self.live_stitch_mode == "candidate":
             return (
                 "实验性候选（rotation-only）：远景优先，近景可能重影。"
@@ -3807,6 +5005,7 @@ class MainWindow(QMainWindow):
             PreviewContentMode.LIVE: "Live",
             PreviewContentMode.STILL: "Still",
         }[self.preview_content_mode]
+        runtime = self.runtime_stitch_config.mode.value
         warnings = self.preview_warning_messages()
         summary = (
             f"Topology: {topology}  |  相机: {len(active_keys)} 路 "
@@ -3815,6 +5014,7 @@ class MainWindow(QMainWindow):
             f"Failed {status_counts[STREAM_FAILED]} / "
             f"Stopped {status_counts[STREAM_STOPPED]})  |  "
             f"布局: {layout}  |  内容: {content}  |  "
+            f"拼接算法: {runtime}  |  "
             f"标定状态: {self.calibration_candidate_state()}"
         )
         if warnings:
@@ -3834,12 +5034,22 @@ class MainWindow(QMainWindow):
 
     def canvas_status_text(self) -> str:
         if self.preview_content_mode == PreviewContentMode.LIVE:
+            if self.runtime_stitch_config.mode == StitchRuntimeMode.NEAR_FIELD:
+                return self.t("Near-field stitched view")
+            if self.runtime_stitch_config.mode == StitchRuntimeMode.FAR_FIELD:
+                return self.t("Far-field stitched view")
             if self.live_stitch_mode == "candidate":
                 return self.t("Experimental candidate live view")
             return self.t("Live stitched view")
         if self.preview_content_mode == PreviewContentMode.STILL:
             return self.t("Static stitched view")
         return self.t("Live preview stopped")
+
+    def render_canvas_view(self) -> None:
+        if self.canvas is None or not hasattr(self, "canvas_view"):
+            return
+        self.canvas_view.set_overlay(self.canvas_status_text())
+        self.canvas_view.set_image(self.canvas, self.t("stitched canvas"))
 
     def apply_live_stitch_mode_controls(self) -> None:
         if not hasattr(self, "candidate_stitch_button"):
@@ -3852,7 +5062,7 @@ class MainWindow(QMainWindow):
         self.candidate_stitch_button.setEnabled(candidate_available)
         self.candidate_stitch_button.setToolTip(
             (
-                "实验性候选，仅供实时诊断；不会写入正式 calibration.yaml。"
+                "B-2 候选实时视图，仅供高级诊断；不会写入正式 calibration.yaml。"
                 if candidate_available
                 else "当前 topology 没有可用候选，请先完成采样和 B-2 候选求解。"
             )
@@ -3870,14 +5080,14 @@ class MainWindow(QMainWindow):
         self.template_stitch_button.blockSignals(False)
         if self.live_stitch_mode == "candidate":
             self.stitch_strategy_label.setText(
-                self.t("Experimental candidate live view")
+                self.t("B-2 candidate view")
             )
             self.stitch_strategy_label.setToolTip(
                 str(self.live_candidate_directory)
             )
         else:
             self.stitch_strategy_label.setText(
-                self.t("Template stitching")
+                self.t("Current Profile Template")
             )
             self.stitch_strategy_label.setToolTip("")
 
@@ -3967,6 +5177,7 @@ class MainWindow(QMainWindow):
             self.back_to_grid_button.setVisible(is_focus)
             self.preview_mode_label.setText(self.preview_mode_text())
             self.apply_live_stitch_mode_controls()
+            self.refresh_stitch_runtime_controls()
             self.canvas_view.set_overlay(self.canvas_status_text())
             self.stitched_view_notice.setVisible(is_stitched)
             self.stitched_view_notice.setText(
@@ -3988,7 +5199,7 @@ class MainWindow(QMainWindow):
         if self.preview_content_mode == PreviewContentMode.STOPPED:
             self.canvas_view.set_placeholder(self.t("Live preview stopped"))
         elif self.should_render_canvas() and self.canvas is not None:
-            self.canvas_view.set_image(self.canvas, self.t("stitched canvas"))
+            self.render_canvas_view()
         self.refresh_warped_views()
 
     def _layout_camera_views(
@@ -4124,7 +5335,8 @@ class MainWindow(QMainWindow):
             "Starting live preview: "
             f"topology={self.calibration_config.get('stitch_topology', '')}, "
             f"cameras={self.active_camera_keys()}, "
-            f"stitch_mode={self.live_stitch_mode}"
+            f"stitch_mode={self.live_stitch_mode}, "
+            f"runtime_mode={self.runtime_stitch_config.mode.value}"
         )
         self.stream_snapshots = self.stream_manager.snapshots(include_frames=False)
         for key, snapshot in self.stream_snapshots.items():
@@ -4354,17 +5566,27 @@ class MainWindow(QMainWindow):
             return
 
         self.last_stitch_ui_error = ""
+        self.last_runtime_stitch_status = result.runtime_status
+        self.last_runtime_warnings = list(result.runtime_warnings)
+        self.last_runtime_metrics = result.runtime_metrics
+        warning_text = "; ".join(self.last_runtime_warnings)
+        if warning_text and warning_text != self.last_runtime_warning_log_text:
+            self.last_runtime_warning_log_text = warning_text
+            self.log(warning_text, level="WARNING")
         self.warped = result.warped
         self.canvas = result.canvas
         self.refresh_warped_views()
         if self.canvas is not None and self.should_render_canvas():
-            self.canvas_view.set_image(self.canvas, self.t("stitched canvas"))
-        self.statusBar().showMessage(self.t(
+            self.render_canvas_view()
+        message = self.t(
             "{status}: {count} active frames | stitch {ms:.1f} ms",
             status=self.t("Live frame"),
             count=len(self.frames),
             ms=self.last_stitch_ms,
-        ))
+        )
+        self.statusBar().showMessage(
+            message + self.runtime_timing_status_suffix(self.last_runtime_metrics)
+        )
 
     def _process_and_render_frames(self, status_prefix: str) -> None:
         start_time = time.perf_counter()
@@ -4376,10 +5598,14 @@ class MainWindow(QMainWindow):
         self.log_source_coordinate_warnings(self.frames)
 
         try:
-            self.warped, self.canvas = self.stitcher.process(self.frames)
+            self.warped, self.canvas, runtime_warnings = (
+                self.process_frames_with_runtime_controller(self.frames)
+            )
         except Exception as exc:
             QMessageBox.critical(self, self.t("Stitch failed"), str(exc))
             return
+        if runtime_warnings:
+            self.log("; ".join(runtime_warnings), level="WARNING")
 
         now = time.perf_counter()
         preview_interval = 1.0 / max(1, int(self.performance_config.get("preview_fps", 2)))
@@ -4389,19 +5615,22 @@ class MainWindow(QMainWindow):
             self.refresh_raw_preview(force=True)
             self.refresh_warped_views()
         if self.canvas is not None and self.should_render_canvas():
-            self.canvas_view.set_image(self.canvas, self.t("stitched canvas"))
+            self.render_canvas_view()
             if hasattr(self, "seam_editor") and status_prefix != "Live frame":
                 self.refresh_seam_editor()
         self.last_stitch_ms = (time.perf_counter() - start_time) * 1000.0
         if now - self.last_health_time >= 1.0 or status_prefix != "Live frame":
             self.last_health_time = now
             self.update_health_table()
-        self.statusBar().showMessage(self.t(
+        message = self.t(
             "{status}: {count} active frames | stitch {ms:.1f} ms",
             status=self.t(status_prefix),
             count=len(self.frames),
             ms=self.last_stitch_ms,
-        ))
+        )
+        self.statusBar().showMessage(
+            message + self.runtime_timing_status_suffix(self.last_runtime_metrics)
+        )
 
     def update_health_table(self) -> None:
         keys = CAMERA_KEYS
@@ -4462,6 +5691,10 @@ class MainWindow(QMainWindow):
             "use_intrinsics": self.use_intrinsics_live.isChecked(),
         }
         self.camera_config["cameras"] = {key: row.to_config() for key, row in self.camera_rows.items()}
+        if hasattr(self, "qgc_output_kind"):
+            self.camera_config["qgc_video_output"] = (
+                self.qgc_video_output_config_from_widgets()
+            )
 
     def backup_before_config_write(self) -> None:
         try:
@@ -4537,6 +5770,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self.t("Saved configs to {path}", path=CONFIG_DIR))
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self.stop_qgc_output_service()
         self.stop_live_preview()
         self.stitch_processor.shutdown()
         super().closeEvent(event)
@@ -4567,7 +5801,21 @@ class MainWindow(QMainWindow):
         self._candidate_ui_cache = {}
         if self.live_candidate_directory is None:
             self.live_stitch_mode = "template"
+        if self.runtime_layout_candidate is not None:
+            try:
+                self.runtime_layout_candidate = load_layout_candidate_for_runtime(
+                    self.runtime_layout_candidate.path,
+                    expected_profile_id=self.current_runtime_profile_id(),
+                )
+            except Exception as exc:
+                self.log(
+                    f"Runtime layout candidate unavailable after reload: {exc}",
+                    level="WARNING",
+                )
+                self.runtime_layout_candidate = None
+                self.runtime_stitch_config = RuntimeStitchConfig()
         self.apply_live_stitch_mode_controls()
+        self.refresh_stitch_runtime_controls()
         self.sync_camera_config_widgets()
         self.stitcher = self.create_stitcher()
         self.bump_preview_session()
@@ -4612,10 +5860,261 @@ class MainWindow(QMainWindow):
             )
             if hasattr(self, "feather_width"):
                 self.feather_width.setValue(self.current_feather_width())
+            if hasattr(self, "qgc_output_kind"):
+                self.sync_qgc_video_output_widgets()
         finally:
             self._syncing_camera_widgets = False
         self._camera_config_dirty = False
         self.refresh_camera_count()
+
+    def qgc_video_output_config_from_widgets(self) -> dict[str, Any]:
+        kind = self.qgc_output_kind.currentData() or "rtsp"
+        kind = str(kind)
+        url = self.qgc_output_url.text().strip() or self._default_qgc_output_url(kind)
+        return {
+            "kind": kind,
+            "url": url,
+            "fps": float(self.qgc_output_fps.value()),
+            "bitrate": self.qgc_output_bitrate.text().strip() or "6000k",
+            "rtsp_transport": str(self.qgc_rtsp_transport.currentData() or "tcp"),
+            "ffmpeg_path": self.qgc_ffmpeg_path.text().strip() or "ffmpeg",
+        }
+
+    def sync_qgc_video_output_widgets(self) -> None:
+        config = self._qgc_video_output_config()
+        self.qgc_output_kind.setCurrentIndex(
+            max(0, self.qgc_output_kind.findData(config["kind"]))
+        )
+        self.qgc_output_url.setText(config["url"])
+        self.qgc_output_url.setPlaceholderText(
+            self._default_qgc_output_url(config["kind"])
+        )
+        self.qgc_output_fps.setValue(float(config["fps"]))
+        self.qgc_output_bitrate.setText(config["bitrate"])
+        self.qgc_rtsp_transport.setCurrentIndex(
+            max(0, self.qgc_rtsp_transport.findData(config["rtsp_transport"]))
+        )
+        self.qgc_ffmpeg_path.setText(config["ffmpeg_path"])
+
+    def on_qgc_output_kind_changed(self, _index: int) -> None:
+        kind = str(self.qgc_output_kind.currentData() or "rtsp")
+        self.qgc_output_url.setPlaceholderText(self._default_qgc_output_url(kind))
+        current_url = self.qgc_output_url.text().strip()
+        default_urls = {
+            self._default_qgc_output_url("rtsp"),
+            self._default_qgc_output_url("udp_mpegts"),
+            "",
+        }
+        if current_url in default_urls:
+            self.qgc_output_url.setText(self._default_qgc_output_url(kind))
+
+    def save_qgc_video_output_settings(self) -> None:
+        if config_revision("cameras.yaml") != self._camera_config_revision:
+            self.show_config_conflict()
+            return
+        self.camera_config["qgc_video_output"] = (
+            self.qgc_video_output_config_from_widgets()
+        )
+        self.backup_before_config_write()
+        if not self.persist_camera_config_from_widgets():
+            return
+        self.statusBar().showMessage(self.t("QGC output settings saved."))
+        self.log(self.t("QGC output settings saved."))
+
+    def qgc_output_service_arguments(self) -> list[str] | None:
+        output = self.qgc_video_output_config_from_widgets()
+        mode = self.selected_runtime_mode()
+        projection = (
+            self.selected_projection_source()
+            if mode == StitchRuntimeMode.NEAR_FIELD
+            else ProjectionSource.CURRENT_PERSPECTIVE
+        )
+        if mode == StitchRuntimeMode.NEAR_FIELD and self.runtime_layout_candidate is None:
+            QMessageBox.information(
+                self,
+                self.t("QGC output service"),
+                self.t("Near-field mode requires a loaded Layout Candidate V2."),
+            )
+            return None
+        if (
+            projection == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE
+            and self.runtime_fisheye_intrinsics_source is None
+        ):
+            QMessageBox.information(
+                self,
+                self.t("QGC output service"),
+                self.t("Fisheye Rectilinear projection requires a loaded fisheye intrinsics source."),
+            )
+            return None
+        use_far_field_custom = (
+            mode == StitchRuntimeMode.FAR_FIELD
+            and hasattr(self, "far_field_custom_layout_check")
+            and self.far_field_custom_layout_check.isChecked()
+        )
+        if use_far_field_custom and self.far_field_layout_candidate is None:
+            QMessageBox.information(
+                self,
+                self.t("QGC output service"),
+                self.t("Far-field custom layout requires a loaded Far-field Layout Candidate."),
+            )
+            return None
+        max_width, use_intrinsics = self.live_stitcher_options()
+        args = [
+            "-m",
+            "deep_shark_studio.qgc.runtime_service",
+            "--cameras-config",
+            str(CONFIG_DIR / "cameras.yaml"),
+            "--calibration-config",
+            str(CONFIG_DIR / "calibration.yaml"),
+            "--mode",
+            mode.value,
+            "--process-fps",
+            str(float(self.process_fps.value()) if hasattr(self, "process_fps") else 15.0),
+            "--output-kind",
+            output["kind"],
+            "--output-url",
+            output["url"],
+            "--output-fps",
+            str(float(output["fps"])),
+            "--output-bitrate",
+            output["bitrate"],
+            "--rtsp-transport",
+            output["rtsp_transport"],
+            "--ffmpeg",
+            output["ffmpeg_path"],
+            "--max-input-width",
+            str(0 if max_width is None else int(max_width)),
+        ]
+        if use_intrinsics:
+            args.append("--use-intrinsics")
+        if use_far_field_custom and self.far_field_layout_candidate is not None:
+            args.extend(
+                [
+                    "--far-field-layout-candidate",
+                    str(self.far_field_layout_candidate.path),
+                ]
+            )
+        if mode == StitchRuntimeMode.NEAR_FIELD and self.runtime_layout_candidate is not None:
+            balance, fov_scale = self.selected_runtime_fisheye_params()
+            args.extend(
+                [
+                    "--near-field-layout-candidate",
+                    str(self.runtime_layout_candidate.path),
+                    "--projection-source",
+                    projection.value,
+                    "--fisheye-balance",
+                    str(float(balance)),
+                    "--fisheye-fov-scale",
+                    str(float(fov_scale)),
+                ]
+            )
+            if self.runtime_fisheye_intrinsics_source is not None:
+                args.extend(
+                    [
+                        "--projection-intrinsics-source",
+                        str(self.runtime_fisheye_intrinsics_source.path),
+                    ]
+                )
+        return args
+
+    def start_qgc_output_service(self) -> None:
+        if (
+            self.qgc_output_process is not None
+            and self.qgc_output_process.state() != QProcess.ProcessState.NotRunning
+        ):
+            QMessageBox.information(
+                self,
+                self.t("QGC output service"),
+                self.t("QGC output service already running."),
+            )
+            return
+        args = self.qgc_output_service_arguments()
+        if args is None:
+            return
+        process = QProcess(self)
+        process.setProgram(sys.executable)
+        process.setArguments(args)
+        process.setWorkingDirectory(str(PROJECT_ROOT))
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        process.readyReadStandardOutput.connect(self.on_qgc_output_service_output)
+        process.errorOccurred.connect(self.on_qgc_output_service_error)
+        process.finished.connect(self.on_qgc_output_service_finished)
+        self.qgc_output_process = process
+        process.start()
+        if not process.waitForStarted(3000):
+            self.qgc_output_process = None
+            self.qgc_output_start_button.setEnabled(True)
+            self.qgc_output_stop_button.setEnabled(False)
+            QMessageBox.warning(
+                self,
+                self.t("QGC output service"),
+                self.t("QGC output service failed to start."),
+            )
+            return
+        output = self.qgc_video_output_config_from_widgets()
+        status = self.t(
+            "QGC output service started: {url}",
+            url=output["url"],
+        )
+        if hasattr(self, "qgc_output_service_status"):
+            self.qgc_output_service_status.setText(
+                f"{status}\nPID: {process.processId()}"
+            )
+        self.qgc_output_start_button.setEnabled(False)
+        self.qgc_output_stop_button.setEnabled(True)
+        self.statusBar().showMessage(status)
+        self.log(status)
+
+    def stop_qgc_output_service(self) -> None:
+        process = self.qgc_output_process
+        if process is None or process.state() == QProcess.ProcessState.NotRunning:
+            self.qgc_output_process = None
+            if hasattr(self, "qgc_output_start_button"):
+                self.qgc_output_start_button.setEnabled(True)
+            if hasattr(self, "qgc_output_stop_button"):
+                self.qgc_output_stop_button.setEnabled(False)
+            if hasattr(self, "qgc_output_service_status"):
+                self.qgc_output_service_status.setText(
+                    self.t("QGC output service is stopped.")
+                )
+            return
+        process.terminate()
+        QTimer.singleShot(3000, self.kill_qgc_output_service_if_running)
+
+    def kill_qgc_output_service_if_running(self) -> None:
+        process = self.qgc_output_process
+        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            process.kill()
+
+    def on_qgc_output_service_output(self) -> None:
+        process = self.qgc_output_process
+        if process is None:
+            return
+        data = bytes(process.readAllStandardOutput()).decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
+        if data:
+            self.log(f"QGC output service: {data}")
+
+    def on_qgc_output_service_error(self, error) -> None:
+        self.log(f"QGC output service error: {error}", level="ERROR")
+
+    def on_qgc_output_service_finished(self, exit_code: int, _exit_status) -> None:
+        message = (
+            self.t("QGC output service stopped.")
+            if int(exit_code) == 0
+            else self.t("QGC output service exited with code {code}.", code=exit_code)
+        )
+        if hasattr(self, "qgc_output_service_status"):
+            self.qgc_output_service_status.setText(message)
+        if hasattr(self, "qgc_output_start_button"):
+            self.qgc_output_start_button.setEnabled(True)
+        if hasattr(self, "qgc_output_stop_button"):
+            self.qgc_output_stop_button.setEnabled(False)
+        self.qgc_output_process = None
+        self.statusBar().showMessage(message)
+        self.log(message)
 
     def save_project_as(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -6655,4 +8154,5 @@ def main() -> int:
     window = MainWindow()
     window.show()
     return app.exec()
+
 

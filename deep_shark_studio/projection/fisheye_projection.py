@@ -12,6 +12,7 @@ import numpy as np
 from deep_shark_studio.stitcher import save_image
 
 from .intrinsics_candidate import CAMERA_KEYS, FisheyeCameraModel
+from .runtime_providers import ProjectionResult
 
 
 @dataclass(frozen=True)
@@ -26,13 +27,6 @@ class EquirectangularParams:
         data["yaw_range_deg"] = list(self.yaw_range_deg)
         data["pitch_range_deg"] = list(self.pitch_range_deg)
         return data
-
-
-@dataclass(frozen=True)
-class ProjectionResult:
-    warped_images: dict[str, np.ndarray]
-    valid_masks: dict[str, np.ndarray]
-    metadata: dict[str, Any]
 
 
 def build_rectilinear_projection(
@@ -216,7 +210,12 @@ def build_equirectangular_projection(
         save_image(canvas_path, canvas)
         metadata["overlay_debug"] = canvas_path.relative_to(root).as_posix()
     metadata["suggested_overlaps"] = suggested_overlaps(masks)
-    return ProjectionResult(remapped, masks, metadata)
+    return ProjectionResult(
+        warped_images=remapped,
+        valid_masks=masks,
+        metadata=metadata,
+        timings={},
+    )
 
 
 def suggested_overlaps(valid_masks: dict[str, np.ndarray]) -> dict[str, Any]:

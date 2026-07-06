@@ -71,6 +71,7 @@ def export_runtime_config(path: str | Path) -> Path:
         "stitch_points": calibration.get("stitch_points", {}),
         "mask_rules": calibration.get("mask_rules", []),
         "network": network,
+        "qgc_video_output": cameras.get("qgc_video_output", {}),
     }
     export_path = Path(path)
     save_yaml(export_path, runtime)

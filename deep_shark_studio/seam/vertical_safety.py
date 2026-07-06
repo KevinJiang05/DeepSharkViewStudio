@@ -11,6 +11,7 @@ from .layout_preview import (
     FrontPriorityLayoutPreviewRenderer,
     LayoutPairCandidate,
     LayoutPreviewParams,
+    valid_mask_for_image,
 )
 
 
@@ -58,6 +59,8 @@ class VerticalSafetyRenderer:
         safety_params: VerticalSafetyParams,
         main_camera: str = "front",
         pair_params: dict[str, LayoutPreviewParams] | None = None,
+        draw_label: bool = True,
+        valid_masks: dict[str, np.ndarray] | None = None,
     ) -> VerticalSafetyResult:
         base = FrontPriorityLayoutPreviewRenderer().render(
             warped_images,
@@ -65,13 +68,20 @@ class VerticalSafetyRenderer:
             layout_params,
             main_camera=main_camera,
             pair_params=pair_params,
+            draw_label=draw_label,
+            valid_masks=valid_masks,
         )
         if main_camera not in warped_images:
             raise ValueError("warped_images must include the front camera.")
         front = warped_images[main_camera]
         crop_x0, crop_x1 = base.crop
         front_crop = front[:, crop_x0:crop_x1]
-        front_valid = np.any(front_crop != 0, axis=2)
+        front_valid_full = valid_mask_for_image(
+            front,
+            (valid_masks or {}).get(main_camera),
+            main_camera,
+        )
+        front_valid = front_valid_full[:, crop_x0:crop_x1]
         height, width = base.image.shape[:2]
         weight_1d = self.vertical_weight(
             height,
@@ -99,7 +109,8 @@ class VerticalSafetyRenderer:
         front_valid_crop = front_valid[crop_y0:crop_y1]
         front_preserved = front_valid_crop & ~after_crop
         black = np.all(cropped == 0, axis=2)
-        self._draw_label(cropped, layout_params, safety_params)
+        if draw_label:
+            self._draw_label(cropped, layout_params, safety_params)
         metrics = self._metrics(
             front_valid_crop,
             before_crop,

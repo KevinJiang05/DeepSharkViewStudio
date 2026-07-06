@@ -8,6 +8,19 @@ import cv2
 import numpy as np
 
 
+def valid_mask_for_image(
+    image: np.ndarray,
+    mask: np.ndarray | None,
+    camera: str,
+) -> np.ndarray:
+    if mask is None:
+        return np.any(image != 0, axis=2)
+    mask_array = np.asarray(mask)
+    if mask_array.shape != image.shape[:2]:
+        raise ValueError(f"valid_mask size mismatch for {camera}")
+    return mask_array.astype(bool)
+
+
 @dataclass(frozen=True)
 class LayoutPreviewParams:
     side_shift_px: int = 40
@@ -66,12 +79,19 @@ class FrontPriorityLayoutPreviewRenderer:
         params: LayoutPreviewParams,
         main_camera: str = "front",
         pair_params: dict[str, LayoutPreviewParams] | None = None,
+        draw_label: bool = True,
+        valid_masks: dict[str, np.ndarray] | None = None,
     ) -> LayoutPreviewResult:
         if main_camera not in warped_images:
             raise ValueError("warped_images must include the front camera.")
+        input_masks = valid_masks or {}
         front = warped_images[main_camera]
         height, width = front.shape[:2]
-        front_valid = np.any(front != 0, axis=2)
+        front_valid = valid_mask_for_image(
+            front,
+            input_masks.get(main_camera),
+            main_camera,
+        )
         output = np.zeros_like(front)
         output[front_valid] = front[front_valid]
         side_visible_total = np.zeros((height, width), dtype=bool)
@@ -91,7 +111,16 @@ class FrontPriorityLayoutPreviewRenderer:
                 candidate.side_position,
                 candidate_params.side_shift_px,
             )
-            side_valid = np.any(side != 0, axis=2)
+            side_source_valid = valid_mask_for_image(
+                warped_images[candidate.side_camera],
+                input_masks.get(candidate.side_camera),
+                candidate.side_camera,
+            )
+            side_valid = self.shift_side_image(
+                side_source_valid.astype(np.uint8),
+                candidate.side_position,
+                candidate_params.side_shift_px,
+            ).astype(bool)
             seam_x = self._seam_x_by_row(
                 candidate.shifted_points(candidate_params.side_shift_px, width),
                 height,
@@ -139,7 +168,8 @@ class FrontPriorityLayoutPreviewRenderer:
             crop_x1,
             boundary_count,
         )
-        self._draw_label(cropped, params, pair_candidates)
+        if draw_label:
+            self._draw_label(cropped, params, pair_candidates)
         return LayoutPreviewResult(
             layout_id=params.layout_id,
             image=cropped,

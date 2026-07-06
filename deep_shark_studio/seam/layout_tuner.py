@@ -11,6 +11,12 @@ import cv2
 import numpy as np
 
 from deep_shark_studio.config import CONFIG_DIR, PROJECT_ROOT, file_revision, save_yaml
+from deep_shark_studio.stitching.camera_layout_adjust import (
+    AdjustedWarpResult,
+    CameraAdjustParams,
+    apply_post_warp_camera_adjustments,
+    identity_camera_adjust,
+)
 from deep_shark_studio.stitcher import save_image
 
 from .layout_preview import (
@@ -86,16 +92,6 @@ class PairLayoutParams:
             side_visible_fraction=float(self.side_visible_fraction),
             feather_width_px=int(self.feather_width_px),
         )
-
-    def to_dict(self) -> dict[str, int | float]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class CameraAdjustParams:
-    x_offset_px: int = 0
-    y_offset_px: int = 0
-    scale: float = 1.0
 
     def to_dict(self) -> dict[str, int | float]:
         return asdict(self)
@@ -186,22 +182,6 @@ class LayoutTunerPreviewResult:
     adjusted_warped_images: dict[str, np.ndarray] | None = None
     adjusted_valid_masks: dict[str, np.ndarray] | None = None
     camera_adjust_metadata: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class AdjustedWarpResult:
-    warped_images: dict[str, np.ndarray]
-    valid_masks: dict[str, np.ndarray]
-    transforms: dict[str, np.ndarray]
-    metadata: dict[str, Any]
-
-
-def identity_camera_adjust() -> dict[str, CameraAdjustParams]:
-    return {
-        "front_left": CameraAdjustParams(),
-        "front": CameraAdjustParams(),
-        "front_right": CameraAdjustParams(),
-    }
 
 
 LAYOUT_TUNER_PRESETS: dict[str, LayoutTunerParams] = {
@@ -312,76 +292,6 @@ def normalize_layout_tuner_params(
     return layout_tuner_params_v1_to_v2(params)
 
 
-def apply_post_warp_camera_adjustments(
-    warped_images: dict[str, np.ndarray],
-    valid_masks: dict[str, np.ndarray] | None,
-    camera_adjust: dict[str, CameraAdjustParams],
-) -> AdjustedWarpResult:
-    """Apply preview-only affine x/y/scale adjustment after formal warp."""
-    adjusted: dict[str, np.ndarray] = {}
-    adjusted_masks: dict[str, np.ndarray] = {}
-    transforms: dict[str, np.ndarray] = {}
-    cameras: dict[str, Any] = {}
-    input_masks = valid_masks or {}
-    for camera, image in warped_images.items():
-        params = camera_adjust.get(camera, CameraAdjustParams())
-        mask = input_masks.get(camera)
-        if mask is None:
-            # Temporary runtime-compatible validity heuristic: current formal
-            # warped images use black fill for invalid canvas regions.
-            mask = np.any(image != 0, axis=2)
-        else:
-            mask = mask.astype(bool)
-        height, width = image.shape[:2]
-        center = _valid_bbox_center(mask, width, height)
-        scale = float(np.clip(params.scale, 0.80, 1.20))
-        matrix = _camera_adjust_matrix(
-            center=center,
-            scale=scale,
-            x_offset=int(params.x_offset_px),
-            y_offset=int(params.y_offset_px),
-        )
-        adjusted_image = cv2.warpAffine(
-            image,
-            matrix,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
-        )
-        adjusted_mask = cv2.warpAffine(
-            mask.astype(np.uint8),
-            matrix,
-            (width, height),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        ).astype(bool)
-        adjusted_image[~adjusted_mask] = 0
-        adjusted[camera] = adjusted_image
-        adjusted_masks[camera] = adjusted_mask
-        transforms[camera] = matrix
-        cameras[camera] = {
-            "x_offset_px": int(params.x_offset_px),
-            "y_offset_px": int(params.y_offset_px),
-            "scale": scale,
-            "scale_center": [float(center[0]), float(center[1])],
-            "matrix": matrix.tolist(),
-            "valid_ratio_before": float(np.count_nonzero(mask) / max(1, mask.size)),
-            "valid_ratio_after": float(np.count_nonzero(adjusted_mask) / max(1, adjusted_mask.size)),
-        }
-    return AdjustedWarpResult(
-        warped_images=adjusted,
-        valid_masks=adjusted_masks,
-        transforms=transforms,
-        metadata={
-            "mode": "post_warp_camera_adjustment",
-            "note": "Preview-only affine display adjustment; not camera extrinsics calibration.",
-            "cameras": cameras,
-        },
-    )
-
-
 def layout_tuner_pair_candidates(
     stitch_profile: dict[str, Any],
 ) -> list[LayoutPairCandidate]:
@@ -430,12 +340,13 @@ def render_front_priority_layout_preview(
     pair_candidates: list[LayoutPairCandidate],
     params: LayoutPreviewParamsV2 | LayoutTunerParams | LayoutPreviewParams | None = None,
     vertical_params: VerticalSafetyParams | None = None,
+    valid_masks: dict[str, np.ndarray] | None = None,
 ) -> LayoutTunerPreviewResult:
     """Render one tuner preview from already-warped images."""
     tuner_params = normalize_layout_tuner_params(params)
     adjusted = apply_post_warp_camera_adjustments(
         warped_images,
-        valid_masks=None,
+        valid_masks=valid_masks,
         camera_adjust=tuner_params.camera_adjust or identity_camera_adjust(),
     )
     canvas_height = _front_canvas_height(adjusted.warped_images)
@@ -475,6 +386,7 @@ def save_layout_tuner_candidate(
     params: LayoutPreviewParamsV2 | LayoutTunerParams | LayoutPreviewParams,
     preview: LayoutTunerPreviewResult,
     source: dict[str, Any] | None = None,
+    projection: dict[str, Any] | None = None,
     formal_calibration_path: str | Path | None = None,
 ) -> Path:
     """Save one human-readable layout tuner candidate without config writes."""
@@ -494,8 +406,9 @@ def save_layout_tuner_candidate(
     save_image(masks_dir / "front_preserved_mask.png", _mask_image(preview.front_preserved_mask))
     save_image(masks_dir / "suppressed_side_mask.png", _mask_image(preview.side_suppressed_mask))
     debug_files = _save_adjusted_debug_images(debug_dir, preview)
+    schema_version = 3 if projection else 2
     candidate = {
-        "schema_version": 2,
+        "schema_version": schema_version,
         "candidate_type": "front_priority_layout",
         "profile_id": profile_id,
         "created_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
@@ -539,8 +452,10 @@ def save_layout_tuner_candidate(
             "debug": debug_files,
         },
     }
+    if projection:
+        candidate["projection"] = dict(projection)
     report = {
-        "schema_version": 2,
+        "schema_version": schema_version,
         "candidate_type": "front_priority_layout",
         "layout_id": preview.layout_id,
         "profile_id": profile_id,
@@ -556,9 +471,15 @@ def save_layout_tuner_candidate(
         "notes": [
             "Report-only layout tuner candidate.",
             "Not applied to formal runtime/profile.",
-            "Uses existing perspective/template warped images, not projection candidates.",
+            (
+                "Projection source is recorded in candidate.yaml."
+                if projection
+                else "Uses existing perspective/template warped images, not projection candidates."
+            ),
         ],
     }
+    if projection:
+        report["projection"] = dict(projection)
     save_yaml(directory / "candidate.yaml", candidate)
     save_yaml(directory / "report.yaml", report)
     after = file_revision(calibration_path)
@@ -665,32 +586,6 @@ def _from_vertical_result(
 def _front_canvas_height(warped_images: dict[str, np.ndarray]) -> int | None:
     front = warped_images.get("front")
     return int(front.shape[0]) if front is not None else None
-
-
-def _valid_bbox_center(mask: np.ndarray, width: int, height: int) -> tuple[float, float]:
-    ys, xs = np.where(mask)
-    if xs.size == 0 or ys.size == 0:
-        return ((width - 1) / 2.0, (height - 1) / 2.0)
-    return (
-        float((int(xs.min()) + int(xs.max())) / 2.0),
-        float((int(ys.min()) + int(ys.max())) / 2.0),
-    )
-
-
-def _camera_adjust_matrix(
-    center: tuple[float, float],
-    scale: float,
-    x_offset: int,
-    y_offset: int,
-) -> np.ndarray:
-    cx, cy = center
-    return np.asarray(
-        [
-            [scale, 0.0, cx - scale * cx + float(x_offset)],
-            [0.0, scale, cy - scale * cy + float(y_offset)],
-        ],
-        dtype=np.float32,
-    )
 
 
 def _create_candidate_directory(output_root: Path) -> Path:

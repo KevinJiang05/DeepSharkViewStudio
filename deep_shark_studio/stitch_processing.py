@@ -10,6 +10,8 @@ from typing import Any
 import numpy as np
 
 from .calibration_candidate import CandidatePanoramaProcessor
+from .stitch_runtime_controller import RuntimeStitchController, RuntimeStitchResult
+from .stitch_runtime_modes import RuntimeStitchConfig
 from .stitcher import SurroundStitcher
 
 
@@ -29,6 +31,10 @@ class StitchResult:
     canvas: np.ndarray | None
     elapsed_ms: float
     error: str = ""
+    runtime_mode: str = ""
+    runtime_status: str = ""
+    runtime_warnings: tuple[str, ...] = ()
+    runtime_metrics: dict[str, Any] | None = None
 
 
 class StitchProcessingWorker:
@@ -42,7 +48,7 @@ class StitchProcessingWorker:
         self._pending_request: StitchRequest | None = None
         self._latest_result: StitchResult | None = None
         self._stitcher: (
-            SurroundStitcher | CandidatePanoramaProcessor | None
+            RuntimeStitchController | CandidatePanoramaProcessor | None
         ) = None
         self._config: dict[str, Any] = {}
         self._max_input_width: int | None = None
@@ -67,6 +73,7 @@ class StitchProcessingWorker:
         use_intrinsics: bool,
         processor_mode: str = "template",
         candidate_directory: str | None = None,
+        runtime_config: RuntimeStitchConfig | None = None,
     ) -> None:
         with self._condition:
             self._active_session_id = session_id
@@ -82,10 +89,14 @@ class StitchProcessingWorker:
                     candidate_directory
                 )
             else:
-                self._stitcher = SurroundStitcher(
+                stitcher = SurroundStitcher(
                     self._config,
                     max_input_width=max_input_width,
                     use_intrinsics=use_intrinsics,
+                )
+                self._stitcher = RuntimeStitchController(
+                    stitcher,
+                    runtime_config or RuntimeStitchConfig(),
                 )
             self._pending_request = None
             self._latest_result = None
@@ -145,8 +156,21 @@ class StitchProcessingWorker:
             warped: dict[str, np.ndarray] = {}
             canvas: np.ndarray | None = None
             error = ""
+            runtime_mode = ""
+            runtime_status = ""
+            runtime_warnings: tuple[str, ...] = ()
+            runtime_metrics: dict[str, Any] | None = None
             try:
-                warped, canvas = stitcher.process(request.frames)
+                processed = stitcher.process(request.frames)
+                if isinstance(processed, RuntimeStitchResult):
+                    warped = processed.warped
+                    canvas = processed.canvas
+                    runtime_mode = processed.mode.value
+                    runtime_status = processed.status
+                    runtime_warnings = processed.warnings
+                    runtime_metrics = processed.metrics
+                else:
+                    warped, canvas = processed
             except Exception as exc:
                 error = str(exc)
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
@@ -161,6 +185,10 @@ class StitchProcessingWorker:
                     canvas=canvas,
                     elapsed_ms=elapsed_ms,
                     error=error,
+                    runtime_mode=runtime_mode,
+                    runtime_status=runtime_status,
+                    runtime_warnings=runtime_warnings,
+                    runtime_metrics=runtime_metrics,
                 )
 
 
@@ -181,6 +209,7 @@ class StitchProcessingManager:
         use_intrinsics: bool,
         processor_mode: str = "template",
         candidate_directory: str | None = None,
+        runtime_config: RuntimeStitchConfig | None = None,
     ) -> None:
         self.start()
         self._worker.configure(
@@ -190,6 +219,7 @@ class StitchProcessingManager:
             use_intrinsics,
             processor_mode=processor_mode,
             candidate_directory=candidate_directory,
+            runtime_config=runtime_config,
         )
 
     def submit_latest(self, session_id: int, frames: dict[str, np.ndarray]) -> int:

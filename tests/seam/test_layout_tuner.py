@@ -299,6 +299,37 @@ class LayoutTunerTests(unittest.TestCase):
         after = file_revision(CONFIG_DIR / "calibration.yaml")
         self.assertEqual(before, after)
 
+    def test_candidate_save_with_projection_block_writes_schema_v3(self) -> None:
+        candidates = layout_tuner_pair_candidates(_profile())
+        preview = render_front_priority_layout_preview(
+            _warped_images(),
+            candidates,
+            LayoutTunerParams(),
+        )
+        projection = {
+            "source": "fisheye_rectilinear",
+            "intrinsics_source_path": "projects/calibration_candidates/example/candidate.yaml",
+            "balance": 0.6,
+            "fov_scale": 1.0,
+            "projection_pipeline": "fisheye_rectilinear_then_template_perspective_warp",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output = save_layout_tuner_candidate(
+                Path(directory),
+                "triple_front_panorama",
+                LayoutTunerParams(),
+                preview,
+                source={"mode": "unit_test"},
+                projection=projection,
+            )
+            data = yaml.safe_load((output / "candidate.yaml").read_text(encoding="utf-8"))
+            report = yaml.safe_load((output / "report.yaml").read_text(encoding="utf-8"))
+
+            self.assertEqual(3, data["schema_version"])
+            self.assertEqual(projection, data["projection"])
+            self.assertEqual(3, report["schema_version"])
+            self.assertEqual(projection, report["projection"])
+
 
 if __name__ == "__main__":
     unittest.main()
