@@ -6,6 +6,7 @@ import sys
 import time
 import traceback
 import shutil
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
@@ -103,6 +104,7 @@ from deep_shark_studio.project import backup_configs, export_runtime_config, loa
 from deep_shark_studio.project_package import (
     activate_project_package,
     export_project_package,
+    load_active_project_runtime_defaults,
     validate_project_package,
 )
 from deep_shark_studio.qgc.video_output import FfmpegVideoSink, VideoOutputConfig
@@ -132,6 +134,7 @@ from deep_shark_studio.stitch_runtime_modes import (
     ProjectionSource,
     RuntimeStitchConfig,
     StitchRuntimeMode,
+    resolve_effective_runtime_status,
 )
 from deep_shark_studio.stitcher import SurroundStitcher, load_images_from_directory, save_image
 from deep_shark_studio.projection import (
@@ -176,6 +179,7 @@ from deep_shark_studio.topology import (
 
 CAMERA_KEYS = ["front_left", "front_right", "front", "behind", "left", "right"]
 SOURCE_TYPES = ["image_dir", "usb", "video_file", "rtsp"]
+LIVE_FRAME_MAX_AGE_SECONDS = 3.0
 
 ZH_CN = {
     "Language": "语言",
@@ -693,6 +697,25 @@ class PreviewContentMode(Enum):
     STOPPED = "stopped"
     LIVE = "live"
     STILL = "still"
+
+
+class LiveHealthState(Enum):
+    STOPPED = "Stopped"
+    STARTING = "Starting"
+    LIVE = "Live"
+    DEGRADED = "Degraded"
+    FAILED = "Failed"
+    STILL = "Still"
+
+
+@dataclass(frozen=True)
+class RestoredProjectRuntimeSelection:
+    runtime_config: RuntimeStitchConfig
+    live_stitch_mode: str
+    live_candidate_directory: Path | None
+    runtime_layout_candidate: LayoutRuntimeCandidate | None
+    far_field_layout_candidate: FarFieldLayoutRuntimeCandidate | None
+    runtime_fisheye_intrinsics_source: FisheyeIntrinsicsRuntimeSource | None
 
 
 class NoWheelSpinBox(QSpinBox):
@@ -1656,6 +1679,7 @@ class MainWindow(QMainWindow):
         self.last_stitch_error_result_id = 0
         self.preview_layout_mode = PreviewLayoutMode.GRID
         self.preview_content_mode = PreviewContentMode.STOPPED
+        self.live_health_state = LiveHealthState.STOPPED
         self.focused_camera_id: str | None = None
         self._applying_view_state = False
         self._syncing_camera_widgets = False
@@ -1664,6 +1688,8 @@ class MainWindow(QMainWindow):
         self.source_contract_log_messages: set[str] = set()
         self.last_stitch_ui_error = ""
         self.last_runtime_stitch_status = ""
+        self.last_runtime_result_session_id = 0
+        self.last_runtime_result_configuration_id = 0
         self.last_runtime_warnings: list[str] = []
         self.last_runtime_metrics: dict[str, Any] | None = None
         self.last_runtime_warning_log_text = ""
@@ -1676,11 +1702,14 @@ class MainWindow(QMainWindow):
                 )
             )
         )
-        self.live_stitch_mode = (
-            "candidate"
-            if self.live_candidate_directory is not None
-            else "template"
+        # A discovered B-2 candidate is available for an explicit advanced
+        # selection; it must never override the formal Far-field default.
+        self.live_stitch_mode = "template"
+        active_runtime_logs = self.restore_active_project_runtime_defaults(
+            discovered_b2_candidate=self.live_candidate_directory,
         )
+        self.minimum_stitch_result_request_id = 0
+        self.awaiting_current_frame_set_result = False
         self._candidate_ui_cache_path: Path | None = None
         self._candidate_ui_cache: dict[str, Any] = {}
         self.b2_candidate_solver_launcher: (
@@ -1702,6 +1731,8 @@ class MainWindow(QMainWindow):
         self.warped_views: dict[str, ImageView] = {}
 
         self._build_ui()
+        for level, message in active_runtime_logs:
+            self.log(message, level=level)
         self.fit_initial_window_to_available_screen()
         self.refresh_camera_count()
         self.statusBar().showMessage(self.t("Ready"))
@@ -1804,6 +1835,211 @@ class MainWindow(QMainWindow):
     def current_stitch_profile(self) -> dict[str, Any]:
         return active_stitch_profile(self.calibration_config)
 
+    @staticmethod
+    def _default_project_runtime_selection(
+        discovered_b2_candidate: Path | None,
+    ) -> RestoredProjectRuntimeSelection:
+        return RestoredProjectRuntimeSelection(
+            runtime_config=RuntimeStitchConfig(),
+            live_stitch_mode="template",
+            live_candidate_directory=discovered_b2_candidate,
+            runtime_layout_candidate=None,
+            far_field_layout_candidate=None,
+            runtime_fisheye_intrinsics_source=None,
+        )
+
+    def _stage_active_project_runtime_selection(
+        self,
+        defaults: Any,
+    ) -> RestoredProjectRuntimeSelection:
+        """Load every referenced runtime asset before changing live UI state."""
+        profile_id = self.current_runtime_profile_id()
+        calibration_path = CONFIG_DIR / "calibration.yaml"
+
+        far_candidate = None
+        if defaults.far_field_layout_candidate is not None:
+            far_candidate = load_far_field_layout_candidate(
+                defaults.far_field_layout_candidate,
+                expected_profile_id=profile_id,
+                formal_calibration_path=calibration_path,
+            )
+
+        near_candidate = None
+        if defaults.near_field_layout_candidate is not None:
+            near_candidate = load_layout_candidate_for_runtime(
+                defaults.near_field_layout_candidate,
+                expected_profile_id=profile_id,
+                formal_calibration_path=calibration_path,
+            )
+
+        fisheye_source = None
+        if defaults.fisheye_intrinsics_source is not None:
+            fisheye_source = load_fisheye_intrinsics_source(
+                defaults.fisheye_intrinsics_source,
+            )
+
+        runtime_mode = StitchRuntimeMode(str(defaults.default_stitch_mode))
+        projection_source = ProjectionSource(
+            str(defaults.near_field_projection_source)
+        )
+        use_far_field_custom = bool(defaults.use_far_field_custom)
+        b2_candidate_path = (
+            Path(defaults.b2_candidate)
+            if defaults.b2_candidate is not None
+            else None
+        )
+        b2_candidate_directory = (
+            b2_candidate_path.parent
+            if b2_candidate_path is not None
+            and b2_candidate_path.name == "candidate.yaml"
+            else b2_candidate_path
+        )
+
+        if runtime_mode == StitchRuntimeMode.NEAR_FIELD and near_candidate is None:
+            raise RuntimeError(
+                "Active project Near-field default has no loaded Near-field candidate."
+            )
+        if (
+            near_candidate is not None
+            and near_candidate.projection.source != projection_source
+        ):
+            raise RuntimeError(
+                "Active project Near-field projection source does not match its candidate."
+            )
+        if (
+            projection_source
+            == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE
+            and fisheye_source is None
+        ):
+            raise RuntimeError(
+                "Active project fisheye projection has no loaded intrinsics source."
+            )
+        if use_far_field_custom:
+            if far_candidate is None:
+                raise RuntimeError(
+                    "Active project Far-field Custom default has no loaded candidate."
+                )
+            if (
+                far_candidate.projection_source
+                != B2_FAR_FIELD_PROJECTION_SOURCE
+                or b2_candidate_directory is None
+            ):
+                raise RuntimeError(
+                    "Active project Far-field Custom default is not backed by B-2 projection."
+                )
+
+        balance = 0.6
+        fov_scale = 1.0
+        if near_candidate is not None:
+            balance = near_candidate.projection.balance
+            fov_scale = near_candidate.projection.fov_scale
+
+        requested_strategy = str(defaults.live_stitch_strategy)
+        if requested_strategy not in {"candidate", "template"}:
+            raise RuntimeError(
+                f"Unsupported active project live stitch strategy: {requested_strategy!r}."
+            )
+        # Candidate mode is the explicit advanced B-2 view. Near-field and
+        # Far-field Custom have their own formal processors and must use the
+        # template worker entry point so the UI and worker cannot diverge.
+        live_stitch_mode = (
+            "candidate"
+            if requested_strategy == "candidate"
+            and runtime_mode == StitchRuntimeMode.FAR_FIELD
+            and not use_far_field_custom
+            and b2_candidate_directory is not None
+            else "template"
+        )
+
+        return RestoredProjectRuntimeSelection(
+            runtime_config=RuntimeStitchConfig(
+                mode=runtime_mode,
+                projection_source=projection_source,
+                layout_candidate_path=(
+                    near_candidate.path if near_candidate is not None else None
+                ),
+                use_far_field_custom_layout=use_far_field_custom,
+                far_field_layout_candidate_path=(
+                    far_candidate.path if far_candidate is not None else None
+                ),
+                projection_intrinsics_source_path=(
+                    fisheye_source.path if fisheye_source is not None else None
+                ),
+                fisheye_balance=balance,
+                fisheye_fov_scale=fov_scale,
+                auto_enabled=False,
+            ).normalized(),
+            live_stitch_mode=live_stitch_mode,
+            live_candidate_directory=b2_candidate_directory,
+            runtime_layout_candidate=near_candidate,
+            far_field_layout_candidate=far_candidate,
+            runtime_fisheye_intrinsics_source=fisheye_source,
+        )
+
+    def _commit_project_runtime_selection(
+        self,
+        selection: RestoredProjectRuntimeSelection,
+    ) -> None:
+        self.runtime_stitch_config = selection.runtime_config
+        self.live_stitch_mode = selection.live_stitch_mode
+        self.live_candidate_directory = selection.live_candidate_directory
+        self.runtime_layout_candidate = selection.runtime_layout_candidate
+        self.far_field_layout_candidate = selection.far_field_layout_candidate
+        self.runtime_fisheye_intrinsics_source = (
+            selection.runtime_fisheye_intrinsics_source
+        )
+        self.layout_tuner_fisheye_intrinsics_source = (
+            selection.runtime_fisheye_intrinsics_source
+        )
+
+    def restore_active_project_runtime_defaults(
+        self,
+        *,
+        discovered_b2_candidate: Path | None,
+    ) -> tuple[tuple[str, str], ...]:
+        """Restore active-package runtime state, or fail closed as one unit."""
+        safe_default = self._default_project_runtime_selection(
+            discovered_b2_candidate,
+        )
+        try:
+            defaults = load_active_project_runtime_defaults(
+                active_config_dir=CONFIG_DIR,
+            )
+            selection = (
+                safe_default
+                if defaults is None
+                else self._stage_active_project_runtime_selection(defaults)
+            )
+        except Exception as exc:
+            # Startup must remain usable when a persisted package or one of its
+            # candidate files was removed/tampered with after activation. Do
+            # not retain even the candidates that loaded before the failure.
+            self._commit_project_runtime_selection(
+                self._default_project_runtime_selection(None)
+            )
+            return (
+                (
+                    "ERROR",
+                    "Active project runtime restore failed; using Far-field "
+                    f"Default/template: {exc}",
+                ),
+            )
+
+        self._commit_project_runtime_selection(selection)
+        if defaults is None:
+            return ()
+        return (
+            (
+                "INFO",
+                "Active project runtime restored: "
+                f"manifest={defaults.manifest_path}, "
+                f"mode={selection.runtime_config.mode.value}, "
+                f"strategy={selection.live_stitch_mode}, "
+                "projection="
+                f"{selection.runtime_config.projection_source.value}",
+            ),
+        )
+
     def live_stitcher_options(self) -> tuple[int | None, bool]:
         max_width = int(self.performance_config.get("max_input_width", 960))
         if max_width <= 0:
@@ -1811,56 +2047,164 @@ class MainWindow(QMainWindow):
         return max_width, bool(self.performance_config.get("use_intrinsics", False))
 
     def bump_preview_session(self) -> int:
-        self.preview_session_id += 1
+        return self._set_preview_session(self.preview_session_id + 1)
+
+    def _set_preview_session(self, session_id: int) -> int:
+        self.preview_session_id = int(session_id)
         self.displayed_stitch_result_id = 0
         self.last_stitch_error_result_id = 0
         self.last_frame_signature = ()
+        self.minimum_stitch_result_request_id = 0
+        self.awaiting_current_frame_set_result = False
+        self.last_stitch_ui_error = ""
+        self.last_runtime_stitch_status = ""
+        self.last_runtime_result_session_id = 0
+        self.last_runtime_result_configuration_id = 0
+        self.last_runtime_warnings = []
+        self.last_runtime_metrics = None
         return self.preview_session_id
 
-    def configure_live_stitch_processor(self) -> None:
-        max_width, use_intrinsics = self.live_stitcher_options()
-        processor_mode = self.live_stitch_mode
-        runtime_config = self.runtime_stitch_config
+    def effective_live_processor_mode(
+        self,
+        runtime_config: RuntimeStitchConfig | None = None,
+        live_stitch_mode: str | None = None,
+    ) -> str:
+        config = runtime_config or self.runtime_stitch_config
+        requested_mode = live_stitch_mode or self.live_stitch_mode
         if (
-            runtime_config.mode == StitchRuntimeMode.NEAR_FIELD
-            or runtime_config.use_far_field_custom_layout
+            config.mode != StitchRuntimeMode.FAR_FIELD
+            or config.use_far_field_custom_layout
         ):
-            processor_mode = "template"
+            return "template"
+        return requested_mode
+
+    def configure_live_stitch_processor(
+        self,
+        *,
+        session_id: int | None = None,
+        runtime_config: RuntimeStitchConfig | None = None,
+        live_stitch_mode: str | None = None,
+    ) -> Any:
+        max_width, use_intrinsics = self.live_stitcher_options()
+        target_session_id = (
+            self.preview_session_id if session_id is None else int(session_id)
+        )
+        target_runtime_config = runtime_config or self.runtime_stitch_config
+        processor_mode = self.effective_live_processor_mode(
+            target_runtime_config,
+            live_stitch_mode,
+        )
         candidate_directory = (
             str(self.live_candidate_directory)
             if processor_mode == "candidate"
             and self.live_candidate_directory is not None
             else None
         )
-        try:
-            self.stitch_processor.configure(
-                self.preview_session_id,
-                self.calibration_config,
-                max_width,
-                use_intrinsics,
-                processor_mode=processor_mode,
-                candidate_directory=candidate_directory,
-                candidate_use_opencl=self.b2_candidate_opencl_enabled(),
-                runtime_config=runtime_config,
+        self.stitch_processor.configure(
+            target_session_id,
+            self.calibration_config,
+            max_width,
+            use_intrinsics,
+            processor_mode=processor_mode,
+            candidate_directory=candidate_directory,
+            candidate_use_opencl=self.b2_candidate_opencl_enabled(),
+            runtime_config=target_runtime_config,
+        )
+        return self.stitch_processor.state()
+
+    def commit_live_runtime_selection(
+        self,
+        runtime_config: RuntimeStitchConfig,
+        live_stitch_mode: str,
+        *,
+        reason: str,
+    ) -> bool:
+        """Atomically apply a UI selection to the live worker when active."""
+        processor_mode = self.effective_live_processor_mode(
+            runtime_config,
+            live_stitch_mode,
+        )
+        if self.preview_content_mode == PreviewContentMode.LIVE:
+            next_session_id = self.preview_session_id + 1
+            try:
+                self.configure_live_stitch_processor(
+                    session_id=next_session_id,
+                    runtime_config=runtime_config,
+                    live_stitch_mode=processor_mode,
+                )
+            except Exception as exc:
+                self.last_stitch_ui_error = str(exc).splitlines()[0][:220]
+                self.live_health_state = LiveHealthState.FAILED
+                self.log(
+                    f"Runtime reconfiguration failed ({reason}): {exc}",
+                    level="ERROR",
+                )
+                self.update_preview_status_summary()
+                return False
+            self._set_preview_session(next_session_id)
+
+        self.runtime_stitch_config = runtime_config.normalized()
+        self.live_stitch_mode = processor_mode
+        self.last_runtime_warning_log_text = ""
+        self.warped.clear()
+        self.canvas = None
+        if hasattr(self, "canvas_view"):
+            self.canvas_view.set_placeholder(
+                "运行链路已切换，等待当前 session 的新拼接结果"
             )
-        except Exception as exc:
-            if processor_mode != "candidate":
-                raise
-            self.log(
-                f"Candidate live processor unavailable; falling back to "
-                f"template: {exc}",
-                level="ERROR",
-            )
-            self.live_stitch_mode = "template"
-            self.stitch_processor.configure(
-                self.preview_session_id,
-                self.calibration_config,
-                max_width,
-                use_intrinsics,
-                processor_mode="template",
-                runtime_config=RuntimeStitchConfig(),
-            )
-            self.apply_live_stitch_mode_controls()
+        for view in self.warped_views.values():
+            view.set_placeholder("运行链路已切换，等待新结果")
+        self.last_process_time = 0.0
+        self.apply_live_stitch_mode_controls()
+        self.refresh_stitch_runtime_controls()
+        self.update_live_health_state()
+        self.update_preview_status_summary()
+        return True
+
+    def effective_runtime_status(self) -> str:
+        if (
+            self.last_runtime_result_session_id == self.preview_session_id
+            and self.last_runtime_stitch_status
+        ):
+            return self.last_runtime_stitch_status
+        if self.preview_content_mode == PreviewContentMode.LIVE:
+            state = self.stitch_processor.state()
+            if (
+                state.configured
+                and state.session_id == self.preview_session_id
+                and state.runtime_status
+            ):
+                return state.runtime_status
+        processor_mode = (
+            "template"
+            if self.preview_content_mode == PreviewContentMode.STILL
+            else self.effective_live_processor_mode()
+        )
+        return resolve_effective_runtime_status(
+            self.runtime_stitch_config,
+            processor_mode=processor_mode,
+        )
+
+    def effective_projection_source(self) -> str:
+        if self.preview_content_mode == PreviewContentMode.LIVE:
+            state = self.stitch_processor.state()
+            if (
+                state.configured
+                and state.session_id == self.preview_session_id
+                and state.projection_source
+            ):
+                return state.projection_source
+        runtime_status = self.effective_runtime_status()
+        if runtime_status == "b2_candidate_view":
+            return "b2_candidate_projection"
+        if (
+            runtime_status == "far_field_custom"
+            and self.far_field_layout_candidate is not None
+        ):
+            return self.far_field_layout_candidate.projection_source
+        if runtime_status == "near_field_fisheye_rectilinear":
+            return ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value
+        return ProjectionSource.CURRENT_PERSPECTIVE.value
 
     def b2_candidate_opencl_enabled(self) -> bool:
         if hasattr(self, "b2_candidate_opencl"):
@@ -1894,6 +2238,14 @@ class MainWindow(QMainWindow):
             )
 
     def load_runtime_layout_candidate_path(self, path: str | Path) -> LayoutRuntimeCandidate:
+        was_active_near_field = (
+            self.preview_content_mode == PreviewContentMode.LIVE
+            and self.effective_runtime_status().startswith("near_field_")
+        )
+        previous_candidate = self.runtime_layout_candidate
+        previous_runtime_source = self.runtime_fisheye_intrinsics_source
+        previous_tuner_source = self.layout_tuner_fisheye_intrinsics_source
+        previous_config = self.runtime_stitch_config
         candidate = load_layout_candidate_for_runtime(
             Path(path),
             expected_profile_id=self.current_runtime_profile_id(),
@@ -1920,17 +2272,31 @@ class MainWindow(QMainWindow):
             fisheye_fov_scale=projection.fov_scale,
             auto_enabled=self.runtime_stitch_config.auto_enabled,
         )
-        self.refresh_stitch_runtime_controls()
-        self.update_preview_status_summary()
+        if was_active_near_field and not self.commit_live_runtime_selection(
+            self.runtime_stitch_config,
+            self.live_stitch_mode,
+            reason="replace active Near-field candidate",
+        ):
+            self.runtime_layout_candidate = previous_candidate
+            self.runtime_fisheye_intrinsics_source = previous_runtime_source
+            self.layout_tuner_fisheye_intrinsics_source = previous_tuner_source
+            self.runtime_stitch_config = previous_config
+            self.refresh_stitch_runtime_controls()
+            raise RuntimeError(self.last_stitch_ui_error)
+        if not was_active_near_field:
+            self.refresh_stitch_runtime_controls()
+            self.update_preview_status_summary()
         self.log(f"Loaded runtime layout candidate: {candidate.path}")
         return candidate
 
     def clear_runtime_layout_candidate(self) -> None:
+        previous_candidate = self.runtime_layout_candidate
+        previous_config = self.runtime_stitch_config
         self.runtime_layout_candidate = None
         mode = self.runtime_stitch_config.mode
         if mode == StitchRuntimeMode.NEAR_FIELD:
             mode = StitchRuntimeMode.FAR_FIELD
-        self.runtime_stitch_config = RuntimeStitchConfig(
+        next_config = RuntimeStitchConfig(
             mode=mode,
             projection_source=ProjectionSource.CURRENT_PERSPECTIVE,
             layout_candidate_path=None,
@@ -1941,8 +2307,14 @@ class MainWindow(QMainWindow):
             fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
             auto_enabled=False,
         )
-        self.refresh_stitch_runtime_controls()
-        self.update_preview_status_summary()
+        if not self.commit_live_runtime_selection(
+            next_config,
+            self.live_stitch_mode,
+            reason="clear Near-field candidate",
+        ):
+            self.runtime_layout_candidate = previous_candidate
+            self.runtime_stitch_config = previous_config
+            self.refresh_stitch_runtime_controls()
 
     def choose_far_field_layout_candidate(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1966,6 +2338,12 @@ class MainWindow(QMainWindow):
         self,
         path: str | Path,
     ) -> FarFieldLayoutRuntimeCandidate:
+        was_active_far_custom = (
+            self.preview_content_mode == PreviewContentMode.LIVE
+            and self.effective_runtime_status() == "far_field_custom"
+        )
+        previous_candidate = self.far_field_layout_candidate
+        previous_config = self.runtime_stitch_config
         candidate = load_far_field_layout_candidate(
             Path(path),
             expected_profile_id=self.current_runtime_profile_id(),
@@ -1984,14 +2362,26 @@ class MainWindow(QMainWindow):
         )
         if hasattr(self, "far_field_custom_layout_check"):
             self.far_field_custom_layout_check.setChecked(True)
-        self.refresh_stitch_runtime_controls()
-        self.update_preview_status_summary()
+        if was_active_far_custom and not self.commit_live_runtime_selection(
+            self.runtime_stitch_config,
+            self.live_stitch_mode,
+            reason="replace active Far-field candidate",
+        ):
+            self.far_field_layout_candidate = previous_candidate
+            self.runtime_stitch_config = previous_config
+            self.refresh_stitch_runtime_controls()
+            raise RuntimeError(self.last_stitch_ui_error)
+        if not was_active_far_custom:
+            self.refresh_stitch_runtime_controls()
+            self.update_preview_status_summary()
         self.log(f"Loaded Far-field layout candidate: {candidate.path}")
         return candidate
 
     def clear_far_field_layout_candidate(self) -> None:
+        previous_candidate = self.far_field_layout_candidate
+        previous_config = self.runtime_stitch_config
         self.far_field_layout_candidate = None
-        self.runtime_stitch_config = RuntimeStitchConfig(
+        next_config = RuntimeStitchConfig(
             mode=self.runtime_stitch_config.mode,
             projection_source=self.runtime_stitch_config.projection_source,
             layout_candidate_path=self.runtime_stitch_config.layout_candidate_path,
@@ -2002,8 +2392,14 @@ class MainWindow(QMainWindow):
             fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
             auto_enabled=self.runtime_stitch_config.auto_enabled,
         )
-        self.refresh_stitch_runtime_controls()
-        self.update_preview_status_summary()
+        if not self.commit_live_runtime_selection(
+            next_config,
+            self.live_stitch_mode,
+            reason="clear Far-field candidate",
+        ):
+            self.far_field_layout_candidate = previous_candidate
+            self.runtime_stitch_config = previous_config
+            self.refresh_stitch_runtime_controls()
 
     def choose_runtime_fisheye_intrinsics_source(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2023,6 +2419,14 @@ class MainWindow(QMainWindow):
                 str(exc),
             )
             return
+        was_active_fisheye = (
+            self.preview_content_mode == PreviewContentMode.LIVE
+            and self.effective_runtime_status()
+            == "near_field_fisheye_rectilinear"
+        )
+        previous_runtime_source = self.runtime_fisheye_intrinsics_source
+        previous_tuner_source = self.layout_tuner_fisheye_intrinsics_source
+        previous_config = self.runtime_stitch_config
         self.runtime_fisheye_intrinsics_source = source
         self.layout_tuner_fisheye_intrinsics_source = source
         self.runtime_stitch_config = RuntimeStitchConfig(
@@ -2040,16 +2444,38 @@ class MainWindow(QMainWindow):
             else self.runtime_stitch_config.fisheye_fov_scale,
             auto_enabled=self.runtime_stitch_config.auto_enabled,
         )
+        if was_active_fisheye and not self.commit_live_runtime_selection(
+            self.runtime_stitch_config,
+            self.live_stitch_mode,
+            reason="replace active fisheye intrinsics",
+        ):
+            self.runtime_fisheye_intrinsics_source = previous_runtime_source
+            self.layout_tuner_fisheye_intrinsics_source = previous_tuner_source
+            self.runtime_stitch_config = previous_config
+            QMessageBox.warning(
+                self,
+                self.t("Fisheye intrinsics source load failed"),
+                self.last_stitch_ui_error,
+            )
         self.refresh_stitch_runtime_controls()
         self.update_preview_status_summary()
 
     def clear_runtime_fisheye_intrinsics_source(self) -> None:
+        previous_runtime_source = self.runtime_fisheye_intrinsics_source
+        previous_tuner_source = self.layout_tuner_fisheye_intrinsics_source
+        previous_config = self.runtime_stitch_config
         self.runtime_fisheye_intrinsics_source = None
         self.layout_tuner_fisheye_intrinsics_source = None
+        self.layout_tuner_candidate_dir = None
+        self.layout_tuner_source_info = {}
+        self.layout_tuner_projection_metadata = {}
+        self.layout_tuner_warped = {}
+        self.layout_tuner_valid_masks = {}
+        self.layout_tuner_preview_result = None
         projection = self.runtime_stitch_config.projection_source
         if projection == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE:
             projection = ProjectionSource.CURRENT_PERSPECTIVE
-        self.runtime_stitch_config = RuntimeStitchConfig(
+        next_config = RuntimeStitchConfig(
             mode=self.runtime_stitch_config.mode,
             projection_source=projection,
             layout_candidate_path=self.runtime_stitch_config.layout_candidate_path,
@@ -2060,8 +2486,15 @@ class MainWindow(QMainWindow):
             fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
             auto_enabled=self.runtime_stitch_config.auto_enabled,
         )
-        self.refresh_stitch_runtime_controls()
-        self.update_preview_status_summary()
+        if not self.commit_live_runtime_selection(
+            next_config,
+            self.live_stitch_mode,
+            reason="clear fisheye intrinsics",
+        ):
+            self.runtime_fisheye_intrinsics_source = previous_runtime_source
+            self.layout_tuner_fisheye_intrinsics_source = previous_tuner_source
+            self.runtime_stitch_config = previous_config
+            self.refresh_stitch_runtime_controls()
 
     def open_runtime_layout_candidate_folder(self) -> None:
         if self.runtime_layout_candidate is not None:
@@ -2240,16 +2673,16 @@ class MainWindow(QMainWindow):
                 self.t("Stitch Runtime Mode"),
                 self.t("Auto stitch runtime mode is not implemented; falling back to Far-field."),
             )
-        if mode == StitchRuntimeMode.NEAR_FIELD and self.live_stitch_mode == "candidate":
-            self.live_stitch_mode = "template"
-            self.apply_live_stitch_mode_controls()
+        target_live_stitch_mode = self.live_stitch_mode
+        if mode == StitchRuntimeMode.NEAR_FIELD and target_live_stitch_mode == "candidate":
+            target_live_stitch_mode = "template"
             self.log(
                 self.t(
                     "Near-field runtime uses current perspective warp; experimental candidate stitch was switched back to template."
                 )
             )
         balance, fov_scale = self.selected_runtime_fisheye_params()
-        self.runtime_stitch_config = RuntimeStitchConfig(
+        next_runtime_config = RuntimeStitchConfig(
             mode=mode,
             projection_source=projection,
             layout_candidate_path=(
@@ -2272,20 +2705,19 @@ class MainWindow(QMainWindow):
             fisheye_fov_scale=fov_scale,
             auto_enabled=False,
         )
-        self.last_runtime_warning_log_text = ""
-        self.refresh_stitch_runtime_controls()
-        self.update_preview_status_summary()
-        if self.preview_content_mode == PreviewContentMode.LIVE:
-            self.bump_preview_session()
-            try:
-                self.configure_live_stitch_processor()
-            except Exception as exc:
-                QMessageBox.warning(self, self.t("Stitch Runtime Mode"), str(exc))
-                return
-            self.warped.clear()
-            self.canvas = None
-            self.last_process_time = 0.0
-        elif self.preview_content_mode == PreviewContentMode.STILL and self.frames:
+        if not self.commit_live_runtime_selection(
+            next_runtime_config,
+            target_live_stitch_mode,
+            reason="runtime apply",
+        ):
+            QMessageBox.warning(
+                self,
+                self.t("Stitch Runtime Mode"),
+                self.last_stitch_ui_error,
+            )
+            self.refresh_stitch_runtime_controls()
+            return
+        if self.preview_content_mode == PreviewContentMode.STILL and self.frames:
             self._process_and_render_frames("Static preview")
         if self.preview_layout_mode != PreviewLayoutMode.STITCHED:
             self.statusBar().showMessage(
@@ -2437,6 +2869,8 @@ class MainWindow(QMainWindow):
         )
         result = controller.process(frames)
         self.last_runtime_stitch_status = result.status
+        self.last_runtime_result_session_id = self.preview_session_id
+        self.last_runtime_result_configuration_id = 0
         self.last_runtime_warnings = list(result.warnings)
         self.last_runtime_metrics = result.metrics
         return result.warped, result.canvas, list(result.warnings)
@@ -2536,6 +2970,7 @@ class MainWindow(QMainWindow):
             )
             self.language_combo.blockSignals(False)
             return
+        self.stop_qgc_output_service()
         self.stop_live_preview()
         self.camera_rows.clear()
         self.camera_views.clear()
@@ -2616,7 +3051,7 @@ class MainWindow(QMainWindow):
         source_toolbar.addStretch(1)
         view_toolbar.addWidget(self.back_to_grid_button)
         view_toolbar.addWidget(self.candidate_stitch_button)
-        self.template_stitch_button.setVisible(False)
+        view_toolbar.addWidget(self.template_stitch_button)
         view_toolbar.addWidget(self.stitch_strategy_label)
         view_toolbar.addWidget(self.preview_mode_label)
         view_toolbar.addWidget(self.input_path_label, 1)
@@ -3456,7 +3891,9 @@ class MainWindow(QMainWindow):
         frame_ages: dict[str, float | None] = {}
         active = set(active_topology_camera_keys(self.calibration_config))
         if self.preview_content_mode == PreviewContentMode.LIVE:
-            latest_frames, snapshots = self.stream_manager.latest_frames()
+            latest_frames, snapshots = self.stream_manager.latest_frames(
+                max_frame_age_seconds=LIVE_FRAME_MAX_AGE_SECONDS,
+            )
             frames = {
                 key: frame
                 for key, frame in latest_frames.items()
@@ -4913,6 +5350,7 @@ class MainWindow(QMainWindow):
 
     def set_preview_content_mode(self, mode: PreviewContentMode) -> None:
         self.preview_content_mode = mode
+        self.update_live_health_state()
         self.apply_preview_view_state()
 
     def on_raw_view_double_clicked(self, camera_id: str) -> None:
@@ -4968,6 +5406,73 @@ class MainWindow(QMainWindow):
         camera = self.camera_config.get("cameras", {}).get(camera_id, {})
         return str(camera.get("display_name", camera_id))
 
+    def update_live_health_state(self) -> LiveHealthState:
+        if self.preview_content_mode == PreviewContentMode.STILL:
+            state = LiveHealthState.STILL
+        elif self.preview_content_mode == PreviewContentMode.STOPPED:
+            still_exiting = any(
+                snapshot.thread_alive
+                for snapshot in self.stream_snapshots.values()
+            )
+            state = (
+                LiveHealthState.FAILED
+                if still_exiting
+                else LiveHealthState.STOPPED
+            )
+        else:
+            active_keys = self.active_camera_keys()[:4]
+            now = time.time()
+            fresh_keys = {
+                key
+                for key in active_keys
+                if key in self.frames
+                and (snapshot := self.stream_snapshots.get(key)) is not None
+                and snapshot.status == STREAM_LIVE
+                and snapshot.frame_timestamp > 0.0
+                and now - snapshot.frame_timestamp <= LIVE_FRAME_MAX_AGE_SECONDS
+            }
+            statuses = {
+                key: self.stream_snapshots[key].status
+                for key in active_keys
+                if key in self.stream_snapshots
+            }
+            stale_live_stream = any(
+                snapshot.status == STREAM_LIVE
+                and snapshot.frame_timestamp > 0.0
+                and now - snapshot.frame_timestamp > LIVE_FRAME_MAX_AGE_SECONDS
+                for key, snapshot in self.stream_snapshots.items()
+                if key in active_keys
+            )
+            if self.last_stitch_ui_error:
+                state = LiveHealthState.FAILED
+            elif active_keys and len(fresh_keys) == len(active_keys):
+                state = LiveHealthState.LIVE
+            elif fresh_keys:
+                state = LiveHealthState.DEGRADED
+            elif any(
+                status in {STREAM_FAILED, STREAM_STOPPING, STREAM_STOPPED}
+                for status in statuses.values()
+            ) or stale_live_stream:
+                state = LiveHealthState.FAILED
+            elif not active_keys:
+                state = LiveHealthState.FAILED
+            else:
+                state = LiveHealthState.STARTING
+        self.live_health_state = state
+        return state
+
+    def runtime_configuration_pending(self) -> bool:
+        if self.preview_content_mode != PreviewContentMode.LIVE:
+            return False
+        state = self.stitch_processor.state()
+        if not state.configured or state.session_id != self.preview_session_id:
+            return False
+        desired = resolve_effective_runtime_status(
+            self.runtime_stitch_config,
+            processor_mode=self.effective_live_processor_mode(),
+        )
+        return desired != state.runtime_status
+
     def preview_mode_text(self) -> str:
         if self.preview_content_mode == PreviewContentMode.STOPPED:
             return self.t("Live preview stopped")
@@ -5003,7 +5508,7 @@ class MainWindow(QMainWindow):
         return candidate
 
     def calibration_candidate_state(self) -> str:
-        if self.live_stitch_mode != "candidate":
+        if self.effective_runtime_status() != "b2_candidate_view":
             origin = self.current_stitch_profile().get(
                 "calibration_origin",
                 {},
@@ -5036,6 +5541,17 @@ class MainWindow(QMainWindow):
             warnings.append(f"最近一次拼接失败：{self.last_stitch_ui_error}")
         warnings.extend(self.last_runtime_warnings)
         warnings.extend(self.runtime_stitch_config.runtime_warnings())
+        if self.runtime_configuration_pending():
+            warnings.append("运行配置有待应用；当前结果仍来自已配置 worker")
+        state = self.stitch_processor.state()
+        if (
+            self.last_runtime_result_session_id == self.preview_session_id
+            and self.last_runtime_stitch_status
+            and state.configured
+            and state.session_id == self.preview_session_id
+            and state.runtime_status != self.last_runtime_stitch_status
+        ):
+            warnings.append("worker 配置状态与最近结果状态不一致")
         candidate = self.current_candidate_metadata()
         if self.calibration_candidate_state() == "experimental":
             warnings.append("当前候选为 experimental，仅供诊断")
@@ -5045,7 +5561,7 @@ class MainWindow(QMainWindow):
             warnings.append(f"候选仍有 {len(quality_issues)} 项采样质量风险")
         panorama = candidate.get("virtual_panorama") or {}
         if (
-            self.live_stitch_mode == "candidate"
+            self.effective_runtime_status() == "b2_candidate_view"
             and "rotation_only" in str(panorama.get("projection", ""))
         ):
             warnings.append("三台相机非共光心：远景优先，近景可能重影")
@@ -5062,14 +5578,22 @@ class MainWindow(QMainWindow):
             return "实时预览已停止。当前布局偏好已保留，启动后才会继续刷新。"
         if self.preview_content_mode == PreviewContentMode.STILL:
             return "静态拼接画面：用于检查图片，不代表实时流状态。"
-        if self.runtime_stitch_config.mode == StitchRuntimeMode.NEAR_FIELD:
+        runtime_status = self.effective_runtime_status()
+        if runtime_status == "near_field_current_perspective":
             return (
                 "近景优先拼接：使用只读 Layout Candidate V2、当前 perspective warp、"
                 "front-priority layout。适合近景物体靠近接缝时手动对比。"
             )
-        if self.runtime_stitch_config.mode == StitchRuntimeMode.AUTO:
+        if runtime_status == "near_field_fisheye_rectilinear":
+            return (
+                "近景优先拼接：使用只读 Layout Candidate V2 与 Fisheye "
+                "Rectilinear 投影。请重点检查边缘拉伸与接缝近物体。"
+            )
+        if runtime_status == "far_field_custom":
+            return "远景自定义布局：使用候选声明的投影与只读布局参数。"
+        if runtime_status == "auto_fallback_far_field":
             return "Auto 拼接算法仍是占位；当前回退 Far-field，不会自动切换。"
-        if self.live_stitch_mode == "candidate":
+        if runtime_status == "b2_candidate_view":
             return (
                 "实验性候选（rotation-only）：远景优先，近景可能重影。"
                 "检查近处人物或物体时，建议切换到多路视图或单路查看。"
@@ -5090,10 +5614,22 @@ class MainWindow(QMainWindow):
             STREAM_STOPPING: 0,
             STREAM_STOPPED: 0,
         }
+        status_now = time.time()
         for key in active_keys:
             snapshot = self.stream_snapshots.get(key)
             status = snapshot.status if snapshot is not None else STREAM_STOPPED
-            if self.preview_content_mode == PreviewContentMode.STOPPED:
+            if (
+                snapshot is not None
+                and status == STREAM_LIVE
+                and snapshot.frame_timestamp > 0.0
+                and status_now - snapshot.frame_timestamp
+                > LIVE_FRAME_MAX_AGE_SECONDS
+            ):
+                status = STREAM_FAILED
+            if (
+                self.preview_content_mode == PreviewContentMode.STOPPED
+                and (snapshot is None or not snapshot.thread_alive)
+            ):
                 status = STREAM_STOPPED
             status_counts[status] = status_counts.get(status, 0) + 1
         topology = str(
@@ -5111,7 +5647,10 @@ class MainWindow(QMainWindow):
             PreviewContentMode.LIVE: "Live",
             PreviewContentMode.STILL: "Still",
         }[self.preview_content_mode]
-        runtime = self.runtime_stitch_config.mode.value
+        health = self.update_live_health_state().value
+        runtime = self.effective_runtime_status()
+        projection = self.effective_projection_source()
+        qgc = "Running" if self.qgc_output_active else "Stopped"
         warnings = self.preview_warning_messages()
         summary = (
             f"Topology: {topology}  |  相机: {len(active_keys)} 路 "
@@ -5120,7 +5659,9 @@ class MainWindow(QMainWindow):
             f"Failed {status_counts[STREAM_FAILED]} / "
             f"Stopped {status_counts[STREAM_STOPPED]})  |  "
             f"布局: {layout}  |  内容: {content}  |  "
-            f"拼接算法: {runtime}  |  "
+            f"健康: {health}  |  实际拼接链路: {runtime}  |  "
+            f"投影: {projection}  |  "
+            f"QGC: {qgc}  |  "
             f"标定状态: {self.calibration_candidate_state()}"
         )
         if warnings:
@@ -5140,12 +5681,19 @@ class MainWindow(QMainWindow):
 
     def canvas_status_text(self) -> str:
         if self.preview_content_mode == PreviewContentMode.LIVE:
-            if self.runtime_stitch_config.mode == StitchRuntimeMode.NEAR_FIELD:
+            runtime_status = self.effective_runtime_status()
+            if runtime_status == "near_field_current_perspective":
                 return self.t("Near-field stitched view")
-            if self.runtime_stitch_config.mode == StitchRuntimeMode.FAR_FIELD:
+            if runtime_status == "near_field_fisheye_rectilinear":
+                return "Near-field Fisheye stitched view"
+            if runtime_status == "far_field_custom":
+                return "Far-field Custom stitched view"
+            if runtime_status == "far_field_default":
                 return self.t("Far-field stitched view")
-            if self.live_stitch_mode == "candidate":
-                return self.t("Experimental candidate live view")
+            if runtime_status == "b2_candidate_view":
+                return f"B-2 {self.t('Experimental candidate live view')}"
+            if runtime_status == "auto_fallback_far_field":
+                return "Auto fallback Far-field stitched view"
             return self.t("Live stitched view")
         if self.preview_content_mode == PreviewContentMode.STILL:
             return self.t("Static stitched view")
@@ -5214,8 +5762,20 @@ class MainWindow(QMainWindow):
         if mode == self.live_stitch_mode:
             self.apply_live_stitch_mode_controls()
             return
-        self.live_stitch_mode = mode
-        self.apply_live_stitch_mode_controls()
+        previous_mode = self.live_stitch_mode
+        if not self.commit_live_runtime_selection(
+            self.runtime_stitch_config,
+            mode,
+            reason=f"live stitch strategy {mode}",
+        ):
+            self.live_stitch_mode = previous_mode
+            self.apply_live_stitch_mode_controls()
+            QMessageBox.warning(
+                self,
+                self.t("Stitched View"),
+                self.last_stitch_ui_error,
+            )
+            return
         self.log(
             "Live stitch strategy changed: "
             f"mode={mode}, candidate={self.live_candidate_directory}"
@@ -5223,14 +5783,9 @@ class MainWindow(QMainWindow):
         if self.preview_content_mode != PreviewContentMode.LIVE:
             self.apply_preview_view_state()
             return
-        self.bump_preview_session()
-        self.configure_live_stitch_processor()
-        self.warped.clear()
-        self.canvas = None
         self.canvas_view.set_placeholder(self.canvas_status_text())
         for view in self.warped_views.values():
             view.set_placeholder(self.canvas_status_text())
-        self.last_process_time = 0.0
         self.apply_preview_view_state()
 
     def apply_preview_view_state(self) -> None:
@@ -5432,8 +5987,16 @@ class MainWindow(QMainWindow):
         self.collect_camera_config_from_widgets()
         self.performance_config = self.camera_config.get("performance", {})
         self.stop_live_preview()
-        self.bump_preview_session()
-        self.configure_live_stitch_processor()
+        try:
+            self.configure_live_stitch_processor()
+        except Exception as exc:
+            self.last_stitch_ui_error = str(exc).splitlines()[0][:220]
+            self.set_preview_content_mode(PreviewContentMode.LIVE)
+            self.live_health_state = LiveHealthState.FAILED
+            self.log(f"Live stitch processor failed to start: {exc}", level="ERROR")
+            self.update_preview_status_summary()
+            self.statusBar().showMessage(self.last_stitch_ui_error)
+            return
         self.frame_counts.clear()
         self.stream_error_log_counts.clear()
         self.stream_manager.start(self.live_stream_configs())
@@ -5452,13 +6015,13 @@ class MainWindow(QMainWindow):
             elif snapshot.status not in (STREAM_IDLE,):
                 self.log(f"{key}: stream worker started")
 
+        self.set_preview_content_mode(PreviewContentMode.LIVE)
         if self.stream_manager.has_active_workers():
             if (
                 self.preview_layout_mode == PreviewLayoutMode.FOCUS
                 and self.focused_camera_id not in self.active_camera_keys()
             ):
                 self.set_preview_layout_mode(PreviewLayoutMode.GRID)
-            self.set_preview_content_mode(PreviewContentMode.LIVE)
             self.last_process_time = 0.0
             self.last_preview_time = 0.0
             self.last_health_time = 0.0
@@ -5467,13 +6030,18 @@ class MainWindow(QMainWindow):
             self.preview_timer.start()
             self.statusBar().showMessage(self.t("Live preview running"))
         else:
-            self.run_still_preview()
+            self.live_health_state = LiveHealthState.FAILED
+            self.update_preview_status_summary()
+            self.statusBar().showMessage(
+                self.t("Video stream unavailable")
+            )
 
-    def stop_live_preview(self) -> None:
+    def stop_live_preview(self) -> bool:
         self.preview_timer.stop()
         self.bump_preview_session()
         self.stitch_processor.invalidate_session(self.preview_session_id)
-        self.stream_manager.stop()
+        stop_result = self.stream_manager.stop()
+        all_stopped = stop_result is not False
         self.stream_snapshots = self.stream_manager.snapshots(include_frames=False)
         self.frames.clear()
         self.warped.clear()
@@ -5490,7 +6058,17 @@ class MainWindow(QMainWindow):
         if hasattr(self, "canvas_view"):
             self.canvas_view.set_placeholder(self.t("Live preview stopped"))
         self.update_health_table()
-        self.statusBar().showMessage(self.t("Preview stopped"))
+        if all_stopped:
+            self.statusBar().showMessage(self.t("Preview stopped"))
+        else:
+            self.statusBar().showMessage(
+                "Preview stopped; one or more capture threads are still exiting."
+            )
+            self.log(
+                "Capture shutdown timed out; daemon worker remains observable as Stopping.",
+                level="WARNING",
+            )
+        return all_stopped
 
     def update_live_preview(self) -> None:
         now = time.perf_counter()
@@ -5500,7 +6078,9 @@ class MainWindow(QMainWindow):
         should_submit_stitch = (now - self.last_process_time) >= process_interval
 
         if should_refresh_preview or should_submit_stitch:
-            latest_frames, snapshots = self.stream_manager.latest_frames()
+            latest_frames, snapshots = self.stream_manager.latest_frames(
+                max_frame_age_seconds=LIVE_FRAME_MAX_AGE_SECONDS,
+            )
             self.stream_snapshots = snapshots
             for key, snapshot in snapshots.items():
                 self.frame_counts[key] = snapshot.frame_count
@@ -5512,12 +6092,36 @@ class MainWindow(QMainWindow):
                 ):
                     self.log(f"{key}: {snapshot.last_error}")
                     self.stream_error_log_counts[key] = snapshot.failed_read_count
-            if latest_frames:
-                self.frames.update(latest_frames)
-                self.log_source_coordinate_warnings(latest_frames)
+            active = set(self.active_camera_keys())
+            previous_frame_keys = frozenset(self.frames)
+            self.frames = {
+                key: frame
+                for key, frame in latest_frames.items()
+                if key in active
+            }
+            if self.frames:
+                self.log_source_coordinate_warnings(self.frames)
 
-            signature = self.frame_signature(snapshots)
+            usable_snapshots = {
+                key: snapshot
+                for key, snapshot in snapshots.items()
+                if key in self.frames
+            }
+            signature = self.frame_signature(usable_snapshots)
             has_new_frames = bool(signature) and signature != self.last_frame_signature
+            frame_keys = frozenset(self.frames)
+            frame_set_changed = frame_keys != previous_frame_keys
+            if frame_set_changed:
+                self.awaiting_current_frame_set_result = True
+                self.warped.clear()
+                self.canvas = None
+                if hasattr(self, "canvas_view"):
+                    self.canvas_view.set_placeholder(
+                        "拼接结果等待当前可用相机的新帧"
+                    )
+                for view in self.warped_views.values():
+                    view.set_placeholder("等待当前可用相机的新帧")
+            self.update_live_health_state()
             if should_refresh_preview:
                 self.last_preview_time = now
                 self.refresh_raw_preview()
@@ -5525,14 +6129,27 @@ class MainWindow(QMainWindow):
             if should_submit_stitch and self.frames and has_new_frames:
                 self.last_process_time = now
                 self.last_frame_signature = signature
-                active = set(self.active_camera_keys())
-                frames = {key: frame for key, frame in self.frames.items() if key in active}
-                if frames:
-                    self.stitch_processor.submit_latest(self.preview_session_id, frames)
+                request_id = self.stitch_processor.submit_latest(
+                    self.preview_session_id,
+                    self.frames,
+                )
+                if (
+                    self.awaiting_current_frame_set_result
+                    and isinstance(request_id, int)
+                    and request_id > 0
+                ):
+                    self.minimum_stitch_result_request_id = request_id
 
-        self.apply_latest_stitch_result()
-        if not self.stream_manager.has_active_workers():
+        workers_active = self.stream_manager.has_active_workers()
+        if not workers_active and self.live_health_state == LiveHealthState.FAILED:
+            self.bump_preview_session()
+            self.stitch_processor.invalidate_session(self.preview_session_id)
+            self.warped.clear()
+            self.canvas = None
             self.preview_timer.stop()
+            self.update_preview_status_summary()
+            return
+        self.apply_latest_stitch_result()
 
     def effective_preview_interval(self) -> float:
         configured_interval = 1.0 / max(1, int(self.performance_config.get("preview_fps", 2)))
@@ -5589,6 +6206,12 @@ class MainWindow(QMainWindow):
 
             snapshot = self.stream_snapshots.get(key)
             if snapshot is not None:
+                snapshot_is_stale = (
+                    snapshot.status == STREAM_LIVE
+                    and snapshot.frame_timestamp > 0.0
+                    and time.time() - snapshot.frame_timestamp
+                    > LIVE_FRAME_MAX_AGE_SECONDS
+                )
                 if snapshot.status == STREAM_CONNECTING:
                     view.set_placeholder(
                         f"{display_name}\n正在连接视频流\n"
@@ -5596,8 +6219,12 @@ class MainWindow(QMainWindow):
                         "下一步：稍候；若长时间不变，请检查地址、网络和设备。"
                     )
                     continue
-                if snapshot.status == STREAM_FAILED:
-                    error = (snapshot.last_error or self.t("Failed")).splitlines()[0][:180]
+                if snapshot.status == STREAM_FAILED or snapshot_is_stale:
+                    error = (
+                        f"Frame is stale for more than {LIVE_FRAME_MAX_AGE_SECONDS:.1f}s"
+                        if snapshot_is_stale
+                        else (snapshot.last_error or self.t("Failed")).splitlines()[0][:180]
+                    )
                     lines = [
                         display_name,
                         self.t("Video stream unavailable"),
@@ -5673,15 +6300,31 @@ class MainWindow(QMainWindow):
             return
         if result.result_id <= self.displayed_stitch_result_id:
             return
+        if (
+            self.awaiting_current_frame_set_result
+            and self.minimum_stitch_result_request_id <= 0
+        ):
+            return
+        if result.request_id < self.minimum_stitch_result_request_id:
+            return
 
+        self.awaiting_current_frame_set_result = False
         self.displayed_stitch_result_id = result.result_id
         self.last_stitch_ms = result.elapsed_ms
+        self.last_runtime_stitch_status = result.runtime_status
+        self.last_runtime_result_session_id = result.session_id
+        self.last_runtime_result_configuration_id = result.configuration_id
+        self.last_runtime_warnings = list(result.runtime_warnings)
+        self.last_runtime_metrics = result.runtime_metrics
         if result.error:
             self.last_stitch_ui_error = str(result.error).splitlines()[0][:220]
+            self.live_health_state = LiveHealthState.FAILED
+            self.warped.clear()
+            self.canvas = None
             if result.result_id != self.last_stitch_error_result_id:
                 self.last_stitch_error_result_id = result.result_id
                 self.log(f"Stitch failed: {result.error}", level="ERROR")
-            if self.should_render_canvas():
+            if hasattr(self, "canvas_view"):
                 self.canvas_view.set_placeholder(
                     "拼接结果暂不可用\n"
                     f"发生了什么：{self.last_stitch_ui_error}\n"
@@ -5692,9 +6335,7 @@ class MainWindow(QMainWindow):
             return
 
         self.last_stitch_ui_error = ""
-        self.last_runtime_stitch_status = result.runtime_status
-        self.last_runtime_warnings = list(result.runtime_warnings)
-        self.last_runtime_metrics = result.runtime_metrics
+        self.update_live_health_state()
         warning_text = "; ".join(self.last_runtime_warnings)
         if warning_text and warning_text != self.last_runtime_warning_log_text:
             self.last_runtime_warning_log_text = warning_text
@@ -5714,6 +6355,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             message + self.runtime_timing_status_suffix(self.last_runtime_metrics)
         )
+        self.update_preview_status_summary()
 
     def _process_and_render_frames(self, status_prefix: str) -> None:
         start_time = time.perf_counter()
@@ -5773,7 +6415,13 @@ class MainWindow(QMainWindow):
                 age = time.time() - snapshot.frame_timestamp if snapshot.frame_timestamp else -1
                 age_text = f", age {age:.1f}s" if age >= 0 else ""
                 error_text = f", fail {snapshot.failed_read_count}" if snapshot.failed_read_count else ""
-                status = f"{self.t(snapshot.status)}{age_text}{error_text}"
+                display_status = (
+                    "Failed (stale)"
+                    if snapshot.status == STREAM_LIVE
+                    and age > LIVE_FRAME_MAX_AGE_SECONDS
+                    else self.t(snapshot.status)
+                )
+                status = f"{display_status}{age_text}{error_text}"
             else:
                 status = self.t("Frame") if key in self.frames else self.t("Idle")
             values = [
@@ -5874,6 +6522,7 @@ class MainWindow(QMainWindow):
         )
 
     def save_camera_config(self) -> None:
+        was_live = self.preview_content_mode == PreviewContentMode.LIVE
         if (
             config_revision("cameras.yaml") != self._camera_config_revision
             or config_revision("calibration.yaml")
@@ -5890,29 +6539,52 @@ class MainWindow(QMainWindow):
         stitch_profile.setdefault("canvas", {})["height"] = int(self.canvas_height.value())
         if not self.persist_calibration_config():
             return
+        if was_live:
+            self.stop_live_preview()
         self.performance_config = self.camera_config.get("performance", {})
         self.stitcher = self.create_stitcher()
-        self.bump_preview_session()
-        self.configure_live_stitch_processor()
+        if was_live:
+            self.start_live_preview()
+        else:
+            self.bump_preview_session()
+            self.stitch_processor.invalidate_session(self.preview_session_id)
         self.refresh_seam_editor()
         self.update_topology_diagnostics()
         self.statusBar().showMessage(self.t("Saved configs to {path}", path=CONFIG_DIR))
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.stop_qgc_output_service()
-        self.stop_live_preview()
-        self.stitch_processor.shutdown()
+        captures_stopped = self.stop_live_preview()
+        if not captures_stopped:
+            captures_stopped = self.stream_manager.stop(timeout=3.0)
+        stitch_stopped = self.stitch_processor.shutdown(timeout=5.0)
+        if not captures_stopped or not stitch_stopped:
+            self.log(
+                "Application closed with daemon workers still exiting; "
+                f"capture_clean={captures_stopped}, stitch_clean={stitch_stopped}",
+                level="WARNING",
+            )
         super().closeEvent(event)
 
     def reload_configs(self) -> None:
-        self.reload_runtime_state()
+        try:
+            self.reload_runtime_state()
+        except RuntimeError as exc:
+            QMessageBox.warning(self, self.t("Reloaded"), str(exc))
+            return
         QMessageBox.information(
             self,
             self.t("Reloaded"),
             self.t("Configuration and editor controls were reloaded."),
         )
 
-    def reload_runtime_state(self) -> None:
+    def reload_runtime_state(self, *, workers_already_stopped: bool = False) -> None:
+        if not workers_already_stopped:
+            self.stop_qgc_output_service()
+            if not self.stop_live_preview():
+                raise RuntimeError(
+                    "Configuration reload was cancelled because capture threads are still exiting. Retry after they stop."
+                )
         self.calibration_config = load_config("calibration.yaml")
         self.camera_config = load_config("cameras.yaml")
         self._calibration_config_revision = config_revision("calibration.yaml")
@@ -5928,32 +6600,20 @@ class MainWindow(QMainWindow):
         )
         self._candidate_ui_cache_path = None
         self._candidate_ui_cache = {}
-        if self.live_candidate_directory is None:
-            self.live_stitch_mode = "template"
-        if self.runtime_layout_candidate is not None:
-            try:
-                self.runtime_layout_candidate = load_layout_candidate_for_runtime(
-                    self.runtime_layout_candidate.path,
-                    expected_profile_id=self.current_runtime_profile_id(),
-                )
-            except Exception as exc:
-                self.log(
-                    f"Runtime layout candidate unavailable after reload: {exc}",
-                    level="WARNING",
-                )
-                self.runtime_layout_candidate = None
-                self.runtime_stitch_config = RuntimeStitchConfig()
+        active_runtime_logs = self.restore_active_project_runtime_defaults(
+            discovered_b2_candidate=self.live_candidate_directory,
+        )
         self.apply_live_stitch_mode_controls()
         self.refresh_stitch_runtime_controls()
         self.sync_camera_config_widgets()
         self.stitcher = self.create_stitcher()
-        self.bump_preview_session()
-        self.configure_live_stitch_processor()
         self.populate_point_table()
         self.populate_seam_table()
         self.refresh_seam_editor()
         self.update_topology_diagnostics()
         self.refresh_pairwise_pair_choices()
+        for level, message in active_runtime_logs:
+            self.log(message, level=level)
 
     def sync_camera_config_widgets(self) -> None:
         if not self.camera_rows:
@@ -6105,6 +6765,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(status)
         self.log(status)
         self.write_qgc_output_frame(self.canvas)
+        self.update_preview_status_summary()
 
     def stop_qgc_output_service(self) -> None:
         sink = self.qgc_video_sink
@@ -6121,6 +6782,7 @@ class MainWindow(QMainWindow):
             self.qgc_output_stop_button.setEnabled(False)
         self.statusBar().showMessage(message)
         self.log(message)
+        self.update_preview_status_summary()
 
     def write_qgc_output_frame(self, canvas: np.ndarray | None) -> None:
         if not self.qgc_output_active or self.qgc_video_sink is None or canvas is None:
@@ -6147,6 +6809,9 @@ class MainWindow(QMainWindow):
             self.qgc_output_service_status.setText(
                 f"{self.t('QGC output service started: {url}', url=output['url'])}\n"
                 f"Frames: {self.qgc_output_frames_written} | stitch {self.last_stitch_ms:.1f} ms"
+                f" | runtime {self.effective_runtime_status()}"
+                f" | projection {self.effective_projection_source()}"
+                f" | health {self.live_health_state.value}"
                 f"{timing_suffix}"
             )
 
@@ -6176,6 +6841,8 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self.stop_qgc_output_service()
+        self.stop_live_preview()
         try:
             payload = load_project(path)
             self.reload_runtime_state()
@@ -6238,11 +6905,20 @@ class MainWindow(QMainWindow):
                     if self.runtime_layout_candidate is not None
                     else None
                 ),
-                b2_candidate_path=self.current_b2_candidate_directory(),
+                b2_candidate_path=(
+                    self.far_field_layout_candidate.b2_candidate_directory
+                    if self.far_field_layout_candidate is not None
+                    else self.current_b2_candidate_directory()
+                ),
                 fisheye_intrinsics_path=self._current_fisheye_intrinsics_path(),
                 default_stitch_mode=self.runtime_stitch_config.mode.value,
+                live_stitch_strategy=self.effective_live_processor_mode(),
                 use_far_field_custom=self.runtime_stitch_config.use_far_field_custom_layout,
-                near_field_projection_source=self.runtime_stitch_config.projection_source.value,
+                near_field_projection_source=(
+                    self.runtime_layout_candidate.projection.source.value
+                    if self.runtime_layout_candidate is not None
+                    else self.runtime_stitch_config.projection_source.value
+                ),
             )
         except Exception as exc:
             QMessageBox.critical(self, self.t("Export project package failed"), str(exc))
@@ -6297,9 +6973,22 @@ class MainWindow(QMainWindow):
             )
             self.log(f"Project package validated but not activated: {validation.package_root}")
             return
+        self.stop_qgc_output_service()
+        if not self.stop_live_preview():
+            message = (
+                "Project package activation was cancelled because capture threads "
+                "are still exiting. Retry after they stop."
+            )
+            QMessageBox.critical(
+                self,
+                self.t("Import project package failed"),
+                message,
+            )
+            self.log(message, level="ERROR")
+            return
         try:
             result = activate_project_package(path)
-            self.reload_runtime_state()
+            self.reload_runtime_state(workers_already_stopped=True)
         except Exception as exc:
             QMessageBox.critical(self, self.t("Import project package failed"), str(exc))
             return
@@ -7308,10 +7997,49 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
         self.log(f"B-2 experimental candidate saved: {output_dir}")
+        previous_candidate_directory = self.live_candidate_directory
+        was_active_candidate = (
+            self.preview_content_mode == PreviewContentMode.LIVE
+            and self.effective_runtime_status() == "b2_candidate_view"
+        )
+        activated_new_candidate = False
         self.live_candidate_directory = output_dir
         self._candidate_ui_cache_path = None
         self._candidate_ui_cache = {}
-        self.set_live_stitch_mode("candidate")
+        if was_active_candidate:
+            activated_new_candidate = self.commit_live_runtime_selection(
+                self.runtime_stitch_config,
+                "candidate",
+                reason="replace active B-2 candidate",
+            )
+        if was_active_candidate and not activated_new_candidate:
+            self.live_candidate_directory = previous_candidate_directory
+            self.apply_live_stitch_mode_controls()
+            QMessageBox.warning(
+                self,
+                self.t("Calibration Wizard"),
+                self.last_stitch_ui_error,
+            )
+        self.apply_live_stitch_mode_controls()
+        self.update_preview_status_summary()
+        if activated_new_candidate:
+            self.log("Active B-2 Candidate View was atomically reconfigured.")
+        elif was_active_candidate:
+            self.log(
+                "New B-2 candidate was not activated; the previous candidate "
+                "worker remains selected.",
+                level="WARNING",
+            )
+        elif self.live_stitch_mode == "candidate":
+            self.log(
+                "B-2 candidate selection was updated for the next live start; "
+                "no worker is currently running."
+            )
+        else:
+            self.log(
+                "B-2 candidate is available for explicit Advanced view selection; "
+                "Far-field Default remains active."
+            )
         dialog = CalibrationCandidateDialog(output_dir, self)
         dialog.exec()
 
@@ -7538,7 +8266,9 @@ class MainWindow(QMainWindow):
         self,
     ) -> tuple[dict[str, np.ndarray], dict[str, float | None]]:
         if self.preview_content_mode == PreviewContentMode.LIVE:
-            frames, snapshots = self.stream_manager.latest_frames()
+            frames, snapshots = self.stream_manager.latest_frames(
+                max_frame_age_seconds=LIVE_FRAME_MAX_AGE_SECONDS,
+            )
         else:
             frames = {
                 key: frame.copy()
@@ -7848,7 +8578,9 @@ class MainWindow(QMainWindow):
 
     def refresh_geometry_diagnostics(self) -> None:
         if self.preview_content_mode == PreviewContentMode.LIVE:
-            frames, _ = self.stream_manager.latest_frames()
+            frames, _ = self.stream_manager.latest_frames(
+                max_frame_age_seconds=LIVE_FRAME_MAX_AGE_SECONDS,
+            )
         else:
             frames = {
                 key: frame.copy()
@@ -8160,7 +8892,13 @@ class MainWindow(QMainWindow):
 
     def capture_calibration_frame(self) -> None:
         camera_key = self.calibration_camera.currentText()
-        frame = self.frames.get(camera_key)
+        if self.preview_content_mode == PreviewContentMode.LIVE:
+            latest_frames, _ = self.stream_manager.latest_frames(
+                max_frame_age_seconds=LIVE_FRAME_MAX_AGE_SECONDS,
+            )
+            frame = latest_frames.get(camera_key)
+        else:
+            frame = self.frames.get(camera_key)
         if frame is None:
             QMessageBox.information(
                 self,
@@ -8183,7 +8921,9 @@ class MainWindow(QMainWindow):
         }
 
         if self.preview_content_mode == PreviewContentMode.LIVE:
-            latest_frames, snapshots = self.stream_manager.latest_frames()
+            latest_frames, snapshots = self.stream_manager.latest_frames(
+                max_frame_age_seconds=LIVE_FRAME_MAX_AGE_SECONDS,
+            )
             frames = {
                 key: frame
                 for key, frame in latest_frames.items()

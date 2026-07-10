@@ -5,8 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from deep_shark_studio.config import file_revision, load_yaml, save_yaml
 from deep_shark_studio.project_package import (
+    ProjectPackageExportError,
     activate_project_package,
     export_project_package,
     find_absolute_path_strings,
@@ -21,15 +24,19 @@ class ProjectPackageTests(unittest.TestCase):
         self.temp_dir = Path(tempfile.mkdtemp())
         self.config_dir = self.temp_dir / "configs"
         self.config_dir.mkdir()
+        repository_configs = Path(__file__).resolve().parents[1] / "configs"
         save_yaml(
             self.config_dir / "calibration.yaml",
-            {
-                "stitch_topology": "triple_front_panorama",
-                "canvas": {"width": 2200, "height": 700},
-            },
+            load_yaml(repository_configs / "calibration.yaml"),
         )
-        save_yaml(self.config_dir / "cameras.yaml", {"cameras": {}, "performance": {}})
-        save_yaml(self.config_dir / "network.yaml", {"network": {}})
+        save_yaml(
+            self.config_dir / "cameras.yaml",
+            load_yaml(repository_configs / "cameras.example.yaml"),
+        )
+        save_yaml(
+            self.config_dir / "network.yaml",
+            load_yaml(repository_configs / "network.example.yaml"),
+        )
         self.before_calibration_hash = file_revision(self.config_dir / "calibration.yaml")
 
     def tearDown(self) -> None:
@@ -112,11 +119,54 @@ class ProjectPackageTests(unittest.TestCase):
         self.assertFalse(validation.valid)
         self.assertTrue(any("absolute" in error.lower() for error in validation.errors))
 
+    def test_export_rejects_candidate_dependency_mismatch(self) -> None:
+        far = self._make_far_field_candidate()
+        expected_b2 = self._make_b2_candidate()
+        other_b2_root = self.temp_dir / "other_b2_candidate"
+        shutil.copytree(expected_b2.parent, other_b2_root)
+        far_output = self.temp_dir / "far_mismatch_export"
+
+        with self.assertRaises(ProjectPackageExportError):
+            export_project_package(
+                far_output,
+                project_name="far_mismatch",
+                calibration_config_path=self.config_dir / "calibration.yaml",
+                cameras_config_path=self.config_dir / "cameras.yaml",
+                network_config_path=self.config_dir / "network.yaml",
+                far_field_candidate_path=far,
+                b2_candidate_path=other_b2_root / "candidate.yaml",
+            )
+
+        self.assertEqual([], list(far_output.iterdir()))
+
+        near = self._make_near_field_candidate()
+        expected_fisheye = self._make_fisheye_intrinsics_candidate()
+        other_fisheye_root = self.temp_dir / "other_fisheye_candidate"
+        shutil.copytree(expected_fisheye.parent, other_fisheye_root)
+        near_output = self.temp_dir / "near_mismatch_export"
+
+        with self.assertRaises(ProjectPackageExportError):
+            export_project_package(
+                near_output,
+                project_name="near_mismatch",
+                calibration_config_path=self.config_dir / "calibration.yaml",
+                cameras_config_path=self.config_dir / "cameras.yaml",
+                network_config_path=self.config_dir / "network.yaml",
+                near_field_candidate_path=near,
+                fisheye_intrinsics_path=other_fisheye_root / "candidate.yaml",
+            )
+
+        self.assertEqual([], list(near_output.iterdir()))
+
     def test_path_resolver_blocks_escape_and_absolute_paths(self) -> None:
         with self.assertRaises(ProjectPathError):
             resolve_project_path(self.temp_dir, "../outside.yaml")
         with self.assertRaises(ProjectPathError):
             resolve_project_path(self.temp_dir, "D:/outside.yaml")
+        with self.assertRaises(ProjectPathError):
+            resolve_project_path(self.temp_dir, r"\outside.yaml")
+        with self.assertRaises(ProjectPathError):
+            resolve_project_path(self.temp_dir, "C:drive-relative.yaml")
 
     def test_activate_project_package_requires_explicit_call_and_backs_up(self) -> None:
         result = export_project_package(
@@ -203,12 +253,20 @@ class ProjectPackageTests(unittest.TestCase):
         root = self.temp_dir / "b2_candidate"
         (root / "intrinsics").mkdir(parents=True, exist_ok=True)
         for camera in ("front_left", "front", "front_right"):
-            (root / "intrinsics" / f"{camera}_remap.npz").write_bytes(b"fake")
+            np.savez_compressed(
+                root / "intrinsics" / f"{camera}_remap.npz",
+                map_x=np.zeros((3, 4), dtype=np.float32),
+                map_y=np.zeros((3, 4), dtype=np.float32),
+                valid_mask=np.ones((3, 4), dtype=np.uint8),
+            )
         save_yaml(
             root / "candidate.yaml",
             {
-                "format": "DeepSharkCalibrationCandidate",
-                "resolution": [1280, 720],
+                "format": "DeepSharkFisheyeCalibrationCandidate",
+                "topology": "triple_front_panorama",
+                "resolution": [1920, 1080],
+                "experimental": True,
+                "apply_allowed": False,
                 "rig": {
                     "complete": True,
                     "transforms": {
@@ -217,7 +275,7 @@ class ProjectPackageTests(unittest.TestCase):
                     },
                 },
                 "virtual_panorama": {
-                    "canvas_size": [2200, 700],
+                    "canvas_size": [4, 3],
                     "files": {
                         "remaps": {
                             camera: f"intrinsics/{camera}_remap.npz"

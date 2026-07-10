@@ -32,6 +32,7 @@ from .stitch_runtime_modes import (
     ProjectionSource,
     RuntimeStitchConfig,
     StitchRuntimeMode,
+    resolve_effective_runtime_status,
 )
 
 
@@ -91,7 +92,7 @@ class RuntimeStitchController:
         self,
         frames: dict[str, np.ndarray],
         warnings: tuple[str, ...] = (),
-        status: str = "far_field",
+        status: str = "far_field_default",
     ) -> RuntimeStitchResult:
         if self.config.use_far_field_custom_layout:
             return self._process_far_field_custom(frames, warnings=warnings)
@@ -131,6 +132,7 @@ class RuntimeStitchController:
             + tuple(projection.metadata.get("warning_reasons", []))
         )
         metrics = dict(render.metrics)
+        metrics["runtime_mode"] = "far_field_custom"
         timing = dict(metrics.get("timing", {}))
         timing.update(projection.timings)
         metrics["timing"] = timing
@@ -204,6 +206,8 @@ class RuntimeStitchController:
             projection.metadata.get("warning_reasons", [])
         )
         metrics = dict(near.metrics)
+        status = resolve_effective_runtime_status(self.config)
+        metrics["runtime_mode"] = status
         timing = dict(metrics.get("timing", {}))
         timing.update(projection.timings)
         timing["near_field_compositor_ms"] = near_field_compositor_ms
@@ -213,7 +217,7 @@ class RuntimeStitchController:
             warped=projection.warped_images,
             canvas=near.canvas,
             mode=StitchRuntimeMode.NEAR_FIELD,
-            status="near_field",
+            status=status,
             warnings=warnings,
             metrics=metrics,
         )

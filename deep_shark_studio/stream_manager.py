@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Event, Lock, Thread
 import time
 from typing import Any
@@ -58,7 +58,11 @@ class _CameraStreamWorker:
         self.config = config
         self._lock = Lock()
         self._stop_event = Event()
-        self._thread = Thread(target=self._run, name=f"CameraStream-{config.key}")
+        self._thread = Thread(
+            target=self._run,
+            name=f"CameraStream-{config.key}",
+            daemon=True,
+        )
         self._status = STREAM_IDLE
         self._frame: np.ndarray | None = None
         self._frame_timestamp = 0.0
@@ -75,7 +79,7 @@ class _CameraStreamWorker:
     def request_stop(self) -> None:
         self._stop_event.set()
         if self._thread.is_alive():
-            self._set_state(status=STREAM_STOPPING)
+            self._mark_stopping()
 
     def wait(self, timeout: float) -> bool:
         self._thread.join(timeout=max(0.0, timeout))
@@ -85,7 +89,7 @@ class _CameraStreamWorker:
         self.request_stop()
         stopped = self.wait(timeout)
         if not stopped:
-            self._set_state(status=STREAM_STOPPING, last_error="Stop timeout; capture thread still exiting")
+            self.mark_stop_timeout()
         return stopped
 
     def is_alive(self) -> bool:
@@ -95,14 +99,20 @@ class _CameraStreamWorker:
         return self._stop_event.is_set() and self._thread.is_alive()
 
     def mark_duplicate_start_refused(self) -> None:
-        self._set_state(status=STREAM_STOPPING, last_error=DUPLICATE_WORKER_ERROR)
+        self._mark_stopping(DUPLICATE_WORKER_ERROR)
 
     def mark_stop_timeout(self) -> None:
-        self._set_state(status=STREAM_STOPPING, last_error="Stop timeout; capture thread still exiting")
+        self._mark_stopping("Stop timeout; capture thread still exiting")
 
     def snapshot(self, include_frame: bool = True) -> CameraStreamSnapshot:
         with self._lock:
-            frame = self._frame.copy() if include_frame and self._frame is not None else None
+            can_publish_frame = (
+                include_frame
+                and self._status == STREAM_LIVE
+                and not self._stop_event.is_set()
+                and self._frame is not None
+            )
+            frame = self._frame.copy() if can_publish_frame else None
             return CameraStreamSnapshot(
                 key=self.config.key,
                 status=self._status,
@@ -138,13 +148,11 @@ class _CameraStreamWorker:
                     break
                 if not ok or frame is None:
                     error = self._read_failure_message()
-                    self._increment_failure(error)
-                    self._set_state(status=STREAM_FAILED, last_error=error)
+                    self._set_failure(error)
                     break
                 self._set_frame(frame)
         except Exception as exc:  # OpenCV backends can raise on device/network errors.
-            self._increment_failure(str(exc))
-            self._set_state(status=STREAM_FAILED, last_error=str(exc))
+            self._set_failure(str(exc))
         finally:
             # VideoCapture has strict thread ownership: only this worker creates,
             # reads, and releases its local capture.
@@ -227,14 +235,29 @@ class _CameraStreamWorker:
             self._status = STREAM_LIVE
             self._last_error = ""
 
-    def _increment_failure(self, error: str) -> None:
+    def _set_failure(self, error: str) -> None:
         with self._lock:
             self._failed_read_count += 1
+            self._status = STREAM_FAILED
+            self._frame = None
             self._last_error = error
 
     def _set_state(self, status: str, last_error: str | None = None) -> None:
         with self._lock:
             self._status = status
+            if status != STREAM_LIVE:
+                # Keep counters and the last timestamp for diagnostics, but never
+                # retain an image that could be mistaken for a current live frame.
+                self._frame = None
+            if last_error is not None:
+                self._last_error = last_error
+
+    def _mark_stopping(self, last_error: str | None = None) -> None:
+        with self._lock:
+            if self._status == STREAM_STOPPED:
+                return
+            self._status = STREAM_STOPPING
+            self._frame = None
             if last_error is not None:
                 self._last_error = last_error
 
@@ -289,7 +312,7 @@ class CameraStreamManager:
                 self._states[config.key] = worker.snapshot(include_frame=False)
                 worker.start()
 
-    def stop(self, timeout: float = DEFAULT_STOP_TIMEOUT_SECONDS) -> None:
+    def stop(self, timeout: float = DEFAULT_STOP_TIMEOUT_SECONDS) -> bool:
         with self._lock:
             workers = list(self._workers.items())
 
@@ -297,6 +320,7 @@ class CameraStreamManager:
             worker.request_stop()
 
         deadline = time.monotonic() + max(0.0, timeout)
+        all_stopped = True
         for key, worker in workers:
             remaining = deadline - time.monotonic()
             if remaining > 0.0:
@@ -304,10 +328,20 @@ class CameraStreamManager:
             with self._lock:
                 self._states[key] = worker.snapshot(include_frame=False)
                 if worker.is_alive():
+                    all_stopped = False
                     worker.mark_stop_timeout()
                     self._states[key] = worker.snapshot(include_frame=False)
                 else:
+                    # Re-snapshot after the liveness decision so a worker that
+                    # exited at the deadline cannot leave a stale Stopping state.
+                    self._states[key] = worker.snapshot(include_frame=False)
                     self._workers.pop(key, None)
+        if not all_stopped:
+            with self._lock:
+                all_stopped = not any(
+                    worker.is_alive() for worker in self._workers.values()
+                )
+        return all_stopped
 
     def has_active_workers(self) -> bool:
         self._cleanup_finished_workers()
@@ -318,17 +352,46 @@ class CameraStreamManager:
         self._cleanup_finished_workers()
         with self._lock:
             workers = dict(self._workers)
-            states = dict(self._states)
+            states = {
+                key: replace(
+                    snapshot,
+                    frame=(
+                        snapshot.frame.copy()
+                        if include_frames
+                        and snapshot.status == STREAM_LIVE
+                        and snapshot.frame is not None
+                        else None
+                    ),
+                )
+                for key, snapshot in self._states.items()
+            }
         for key, worker in workers.items():
             states[key] = worker.snapshot(include_frame=include_frames)
         return states
 
-    def latest_frames(self) -> tuple[dict[str, np.ndarray], dict[str, CameraStreamSnapshot]]:
+    def latest_frames(
+        self,
+        max_frame_age_seconds: float | None = None,
+    ) -> tuple[dict[str, np.ndarray], dict[str, CameraStreamSnapshot]]:
         snapshots = self.snapshots(include_frames=True)
+        max_age = (
+            None
+            if max_frame_age_seconds is None
+            else max(0.0, float(max_frame_age_seconds))
+        )
+        now = time.time() if max_age is not None else 0.0
         frames = {
             key: snapshot.frame
             for key, snapshot in snapshots.items()
-            if snapshot.frame is not None
+            if snapshot.status == STREAM_LIVE
+            and snapshot.frame is not None
+            and (
+                max_age is None
+                or (
+                    snapshot.frame_timestamp > 0.0
+                    and now - snapshot.frame_timestamp <= max_age
+                )
+            )
         }
         return frames, snapshots
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from threading import Condition, Lock, Thread
+from threading import Condition, Thread
 import time
 from typing import Any
 
@@ -11,7 +11,10 @@ import numpy as np
 
 from .calibration_candidate import CandidatePanoramaProcessor
 from .stitch_runtime_controller import RuntimeStitchController, RuntimeStitchResult
-from .stitch_runtime_modes import RuntimeStitchConfig
+from .stitch_runtime_modes import (
+    RuntimeStitchConfig,
+    resolve_effective_runtime_status,
+)
 from .stitcher import SurroundStitcher
 
 
@@ -19,6 +22,11 @@ from .stitcher import SurroundStitcher
 class StitchRequest:
     session_id: int
     request_id: int
+    configuration_id: int
+    processor_mode: str
+    runtime_mode: str
+    runtime_status: str
+    projection_source: str
     frames: dict[str, np.ndarray]
 
 
@@ -30,6 +38,9 @@ class StitchResult:
     warped: dict[str, np.ndarray]
     canvas: np.ndarray | None
     elapsed_ms: float
+    configuration_id: int = 0
+    processor_mode: str = ""
+    projection_source: str = ""
     error: str = ""
     runtime_mode: str = ""
     runtime_status: str = ""
@@ -37,13 +48,33 @@ class StitchResult:
     runtime_metrics: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class StitchProcessingState:
+    """Observable worker configuration and lifecycle state."""
+
+    session_id: int
+    configuration_id: int
+    processor_mode: str
+    runtime_mode: str
+    runtime_status: str
+    projection_source: str
+    configured: bool
+    shutdown_requested: bool
+    thread_started: bool
+    thread_alive: bool
+    thread_daemon: bool
+
+
 class StitchProcessingWorker:
     """Single long-lived worker that processes only the newest pending request."""
 
     def __init__(self):
         self._condition = Condition()
-        self._lock = Lock()
-        self._thread = Thread(target=self._run, name="StitchProcessingWorker")
+        self._thread = Thread(
+            target=self._run,
+            name="StitchProcessingWorker",
+            daemon=True,
+        )
         self._shutdown = False
         self._pending_request: StitchRequest | None = None
         self._latest_result: StitchResult | None = None
@@ -56,11 +87,16 @@ class StitchProcessingWorker:
         self._request_id = 0
         self._result_id = 0
         self._active_session_id = 0
+        self._configuration_id = 0
+        self._processor_mode = ""
+        self._runtime_mode = ""
+        self._runtime_status = ""
+        self._projection_source = ""
         self._started = False
 
     def start(self) -> None:
         with self._condition:
-            if self._started:
+            if self._started or self._shutdown:
                 return
             self._started = True
             self._thread.start()
@@ -76,30 +112,75 @@ class StitchProcessingWorker:
         candidate_use_opencl: bool = False,
         runtime_config: RuntimeStitchConfig | None = None,
     ) -> None:
-        with self._condition:
-            self._active_session_id = session_id
-            self._config = dict(config)
-            self._max_input_width = max_input_width
-            self._use_intrinsics = use_intrinsics
-            if processor_mode == "candidate":
-                if not candidate_directory:
-                    raise ValueError(
-                        "Candidate processor requires a candidate directory."
-                    )
-                self._stitcher = CandidatePanoramaProcessor(
+        if processor_mode not in {"template", "candidate"}:
+            raise ValueError(f"Unknown stitch processor mode: {processor_mode}")
+        config_copy = dict(config)
+        normalized_runtime_config = (
+            runtime_config or RuntimeStitchConfig()
+        ).normalized()
+        if processor_mode == "candidate":
+            if not candidate_directory:
+                raise ValueError(
+                    "Candidate processor requires a candidate directory."
+                )
+            processor: RuntimeStitchController | CandidatePanoramaProcessor = (
+                CandidatePanoramaProcessor(
                     candidate_directory,
                     use_opencl=candidate_use_opencl,
                 )
-            else:
-                stitcher = SurroundStitcher(
-                    self._config,
-                    max_input_width=max_input_width,
-                    use_intrinsics=use_intrinsics,
-                )
-                self._stitcher = RuntimeStitchController(
-                    stitcher,
-                    runtime_config or RuntimeStitchConfig(),
-                )
+            )
+            effective_runtime_config = normalized_runtime_config
+            runtime_mode = "far_field"
+            projection_source = "b2_candidate_projection"
+        else:
+            stitcher = SurroundStitcher(
+                config_copy,
+                max_input_width=max_input_width,
+                use_intrinsics=use_intrinsics,
+            )
+            processor = RuntimeStitchController(
+                stitcher,
+                normalized_runtime_config,
+            )
+            effective_runtime_config = getattr(
+                processor,
+                "config",
+                normalized_runtime_config,
+            ).normalized()
+            runtime_mode = (
+                "near_field"
+                if effective_runtime_config.mode.value == "near_field"
+                else "far_field"
+            )
+            projection_source = effective_runtime_config.projection_source.value
+            far_field_candidate = getattr(
+                processor,
+                "far_field_layout_candidate",
+                None,
+            )
+            if (
+                effective_runtime_config.use_far_field_custom_layout
+                and far_field_candidate is not None
+            ):
+                projection_source = str(far_field_candidate.projection_source)
+        runtime_status = resolve_effective_runtime_status(
+            effective_runtime_config,
+            processor_mode=processor_mode,
+        )
+
+        with self._condition:
+            if self._shutdown:
+                raise RuntimeError("Stitch processing worker is shut down.")
+            self._active_session_id = session_id
+            self._configuration_id += 1
+            self._config = config_copy
+            self._max_input_width = max_input_width
+            self._use_intrinsics = use_intrinsics
+            self._stitcher = processor
+            self._processor_mode = processor_mode
+            self._runtime_mode = runtime_mode
+            self._runtime_status = runtime_status
+            self._projection_source = projection_source
             self._pending_request = None
             self._latest_result = None
             self._condition.notify_all()
@@ -114,6 +195,11 @@ class StitchProcessingWorker:
             self._pending_request = StitchRequest(
                 session_id=session_id,
                 request_id=self._request_id,
+                configuration_id=self._configuration_id,
+                processor_mode=self._processor_mode,
+                runtime_mode=self._runtime_mode,
+                runtime_status=self._runtime_status,
+                projection_source=self._projection_source,
                 frames=dict(frames),
             )
             self._condition.notify_all()
@@ -122,18 +208,48 @@ class StitchProcessingWorker:
     def invalidate_session(self, session_id: int) -> None:
         with self._condition:
             self._active_session_id = session_id
+            self._configuration_id += 1
+            self._stitcher = None
+            self._processor_mode = ""
+            self._runtime_mode = ""
+            self._runtime_status = ""
+            self._projection_source = ""
             self._pending_request = None
             self._latest_result = None
             self._condition.notify_all()
 
     def take_latest_result(self) -> StitchResult | None:
-        with self._lock:
+        with self._condition:
             return self._latest_result
+
+    def state(self) -> StitchProcessingState:
+        with self._condition:
+            return StitchProcessingState(
+                session_id=self._active_session_id,
+                configuration_id=self._configuration_id,
+                processor_mode=self._processor_mode,
+                runtime_mode=self._runtime_mode,
+                runtime_status=self._runtime_status,
+                projection_source=self._projection_source,
+                configured=self._stitcher is not None,
+                shutdown_requested=self._shutdown,
+                thread_started=self._started,
+                thread_alive=self._thread.is_alive(),
+                thread_daemon=self._thread.daemon,
+            )
 
     def shutdown(self, timeout: float = 2.0) -> bool:
         with self._condition:
+            if not self._shutdown:
+                self._configuration_id += 1
             self._shutdown = True
+            self._stitcher = None
+            self._processor_mode = ""
+            self._runtime_mode = ""
+            self._runtime_status = ""
+            self._projection_source = ""
             self._pending_request = None
+            self._latest_result = None
             self._condition.notify_all()
         if self._started:
             self._thread.join(timeout=max(0.0, timeout))
@@ -141,68 +257,85 @@ class StitchProcessingWorker:
         return True
 
     def _run(self) -> None:
-        while True:
+        try:
+            while True:
+                with self._condition:
+                    while not self._shutdown and self._pending_request is None:
+                        self._condition.wait()
+                    if self._shutdown:
+                        return
+                    request = self._pending_request
+                    self._pending_request = None
+                    stitcher = self._stitcher
+
+                if request is None or stitcher is None:
+                    continue
+
+                start_time = time.perf_counter()
+                warped: dict[str, np.ndarray] = {}
+                canvas: np.ndarray | None = None
+                error = ""
+                runtime_warnings: tuple[str, ...] = ()
+                runtime_metrics: dict[str, Any] | None = None
+                try:
+                    processed = stitcher.process(request.frames)
+                    if isinstance(processed, RuntimeStitchResult):
+                        warped = processed.warped
+                        canvas = processed.canvas
+                        runtime_warnings = processed.warnings
+                        runtime_metrics = processed.metrics
+                    else:
+                        warped, canvas = processed
+                        if request.processor_mode == "candidate":
+                            timing = getattr(stitcher, "last_timings", {})
+                            runtime_warnings = (
+                                "B-2 candidate view is experimental and read-only; it does not write calibration.yaml.",
+                            )
+                            runtime_metrics = {
+                                "runtime_mode": "b2_candidate_view",
+                                "timing": timing if isinstance(timing, dict) else {},
+                            }
+                except Exception as exc:
+                    error = str(exc)
+                if not error:
+                    runtime_metrics = dict(runtime_metrics or {})
+                    runtime_metrics["runtime_mode"] = request.runtime_status
+                elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+
+                with self._condition:
+                    if (
+                        self._shutdown
+                        or request.session_id != self._active_session_id
+                        or request.configuration_id != self._configuration_id
+                        or stitcher is not self._stitcher
+                    ):
+                        continue
+                    self._result_id += 1
+                    self._latest_result = StitchResult(
+                        session_id=request.session_id,
+                        request_id=request.request_id,
+                        result_id=self._result_id,
+                        warped=warped,
+                        canvas=canvas,
+                        elapsed_ms=elapsed_ms,
+                        configuration_id=request.configuration_id,
+                        processor_mode=request.processor_mode,
+                        projection_source=request.projection_source,
+                        error=error,
+                        runtime_mode=request.runtime_mode,
+                        runtime_status=request.runtime_status,
+                        runtime_warnings=runtime_warnings,
+                        runtime_metrics=runtime_metrics,
+                    )
+        finally:
             with self._condition:
-                while not self._shutdown and self._pending_request is None:
-                    self._condition.wait()
-                if self._shutdown:
-                    return
-                request = self._pending_request
+                self._stitcher = None
+                self._processor_mode = ""
+                self._runtime_mode = ""
+                self._runtime_status = ""
+                self._projection_source = ""
                 self._pending_request = None
-                stitcher = self._stitcher
-
-            if request is None or stitcher is None:
-                continue
-
-            start_time = time.perf_counter()
-            warped: dict[str, np.ndarray] = {}
-            canvas: np.ndarray | None = None
-            error = ""
-            runtime_mode = ""
-            runtime_status = ""
-            runtime_warnings: tuple[str, ...] = ()
-            runtime_metrics: dict[str, Any] | None = None
-            try:
-                processed = stitcher.process(request.frames)
-                if isinstance(processed, RuntimeStitchResult):
-                    warped = processed.warped
-                    canvas = processed.canvas
-                    runtime_mode = processed.mode.value
-                    runtime_status = processed.status
-                    runtime_warnings = processed.warnings
-                    runtime_metrics = processed.metrics
-                else:
-                    warped, canvas = processed
-                    if isinstance(stitcher, CandidatePanoramaProcessor):
-                        timing = getattr(stitcher, "last_timings", {})
-                        runtime_mode = "far_field"
-                        runtime_status = "b2_candidate_view"
-                        runtime_warnings = (
-                            "B-2 candidate view is experimental and read-only; it does not write calibration.yaml.",
-                        )
-                        runtime_metrics = {
-                            "runtime_mode": "b2_candidate_view",
-                            "timing": timing if isinstance(timing, dict) else {},
-                        }
-            except Exception as exc:
-                error = str(exc)
-            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-
-            with self._lock:
-                self._result_id += 1
-                self._latest_result = StitchResult(
-                    session_id=request.session_id,
-                    request_id=request.request_id,
-                    result_id=self._result_id,
-                    warped=warped,
-                    canvas=canvas,
-                    elapsed_ms=elapsed_ms,
-                    error=error,
-                    runtime_mode=runtime_mode,
-                    runtime_status=runtime_status,
-                    runtime_warnings=runtime_warnings,
-                    runtime_metrics=runtime_metrics,
-                )
+                self._condition.notify_all()
 
 
 class StitchProcessingManager:
@@ -246,6 +379,9 @@ class StitchProcessingManager:
 
     def take_latest_result(self) -> StitchResult | None:
         return self._worker.take_latest_result()
+
+    def state(self) -> StitchProcessingState:
+        return self._worker.state()
 
     def shutdown(self, timeout: float = 2.0) -> bool:
         return self._worker.shutdown(timeout=timeout)

@@ -207,7 +207,7 @@ class FarFieldCustomLayoutTests(unittest.TestCase):
 
         self.assertEqual(1, stitcher.process_calls)
         self.assertEqual(StitchRuntimeMode.FAR_FIELD, result.mode)
-        self.assertEqual("far_field", result.status)
+        self.assertEqual("far_field_default", result.status)
 
     def test_far_field_custom_uses_provider_not_process(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

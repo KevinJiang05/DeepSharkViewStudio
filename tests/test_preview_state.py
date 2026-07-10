@@ -3,18 +3,25 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
+import os
 from pathlib import Path
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-from PySide6.QtWidgets import QApplication
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from deep_shark_studio.calibration_session import CalibrationSession
 from deep_shark_studio.calibration_snapshot import topology_diagnostics
 from deep_shark_studio.gui.main_window import (
     CalibrationCandidateDialog,
+    LiveHealthState,
     MainWindow,
     PreviewContentMode,
     PreviewLayoutMode,
@@ -24,6 +31,12 @@ from deep_shark_studio.stream_manager import (
     CameraStreamSnapshot,
     STREAM_FAILED,
     STREAM_LIVE,
+)
+from deep_shark_studio.stitch_processing import StitchResult
+from deep_shark_studio.stitch_runtime_modes import (
+    ProjectionSource,
+    RuntimeStitchConfig,
+    StitchRuntimeMode,
 )
 
 
@@ -154,6 +167,334 @@ class PreviewStateTests(unittest.TestCase):
             700,
         )
 
+    def test_existing_b2_candidate_does_not_override_far_field_default(
+        self,
+    ) -> None:
+        candidate = Path("candidate-present-at-startup")
+        with patch(
+            "deep_shark_studio.gui.main_window.latest_calibration_candidate",
+            return_value=candidate,
+        ):
+            window = MainWindow()
+        try:
+            self.assertEqual(candidate, window.live_candidate_directory)
+            self.assertEqual(
+                StitchRuntimeMode.FAR_FIELD,
+                window.runtime_stitch_config.mode,
+            )
+            self.assertEqual("template", window.live_stitch_mode)
+
+            with patch.object(
+                window.stitch_processor,
+                "configure",
+            ) as configure:
+                window.bump_preview_session()
+                window.configure_live_stitch_processor()
+
+            configure.assert_called_once()
+            self.assertEqual(
+                "template",
+                configure.call_args.kwargs["processor_mode"],
+            )
+            self.assertIsNone(
+                configure.call_args.kwargs["candidate_directory"]
+            )
+            self.assertEqual(
+                RuntimeStitchConfig(),
+                configure.call_args.kwargs["runtime_config"],
+            )
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    @staticmethod
+    def _active_runtime_defaults(
+        root: Path,
+        *,
+        mode: str = "near_field",
+        strategy: str = "candidate",
+        use_far_custom: bool = True,
+        projection: str = "fisheye_rectilinear_candidate",
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            manifest_path=root / "project.dcsvs.yaml",
+            package_root=root,
+            default_stitch_mode=mode,
+            live_stitch_strategy=strategy,
+            use_far_field_custom=use_far_custom,
+            far_field_layout_candidate=root / "far" / "candidate.yaml",
+            near_field_layout_candidate=root / "near" / "candidate.yaml",
+            b2_candidate=root / "b2" / "candidate.yaml",
+            fisheye_intrinsics_source=root / "fisheye" / "candidate.yaml",
+            near_field_projection_source=projection,
+        )
+
+    @staticmethod
+    def _far_runtime_candidate(path: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            path=path,
+            schema_version=1,
+            profile_id="triple_front_panorama",
+            projection_source="b2_far_field_candidate",
+            b2_candidate_directory=path.parent.parent / "b2",
+            output_width_px=2440,
+            output_height_px=1800,
+            warnings=(),
+        )
+
+    @staticmethod
+    def _near_runtime_candidate(
+        path: Path,
+        projection: ProjectionSource = ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE,
+    ) -> SimpleNamespace:
+        pair = SimpleNamespace(
+            side_shift_px=0,
+            side_visible_fraction=0.5,
+            feather_width_px=80,
+        )
+        camera_adjust = {
+            "front": SimpleNamespace(scale=1.0, x_offset_px=0, y_offset_px=0),
+        }
+        return SimpleNamespace(
+            path=path,
+            schema_version=3,
+            profile_id="triple_front_panorama",
+            projection=SimpleNamespace(
+                source=projection,
+                balance=0.72,
+                fov_scale=1.08,
+            ),
+            left_pair=pair,
+            right_pair=pair,
+            camera_adjust=camera_adjust,
+            warnings=(),
+        )
+
+    def test_constructor_restores_active_package_runtime_before_ui_refresh(
+        self,
+    ) -> None:
+        root = Path("moved-package")
+        defaults = self._active_runtime_defaults(root)
+        far = self._far_runtime_candidate(defaults.far_field_layout_candidate)
+        near = self._near_runtime_candidate(defaults.near_field_layout_candidate)
+        fisheye = SimpleNamespace(path=defaults.fisheye_intrinsics_source)
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.latest_calibration_candidate",
+                return_value=Path("local-b2-must-not-win"),
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_active_project_runtime_defaults",
+                return_value=defaults,
+            ) as load_defaults,
+            patch(
+                "deep_shark_studio.gui.main_window.load_far_field_layout_candidate",
+                return_value=far,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_layout_candidate_for_runtime",
+                return_value=near,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_fisheye_intrinsics_source",
+                return_value=fisheye,
+            ),
+        ):
+            window = MainWindow()
+        try:
+            load_defaults.assert_called_once()
+            self.assertEqual(
+                StitchRuntimeMode.NEAR_FIELD,
+                window.runtime_stitch_config.mode,
+            )
+            self.assertEqual(
+                ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE,
+                window.runtime_stitch_config.projection_source,
+            )
+            self.assertTrue(
+                window.runtime_stitch_config.use_far_field_custom_layout
+            )
+            self.assertIs(window.runtime_layout_candidate, near)
+            self.assertIs(window.far_field_layout_candidate, far)
+            self.assertIs(window.runtime_fisheye_intrinsics_source, fisheye)
+            self.assertEqual(root / "b2", window.live_candidate_directory)
+            self.assertEqual(
+                "template",
+                window.live_stitch_mode,
+                "Near-field must not expose the B-2 candidate processor as active",
+            )
+            self.assertEqual(
+                "near_field",
+                window.runtime_mode_combo.currentData(),
+            )
+            self.assertEqual(
+                "fisheye_rectilinear_candidate",
+                window.runtime_projection_combo.currentData(),
+            )
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_constructor_allows_explicit_candidate_only_for_far_default(
+        self,
+    ) -> None:
+        root = Path("moved-package-far-default")
+        defaults = self._active_runtime_defaults(
+            root,
+            mode="far_field",
+            strategy="candidate",
+            use_far_custom=False,
+            projection="current_perspective",
+        )
+        defaults.far_field_layout_candidate = None
+        defaults.near_field_layout_candidate = None
+        defaults.fisheye_intrinsics_source = None
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.latest_calibration_candidate",
+                return_value=None,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_active_project_runtime_defaults",
+                return_value=defaults,
+            ),
+        ):
+            window = MainWindow()
+        try:
+            self.assertEqual(StitchRuntimeMode.FAR_FIELD, window.runtime_stitch_config.mode)
+            self.assertFalse(window.runtime_stitch_config.use_far_field_custom_layout)
+            self.assertEqual("candidate", window.live_stitch_mode)
+            self.assertEqual(root / "b2", window.live_candidate_directory)
+            self.assertEqual("b2_candidate_view", window.effective_runtime_status())
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_reload_runtime_state_discards_partial_candidate_restore(
+        self,
+    ) -> None:
+        root = Path("broken-active-package")
+        defaults = self._active_runtime_defaults(root)
+        far = self._far_runtime_candidate(defaults.far_field_layout_candidate)
+        calibration = deepcopy(self.window.calibration_config)
+        cameras = deepcopy(self.window.camera_config)
+
+        def load_config(name: str):
+            return calibration if name == "calibration.yaml" else cameras
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.load_config",
+                side_effect=load_config,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.config_revision",
+                return_value="reload-active-project",
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.latest_calibration_candidate",
+                return_value=Path("local-b2-must-be-disabled-on-error"),
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_active_project_runtime_defaults",
+                return_value=defaults,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_far_field_layout_candidate",
+                return_value=far,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_layout_candidate_for_runtime",
+                side_effect=ValueError("near candidate truncated"),
+            ),
+        ):
+            self.window.reload_runtime_state()
+
+        self.assertEqual(RuntimeStitchConfig(), self.window.runtime_stitch_config)
+        self.assertEqual("template", self.window.live_stitch_mode)
+        self.assertIsNone(self.window.live_candidate_directory)
+        self.assertIsNone(self.window.far_field_layout_candidate)
+        self.assertIsNone(self.window.runtime_layout_candidate)
+        self.assertIsNone(self.window.runtime_fisheye_intrinsics_source)
+        self.assertIn(
+            "Active project runtime restore failed",
+            self.window.application_log.toPlainText(),
+        )
+        self.assertIn(
+            "near candidate truncated",
+            self.window.application_log.toPlainText(),
+        )
+
+    def test_constructor_bad_active_state_fails_closed_with_visible_error(
+        self,
+    ) -> None:
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.latest_calibration_candidate",
+                return_value=Path("local-b2-must-be-disabled-on-state-error"),
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_active_project_runtime_defaults",
+                side_effect=ValueError("active manifest hash mismatch"),
+            ),
+        ):
+            window = MainWindow()
+        try:
+            self.assertEqual(RuntimeStitchConfig(), window.runtime_stitch_config)
+            self.assertEqual("template", window.live_stitch_mode)
+            self.assertIsNone(window.live_candidate_directory)
+            self.assertIn(
+                "Active project runtime restore failed",
+                window.application_log.toPlainText(),
+            )
+            self.assertIn(
+                "active manifest hash mismatch",
+                window.application_log.toPlainText(),
+            )
+        finally:
+            window.close()
+            window.deleteLater()
+            self.app.processEvents()
+
+    def test_project_package_export_persists_effective_live_strategy(self) -> None:
+        self.window.runtime_stitch_config = RuntimeStitchConfig()
+        self.window.live_stitch_mode = "candidate"
+        self.window.live_candidate_directory = Path("package-b2")
+        self.window.runtime_layout_candidate = self._near_runtime_candidate(
+            Path("package-near/candidate.yaml")
+        )
+        result = SimpleNamespace(
+            package_root=Path("exported-package"),
+            warnings=(),
+        )
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.QFileDialog.getExistingDirectory",
+                return_value="export-root",
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.export_project_package",
+                return_value=result,
+            ) as export_package,
+        ):
+            self.window.export_project_package_file()
+
+        self.assertEqual(
+            "candidate",
+            export_package.call_args.kwargs["live_stitch_strategy"],
+        )
+        self.assertEqual(
+            "fisheye_rectilinear_candidate",
+            export_package.call_args.kwargs["near_field_projection_source"],
+            "an inactive loaded Near candidate must keep its own projection source",
+        )
+
     def test_source_contract_is_shared_by_profile_runtime_editor_and_snapshot(
         self,
     ) -> None:
@@ -276,6 +617,175 @@ class PreviewStateTests(unittest.TestCase):
         self.assertTrue(pixmap is None or pixmap.isNull())
         self.assertFalse(self.window.back_to_grid_button.isHidden())
 
+    def test_failed_camera_frame_is_removed_and_health_is_degraded(self) -> None:
+        active = self.window.active_camera_keys()
+        self.assertGreaterEqual(len(active), 2)
+        live_key, failed_key = active[:2]
+        old_failed_frame = np.full((12, 12, 3), 99, dtype=np.uint8)
+        fresh_live_frame = np.full((12, 12, 3), 17, dtype=np.uint8)
+        self.window.frames = {
+            live_key: np.zeros((12, 12, 3), dtype=np.uint8),
+            failed_key: old_failed_frame,
+        }
+        snapshots = {
+            live_key: CameraStreamSnapshot(
+                key=live_key,
+                status=STREAM_LIVE,
+                frame=fresh_live_frame,
+                frame_timestamp=time.time(),
+                frame_count=11,
+                thread_alive=True,
+            ),
+            failed_key: CameraStreamSnapshot(
+                key=failed_key,
+                status=STREAM_FAILED,
+                frame=old_failed_frame,
+                frame_timestamp=time.time() - 30.0,
+                frame_count=7,
+                failed_read_count=1,
+                last_error="simulated disconnect",
+                thread_alive=False,
+            ),
+        }
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        self.window.last_preview_time = 0.0
+        self.window.last_process_time = 0.0
+
+        with (
+            patch.object(
+                self.window.stream_manager,
+                "latest_frames",
+                return_value=(
+                    {live_key: fresh_live_frame},
+                    snapshots,
+                ),
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "has_active_workers",
+                return_value=True,
+            ),
+            patch.object(
+                self.window.stitch_processor,
+                "submit_latest",
+            ) as submit,
+            patch.object(self.window, "log_source_coordinate_warnings"),
+        ):
+            self.window.update_live_preview()
+
+        self.assertIn(live_key, self.window.frames)
+        self.assertNotIn(failed_key, self.window.frames)
+        submit.assert_called_once()
+        submitted_frames = submit.call_args.args[1]
+        self.assertEqual({live_key}, set(submitted_frames))
+        summary = self.window.preview_status_summary.text()
+        self.assertTrue(
+            "健康: Degraded" in summary or "Health: Degraded" in summary,
+            summary,
+        )
+
+    def test_all_failed_cameras_enter_explicit_failed_health(self) -> None:
+        active = self.window.active_camera_keys()
+        self.assertTrue(active)
+        stale = np.full((12, 12, 3), 99, dtype=np.uint8)
+        self.window.frames = {key: stale for key in active}
+        snapshots = {
+            key: CameraStreamSnapshot(
+                key=key,
+                status=STREAM_FAILED,
+                frame=stale,
+                frame_timestamp=time.time() - 30.0,
+                frame_count=4,
+                failed_read_count=1,
+                last_error="simulated disconnect",
+                thread_alive=False,
+            )
+            for key in active
+        }
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        self.window.last_preview_time = 0.0
+        self.window.last_process_time = 0.0
+
+        with (
+            patch.object(
+                self.window.stream_manager,
+                "latest_frames",
+                return_value=({}, snapshots),
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "has_active_workers",
+                return_value=False,
+            ),
+            patch.object(
+                self.window.stitch_processor,
+                "submit_latest",
+            ) as submit,
+        ):
+            self.window.update_live_preview()
+
+        self.assertEqual({}, self.window.frames)
+        submit.assert_not_called()
+        self.assertFalse(self.window.preview_timer.isActive())
+        summary = self.window.preview_status_summary.text()
+        self.assertTrue(
+            "健康: Failed" in summary or "Health: Failed" in summary,
+            summary,
+        )
+
+    def test_empty_current_frame_set_rejects_inflight_stale_canvas(self) -> None:
+        active = self.window.active_camera_keys()
+        stale = np.full((12, 12, 3), 99, dtype=np.uint8)
+        self.window.frames = {key: stale for key in active}
+        self.window.canvas = stale.copy()
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        self.window.last_preview_time = 0.0
+        self.window.last_process_time = 0.0
+        snapshots = {
+            key: CameraStreamSnapshot(
+                key=key,
+                status=STREAM_LIVE,
+                frame_timestamp=time.time() - 30.0,
+                frame_count=4,
+                thread_alive=True,
+            )
+            for key in active
+        }
+        stale_result = StitchResult(
+            session_id=self.window.preview_session_id,
+            request_id=1,
+            result_id=1,
+            warped={},
+            canvas=stale.copy(),
+            elapsed_ms=1.0,
+            runtime_mode="far_field",
+            runtime_status="far_field_default",
+        )
+
+        with (
+            patch.object(
+                self.window.stream_manager,
+                "latest_frames",
+                return_value=({}, snapshots),
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "has_active_workers",
+                return_value=True,
+            ),
+            patch.object(
+                self.window.stitch_processor,
+                "take_latest_result",
+                return_value=stale_result,
+            ),
+        ):
+            self.window.update_live_preview()
+
+        self.assertEqual({}, self.window.frames)
+        self.assertIsNone(self.window.canvas)
+        self.assertEqual(0, self.window.displayed_stitch_result_id)
+        self.assertEqual(LiveHealthState.FAILED, self.window.live_health_state)
+
     def test_stopped_and_still_labels_preserve_layout(self) -> None:
         self.window.set_preview_layout_mode(PreviewLayoutMode.STITCHED)
 
@@ -361,6 +871,195 @@ class PreviewStateTests(unittest.TestCase):
 
         persist.assert_not_called()
 
+    def test_language_change_stops_live_and_qgc_before_ui_rebuild(self) -> None:
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        self.window.qgc_output_active = True
+        self.window.qgc_video_sink = MagicMock()
+        target_language = "zh_CN" if self.window.language == "en" else "en"
+        target_index = self.window.language_combo.findData(target_language)
+        self.window.language_combo.blockSignals(True)
+        self.window.language_combo.setCurrentIndex(target_index)
+        self.window.language_combo.blockSignals(False)
+        events: list[str] = []
+
+        with (
+            patch.object(self.window, "backup_before_config_write"),
+            patch.object(
+                self.window,
+                "persist_camera_config_from_widgets",
+                return_value=True,
+            ),
+            patch.object(
+                self.window,
+                "stop_qgc_output_service",
+                side_effect=lambda: events.append("qgc-stop"),
+            ) as qgc_stop,
+            patch.object(
+                self.window.stream_manager,
+                "stop",
+                side_effect=lambda *args, **kwargs: events.append(
+                    "capture-stop"
+                ),
+            ) as capture_stop,
+            patch.object(
+                self.window.stream_manager,
+                "snapshots",
+                return_value={},
+            ),
+            patch.object(
+                self.window,
+                "_build_ui",
+                side_effect=lambda: events.append("rebuild"),
+            ) as rebuild,
+            patch.object(self.window, "refresh_camera_count"),
+        ):
+            self.window.change_language()
+
+        qgc_stop.assert_called_once()
+        capture_stop.assert_called()
+        rebuild.assert_called_once()
+        self.assertLess(events.index("qgc-stop"), events.index("rebuild"))
+        self.assertLess(events.index("capture-stop"), events.index("rebuild"))
+        self.assertEqual("Stopped", self.window.live_health_state.value)
+
+    def test_open_project_stops_live_before_loading_project(self) -> None:
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        events: list[str] = []
+        project_path = str(Path("project-transition-test.dsvs.yaml"))
+
+        def load_project_side_effect(path: str) -> dict:
+            events.append("load-project")
+            self.assertEqual(project_path, path)
+            return {"version": 1}
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.QFileDialog.getOpenFileName",
+                return_value=(project_path, ""),
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_project",
+                side_effect=load_project_side_effect,
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "stop",
+                side_effect=lambda *args, **kwargs: events.append(
+                    "capture-stop"
+                ),
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "snapshots",
+                return_value={},
+            ),
+            patch.object(
+                self.window.stitch_processor,
+                "configure",
+            ),
+        ):
+            self.window.open_project_file()
+
+        self.assertIn("capture-stop", events)
+        self.assertLess(
+            events.index("capture-stop"),
+            events.index("load-project"),
+        )
+
+    def test_import_project_package_stops_live_before_activation(self) -> None:
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        events: list[str] = []
+        manifest_path = str(Path("package-transition-test.yaml"))
+        validation = SimpleNamespace(
+            valid=True,
+            errors=(),
+            warnings=(),
+            package_root=Path("package-transition-test"),
+        )
+
+        def activate_side_effect(path: str) -> SimpleNamespace:
+            events.append("activate-package")
+            self.assertEqual(manifest_path, path)
+            return SimpleNamespace(package_root=validation.package_root)
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.QFileDialog.getOpenFileName",
+                return_value=(manifest_path, ""),
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.validate_project_package",
+                return_value=validation,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.activate_project_package",
+                side_effect=activate_side_effect,
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "stop",
+                side_effect=lambda *args, **kwargs: events.append(
+                    "capture-stop"
+                ),
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "snapshots",
+                return_value={},
+            ),
+            patch.object(
+                self.window.stitch_processor,
+                "configure",
+            ),
+        ):
+            self.window.import_project_package_file()
+
+        self.assertIn("capture-stop", events)
+        self.assertLess(
+            events.index("capture-stop"),
+            events.index("activate-package"),
+        )
+
+    def test_import_project_package_aborts_when_capture_threads_are_still_exiting(
+        self,
+    ) -> None:
+        validation = SimpleNamespace(
+            valid=True,
+            errors=(),
+            warnings=(),
+            package_root=Path("package-stop-timeout"),
+        )
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.QFileDialog.getOpenFileName",
+                return_value=("package-stop-timeout/project.dcsvs.yaml", ""),
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.validate_project_package",
+                return_value=validation,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(self.window, "stop_live_preview", return_value=False),
+            patch(
+                "deep_shark_studio.gui.main_window.activate_project_package"
+            ) as activate_package,
+            patch(
+                "deep_shark_studio.gui.main_window.QMessageBox.critical"
+            ) as critical,
+        ):
+            self.window.import_project_package_file()
+
+        activate_package.assert_not_called()
+        critical.assert_called_once()
+        self.assertIn("still exiting", critical.call_args.args[2])
+
     def test_reload_runtime_state_refreshes_camera_editor_widgets(self) -> None:
         calibration = deepcopy(self.window.calibration_config)
         cameras = deepcopy(self.window.camera_config)
@@ -396,6 +1095,53 @@ class PreviewStateTests(unittest.TestCase):
         self.assertEqual(
             ["front_left", "front", "front_right"],
             self.window.active_camera_keys(),
+        )
+
+    def test_reload_runtime_state_retires_the_previous_live_session(self) -> None:
+        calibration = deepcopy(self.window.calibration_config)
+        cameras = deepcopy(self.window.camera_config)
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        previous_session = self.window.preview_session_id
+
+        def load_config(name: str):
+            return calibration if name == "calibration.yaml" else cameras
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.load_config",
+                side_effect=load_config,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.config_revision",
+                return_value="reload-revision",
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.latest_calibration_candidate",
+                return_value=None,
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "stop",
+            ) as capture_stop,
+            patch.object(
+                self.window.stream_manager,
+                "snapshots",
+                return_value={},
+            ),
+            patch.object(
+                self.window.stitch_processor,
+                "configure",
+            ),
+        ):
+            self.window.reload_runtime_state()
+
+        capture_stop.assert_called()
+        self.assertGreater(self.window.preview_session_id, previous_session)
+        self.assertTrue(
+            self.window.preview_content_mode != PreviewContentMode.LIVE
+            or self.window.stream_manager.has_active_workers(),
+            "A reload may stop or restart live preview, but must not leave a "
+            "LIVE UI backed only by the retired session.",
         )
 
     def test_static_preview_uses_current_triple_profile(self) -> None:
@@ -794,6 +1540,61 @@ class PreviewStateTests(unittest.TestCase):
         if len(active) > 1:
             self.assertIn("Failed 1", text)
 
+    def test_stitch_result_drives_effective_runtime_summary_and_overlay(
+        self,
+    ) -> None:
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        self.window.runtime_stitch_config = RuntimeStitchConfig()
+        self.window.live_candidate_directory = Path("candidate-runtime-test")
+        self.window.live_stitch_mode = "candidate"
+        canvas = np.full((24, 32, 3), 17, dtype=np.uint8)
+        qgc_frames: list[np.ndarray] = []
+        self.window.qgc_video_sink = SimpleNamespace(
+            write=lambda frame: qgc_frames.append(np.asarray(frame).copy()),
+            close=lambda: None,
+        )
+        self.window.qgc_output_active = True
+        result = StitchResult(
+            session_id=self.window.preview_session_id,
+            request_id=1,
+            result_id=1,
+            warped={},
+            canvas=canvas,
+            elapsed_ms=2.5,
+            runtime_mode="far_field",
+            runtime_status="b2_candidate_view",
+        )
+
+        with (
+            patch.object(
+                self.window.stitch_processor,
+                "take_latest_result",
+                return_value=result,
+            ),
+            patch.object(
+                self.window,
+                "should_render_canvas_now",
+                return_value=True,
+            ),
+        ):
+            self.window.apply_latest_stitch_result()
+
+        self.window.update_preview_status_summary()
+        self.assertEqual(
+            "b2_candidate_view",
+            self.window.effective_runtime_status(),
+        )
+        self.assertIn(
+            "b2_candidate_view",
+            self.window.preview_status_summary.text(),
+        )
+        self.assertIn("QGC: Running", self.window.preview_status_summary.text())
+        self.assertIn("B-2", self.window.canvas_view.overlay_text)
+        self.assertEqual(1, len(qgc_frames))
+        qgc_status = self.window.qgc_output_service_status.text()
+        self.assertIn("runtime b2_candidate_view", qgc_status)
+        self.assertIn("projection b2_candidate_projection", qgc_status)
+
     def test_stitched_notice_and_camera_error_placeholders_are_actionable(
         self,
     ) -> None:
@@ -919,6 +1720,145 @@ class PreviewStateTests(unittest.TestCase):
         start.assert_not_called()
         stop.assert_not_called()
         save_config.assert_not_called()
+
+    def test_applied_near_candidate_clear_reconfigures_live_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            candidate_path = Path(temp) / "candidate.yaml"
+            candidate_path.write_text(
+                "\n".join(
+                    [
+                        "schema_version: 2",
+                        "candidate_type: front_priority_layout",
+                        "profile_id: triple_front_panorama",
+                        "source:",
+                        "  mode: unit_test",
+                        "  calibration_hash: ignored-for-test",
+                        "camera_adjust:",
+                        "  front_left: {x_offset_px: 0, y_offset_px: 0, scale: 1.0}",
+                        "  front: {x_offset_px: 0, y_offset_px: 0, scale: 1.0}",
+                        "  front_right: {x_offset_px: 0, y_offset_px: 0, scale: 1.0}",
+                        "left_pair: {side_shift_px: 40, side_visible_fraction: 0.3, feather_width_px: 24}",
+                        "right_pair: {side_shift_px: 40, side_visible_fraction: 0.3, feather_width_px: 24}",
+                        "output: {width_px: 1800, height_px: 700}",
+                        "vertical_safety: {enabled: false, vertical_safe_ratio: 1.0, side_vertical_fade_px: 0}",
+                        "formal_profile_modified: false",
+                        "writes_calibration_yaml: false",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            self.window.preview_content_mode = PreviewContentMode.LIVE
+            initial_session = self.window.preview_session_id
+            self.window.load_runtime_layout_candidate_path(candidate_path)
+            self.assertEqual(
+                "far_field_default",
+                self.window.effective_runtime_status(),
+            )
+            self.assertEqual(initial_session, self.window.preview_session_id)
+
+            near_index = self.window.runtime_mode_combo.findData(
+                StitchRuntimeMode.NEAR_FIELD.value
+            )
+            self.window.runtime_mode_combo.setCurrentIndex(near_index)
+            self.window.apply_stitch_runtime_config()
+            applied_session = self.window.preview_session_id
+            self.assertGreater(applied_session, initial_session)
+            self.assertEqual(
+                "near_field_current_perspective",
+                self.window.effective_runtime_status(),
+            )
+
+            self.window.load_runtime_layout_candidate_path(candidate_path)
+            replacement_session = self.window.preview_session_id
+            self.assertGreater(replacement_session, applied_session)
+            self.assertEqual(
+                "near_field_current_perspective",
+                self.window.stitch_processor.state().runtime_status,
+            )
+            applied_session = replacement_session
+
+            self.window.clear_runtime_layout_candidate()
+
+        self.assertGreater(self.window.preview_session_id, applied_session)
+        self.assertEqual(
+            "far_field_default",
+            self.window.effective_runtime_status(),
+        )
+        state = self.window.stitch_processor.state()
+        self.assertEqual(
+            "far_field_default",
+            state.runtime_status,
+        )
+
+    def test_save_camera_config_restarts_live_capture_with_new_sources(
+        self,
+    ) -> None:
+        self.window.set_preview_content_mode(PreviewContentMode.LIVE)
+        existing_stitcher = self.window.stitcher
+
+        def revision(name: str) -> str:
+            if name == "cameras.yaml":
+                return self.window._camera_config_revision
+            return self.window._calibration_config_revision
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.config_revision",
+                side_effect=revision,
+            ),
+            patch.object(self.window, "backup_before_config_write"),
+            patch.object(
+                self.window,
+                "persist_camera_config_from_widgets",
+                return_value=True,
+            ),
+            patch.object(
+                self.window,
+                "persist_calibration_config",
+                return_value=True,
+            ),
+            patch.object(
+                self.window,
+                "create_stitcher",
+                return_value=existing_stitcher,
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "stop",
+            ) as capture_stop,
+            patch.object(
+                self.window.stream_manager,
+                "start",
+            ) as capture_start,
+            patch.object(
+                self.window.stream_manager,
+                "snapshots",
+                return_value={},
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "has_active_workers",
+                return_value=True,
+            ),
+            patch.object(
+                self.window.stitch_processor,
+                "configure",
+            ),
+            patch.object(self.window, "refresh_seam_editor"),
+            patch.object(self.window, "update_topology_diagnostics"),
+        ):
+            self.window.save_camera_config()
+
+        capture_stop.assert_called()
+        capture_start.assert_called_once()
+        self.assertEqual(
+            self.window.live_stream_configs(),
+            capture_start.call_args.args[0],
+        )
+        self.assertEqual(
+            PreviewContentMode.LIVE,
+            self.window.preview_content_mode,
+        )
 
     def test_wizard_restores_incomplete_session_at_correct_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

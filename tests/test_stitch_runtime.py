@@ -153,6 +153,7 @@ class StitchRuntimeTests(unittest.TestCase):
         self.assertEqual(1, stitcher.process_calls)
         self.assertEqual(0, stitcher.warp_all_calls)
         self.assertEqual(StitchRuntimeMode.FAR_FIELD, result.mode)
+        self.assertEqual("far_field_default", result.status)
 
     def test_near_field_requires_layout_candidate(self) -> None:
         stitcher = FakeStitcher()
@@ -224,6 +225,10 @@ class StitchRuntimeTests(unittest.TestCase):
             self.assertEqual((700, 1800), result.canvas.shape[:2])
             self.assertEqual(StitchRuntimeMode.NEAR_FIELD, result.mode)
             self.assertEqual(
+                "near_field_current_perspective",
+                result.status,
+            )
+            self.assertEqual(
                 "CurrentPerspectiveProjectionProvider",
                 result.metrics["projection"]["provider_name"],
             )
@@ -267,6 +272,10 @@ class StitchRuntimeTests(unittest.TestCase):
 
             self.assertEqual(1, provider.project_calls)
             self.assertEqual((700, 1800), result.canvas.shape[:2])
+            self.assertEqual(
+                "near_field_fisheye_rectilinear",
+                result.status,
+            )
 
     def test_far_field_does_not_use_projection_provider(self) -> None:
         stitcher = FakeStitcher()
@@ -524,7 +533,7 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         self.assertNotIn("Runtime", self.window.runtime_apply_button.text())
         self.assertIn("calibration.yaml", self.window.runtime_apply_button.toolTip())
         self.assertIn("B-2", self.window.candidate_stitch_button.text())
-        self.assertFalse(self.window.template_stitch_button.isVisible())
+        self.assertFalse(self.window.template_stitch_button.isHidden())
         far_text = self.window.far_field_load_candidate_button.text()
         near_text = self.window.runtime_load_candidate_button.text()
         self.assertTrue("Far-field" in far_text or "远景" in far_text)

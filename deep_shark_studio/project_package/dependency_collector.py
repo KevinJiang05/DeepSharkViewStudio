@@ -9,7 +9,7 @@ from typing import Any
 
 from deep_shark_studio.config import load_yaml, save_yaml
 
-from .path_resolver import is_absolute_path_string
+from .path_resolver import ProjectPathError, is_absolute_path_string, resolve_project_path
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,9 @@ class PackageDependency:
 
 def candidate_yaml_path(path: str | Path) -> Path:
     source = Path(path)
-    return source if source.is_file() else source / "candidate.yaml"
+    if source.is_file() or source.suffix.lower() in {".yaml", ".yml"}:
+        return source
+    return source / "candidate.yaml"
 
 
 def collect_b2_candidate_dependencies(
@@ -45,19 +47,21 @@ def collect_b2_candidate_dependencies(
     remaps = files.get("remaps") if isinstance(files, dict) else None
     if isinstance(remaps, dict):
         for camera, relative in remaps.items():
-            if isinstance(relative, str) and not is_absolute_path_string(relative):
+            if isinstance(relative, str):
+                source, normalized = _safe_dependency_path(root, relative)
                 dependencies.append(
                     PackageDependency(
-                        root / relative,
-                        Path(relative).as_posix(),
+                        source,
+                        normalized,
                         f"b2_remap:{camera}",
                     )
                 )
     if include_preview_assets and isinstance(files, dict):
         for relative in _iter_relative_strings(files):
             if not relative.startswith("intrinsics/"):
+                source, normalized = _safe_dependency_path(root, relative)
                 dependencies.append(
-                    PackageDependency(root / relative, Path(relative).as_posix(), "b2_preview", required=False)
+                    PackageDependency(source, normalized, "b2_preview", required=False)
                 )
     return _dedupe_dependencies(dependencies)
 
@@ -74,13 +78,37 @@ def copy_candidate_directory(
     dest_root = Path(destination)
     copied: list[Path] = []
     for name in ("candidate.yaml", "report.yaml"):
-        copied.extend(_copy_optional_file(source_root / name, dest_root / name))
+        copied.extend(
+            _copy_optional_file(
+                source_root / name,
+                dest_root / name,
+                source_root=source_root,
+            )
+        )
     if include_preview_assets:
-        copied.extend(_copy_optional_tree(source_root / "previews", dest_root / "previews"))
+        copied.extend(
+            _copy_optional_tree(
+                source_root / "previews",
+                dest_root / "previews",
+                candidate_root=source_root,
+            )
+        )
         for name in ("preview.png", "preview_with_overlay.png"):
-            copied.extend(_copy_optional_file(source_root / name, dest_root / name))
+            copied.extend(
+                _copy_optional_file(
+                    source_root / name,
+                    dest_root / name,
+                    source_root=source_root,
+                )
+            )
     if include_debug_assets:
-        copied.extend(_copy_optional_tree(source_root / "debug", dest_root / "debug"))
+        copied.extend(
+            _copy_optional_tree(
+                source_root / "debug",
+                dest_root / "debug",
+                candidate_root=source_root,
+            )
+        )
     return copied
 
 
@@ -99,14 +127,22 @@ def copy_b2_candidate_directory(
     ):
         if not dependency.source.exists():
             continue
+        destination_path = resolve_project_path(dest_root, dependency.relative_path)
         copied.extend(
             _copy_optional_file(
                 dependency.source,
-                dest_root / dependency.relative_path,
+                destination_path,
+                source_root=source_root,
             )
         )
     for name in ("candidate.yaml", "report.yaml"):
-        copied.extend(_copy_optional_file(source_root / name, dest_root / name))
+        copied.extend(
+            _copy_optional_file(
+                source_root / name,
+                dest_root / name,
+                source_root=source_root,
+            )
+        )
     return _dedupe_paths(copied)
 
 
@@ -166,22 +202,66 @@ def _iter_relative_strings(value: Any) -> list[str]:
     return items
 
 
-def _copy_optional_file(source: Path, destination: Path) -> list[Path]:
+def _safe_dependency_path(root: Path, relative: str) -> tuple[Path, str]:
+    """Resolve one dependency inside its candidate directory.
+
+    Rejecting here is intentional: export must never even attempt a read from
+    or a write to a traversal target.  Validation catches the same
+    ProjectPathError and reports it as a package error.
+    """
+    if is_absolute_path_string(relative):
+        raise ProjectPathError(f"Candidate dependency must be relative: {relative}")
+    source = resolve_project_path(root, relative)
+    normalized = source.relative_to(root.resolve()).as_posix()
+    return source, normalized
+
+
+def _copy_optional_file(
+    source: Path,
+    destination: Path,
+    *,
+    source_root: Path | None = None,
+) -> list[Path]:
     if not source.exists() or not source.is_file():
         return []
+    if source_root is not None:
+        try:
+            source.resolve().relative_to(source_root.resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProjectPathError(
+                f"Candidate source escapes candidate root: {source}"
+            ) from exc
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     return [destination]
 
 
-def _copy_optional_tree(source: Path, destination: Path) -> list[Path]:
+def _copy_optional_tree(
+    source: Path,
+    destination: Path,
+    *,
+    candidate_root: Path | None = None,
+) -> list[Path]:
     if not source.exists() or not source.is_dir():
         return []
     copied: list[Path] = []
+    source_root = (candidate_root or source).resolve()
+    try:
+        source.resolve().relative_to(source_root)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProjectPathError(
+            f"Candidate asset tree escapes candidate root: {source}"
+        ) from exc
     for child in source.rglob("*"):
         if child.is_file():
             relative = child.relative_to(source)
-            copied.extend(_copy_optional_file(child, destination / relative))
+            copied.extend(
+                _copy_optional_file(
+                    child,
+                    destination / relative,
+                    source_root=source_root,
+                )
+            )
     return copied
 
 

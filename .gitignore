@@ -1,6 +1,7 @@
 # Local camera and network configuration
 configs/cameras.yaml
 configs/network.yaml
+configs/active_project.yaml
 
 # Runtime projects, captures, calibration artifacts, and reports
 projects/backups/

@@ -110,3 +110,27 @@ def coerce_projection_source(value: ProjectionSource | str) -> ProjectionSource:
     if isinstance(value, ProjectionSource):
         return value
     return ProjectionSource(str(value))
+
+
+def resolve_effective_runtime_status(
+    runtime_config: RuntimeStitchConfig,
+    *,
+    processor_mode: str = "template",
+) -> str:
+    """Return the concrete processing path selected by a worker configuration."""
+    if processor_mode == "candidate":
+        return "b2_candidate_view"
+
+    config = runtime_config.normalized()
+    if config.mode == StitchRuntimeMode.AUTO:
+        return "auto_fallback_far_field"
+    if config.mode == StitchRuntimeMode.NEAR_FIELD:
+        if (
+            config.projection_source
+            == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE
+        ):
+            return "near_field_fisheye_rectilinear"
+        return "near_field_current_perspective"
+    if config.use_far_field_custom_layout:
+        return "far_field_custom"
+    return "far_field_default"

@@ -1,12 +1,6 @@
 # DeepShark View Studio
 
-DeepShark View Studio is a standalone surround-view development tool extracted from the legacy `Code_End` prototype. It is intended to become the lab tool for camera preview, camera-source configuration, chessboard calibration, perspective tuning, and surround-view stitching before any QGC integration.
-
-The legacy project remains untouched at:
-
-```text
-D:\Develop\image_mosaic\Code_End
-```
+DeepShark View Studio is a standalone surround-view development tool extracted from the legacy `Code_End` prototype. It is intended to become the lab tool for camera preview, camera-source configuration, chessboard calibration, perspective tuning, and surround-view stitching before any QGC integration. The legacy source tree is not required to install or run this repository.
 
 ## Current Features
 
@@ -78,8 +72,10 @@ DeepSharkViewStudio/
   requirements.txt
   configs/
     calibration.yaml
-    cameras.yaml
-    network.yaml
+    cameras.example.yaml
+    network.example.yaml
+    cameras.yaml          # local, initialized explicitly and ignored by Git
+    network.yaml          # local, initialized explicitly and ignored by Git
   deep_shark_studio/
     config.py
     camera.py
@@ -97,24 +93,30 @@ DeepSharkViewStudio/
 
 ## Install
 
-Create or activate a Python environment, then install dependencies:
+From a fresh checkout, create a repository-local environment and install the tracked dependencies:
 
 ```powershell
-cd D:\Develop\image_mosaic\DeepSharkViewStudio
-python -m pip install -r requirements.txt
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-This workstation also has a prepared shared environment:
+The launcher first uses `.venv\Scripts\python.exe`, then falls back to `py -3` and `python`. It contains no machine-specific drive or environment path.
 
-```text
-D:\Develop\envs\deep-shark-view-studio
+## Local Configuration And First Start
+
+`configs/calibration.yaml` is tracked because it contains device-specific calibration data. Local camera and network settings are deliberately not tracked. Initialize only the missing local files from the safe examples:
+
+```powershell
+.\.venv\Scripts\python.exe app.py --initialize-configs --preflight-only
 ```
 
-If a dependency is missing and installation is not available, check the shared environment directory first:
+Initialization is explicit and transactional: it creates missing `cameras.yaml` and `network.yaml`, never overwrites an existing file, and never generates or replaces `calibration.yaml`. Review camera sources before starting live preview. Re-run the read-only preflight at any time with:
 
-```text
-D:\Develop\envs
+```powershell
+.\.venv\Scripts\python.exe app.py --preflight-only
 ```
+
+Both commands can also be passed through `StartDeepSharkViewStudio.cmd`. A normal launch remains read-only and reports a clear error when required local configs are absent or invalid.
 
 ## Image Demo
 
@@ -131,14 +133,7 @@ right
 Then run:
 
 ```powershell
-cd D:\Develop\image_mosaic\DeepSharkViewStudio
 python tools\run_image_demo.py
-```
-
-With the shared environment:
-
-```powershell
-D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe tools\run_image_demo.py
 ```
 
 Results are written to:
@@ -148,10 +143,10 @@ samples/output/canvas.jpg
 samples/output/*_warped.jpg
 ```
 
-You can also point the demo at the legacy sample images:
+You can also point the demo at another image directory:
 
 ```powershell
-python tools\run_image_demo.py --input D:\Develop\image_mosaic\Code_End\3D_opengl_bowl_combined_mode2\Img
+python tools\run_image_demo.py --input <path-to-images>
 ```
 
 ## GUI
@@ -159,20 +154,13 @@ python tools\run_image_demo.py --input D:\Develop\image_mosaic\Code_End\3D_openg
 Run:
 
 ```powershell
-cd D:\Develop\image_mosaic\DeepSharkViewStudio
-python app.py
+StartDeepSharkViewStudio.cmd
 ```
 
-With the shared environment:
+Or, from an activated environment:
 
 ```powershell
-D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe app.py
-```
-
-Or double-click:
-
-```text
-D:\Develop\image_mosaic\DeepSharkViewStudio\StartDeepSharkViewStudio.cmd
+python app.py
 ```
 
 The GUI currently supports:
