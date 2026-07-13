@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ class FarFieldLayoutRuntimeCandidate:
     raw: dict[str, Any]
     projection_source: str = "current_perspective"
     b2_candidate_directory: Path | None = None
+    blend_mode: str | None = None
 
     @property
     def candidate_directory(self) -> Path:
@@ -104,6 +106,16 @@ def load_far_field_layout_candidate(
         raise FarFieldLayoutCandidateError(
             "far_field_blend.mode must be current_horizontal_feather or b2_weight_selection."
         )
+    expected_blend_mode = (
+        "b2_weight_selection"
+        if projection_source == B2_FAR_FIELD_PROJECTION_SOURCE
+        else "current_horizontal_feather"
+    )
+    if blend_mode != expected_blend_mode:
+        raise FarFieldLayoutCandidateError(
+            f"projection.source={projection_source} requires "
+            f"far_field_blend.mode={expected_blend_mode}; got {blend_mode}."
+        )
     feather_override = blend.get("feather_width_override_px")
     if feather_override is not None:
         feather_override = _bounded_int(
@@ -148,6 +160,7 @@ def load_far_field_layout_candidate(
         raw=data,
         projection_source=projection_source,
         b2_candidate_directory=b2_candidate_directory,
+        blend_mode=blend_mode,
     )
 
 
@@ -256,7 +269,7 @@ def _projection_block_from_source(source: dict[str, Any] | None) -> dict[str, An
         block = {
             "source": B2_FAR_FIELD_PROJECTION_SOURCE,
             "candidate_directory": str(candidate_directory),
-            "note": "Far-field custom layout uses read-only B-2 per-camera warped images before horizontal feather composition.",
+            "note": "Far-field custom layout uses read-only B-2 per-camera warped images with B-2 weight-selection composition.",
         }
         return block
     return {
@@ -298,7 +311,7 @@ def _parse_camera_adjust(raw: dict[str, Any]) -> dict[str, CameraAdjustParams]:
         parsed[camera] = CameraAdjustParams(
             x_offset_px=_bounded_int(values, "x_offset_px", -240, 240, f"camera_adjust.{camera}.x_offset_px"),
             y_offset_px=_bounded_int(values, "y_offset_px", -160, 160, f"camera_adjust.{camera}.y_offset_px"),
-            scale=_bounded_float(values, "scale", 0.5, 1.5, f"camera_adjust.{camera}.scale"),
+            scale=_bounded_float(values, "scale", 0.8, 1.2, f"camera_adjust.{camera}.scale"),
         )
     return parsed
 
@@ -334,7 +347,10 @@ def _bounded_int(
     value = data.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FarFieldLayoutCandidateError(f"{label} must be numeric.")
-    result = int(round(float(value)))
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise FarFieldLayoutCandidateError(f"{label} must be finite.")
+    result = int(round(numeric))
     if result < minimum or result > maximum:
         raise FarFieldLayoutCandidateError(
             f"{label}={result} is outside [{minimum}, {maximum}]."
@@ -353,6 +369,8 @@ def _bounded_float(
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise FarFieldLayoutCandidateError(f"{label} must be numeric.")
     result = float(value)
+    if not math.isfinite(result):
+        raise FarFieldLayoutCandidateError(f"{label} must be finite.")
     if result < minimum or result > maximum:
         raise FarFieldLayoutCandidateError(
             f"{label}={result} is outside [{minimum}, {maximum}]."

@@ -15,6 +15,8 @@ from unittest import mock
 
 import yaml
 
+from deep_shark_studio.config import DEFAULT_PROCESS_FPS
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_SOURCE = PROJECT_ROOT / "configs"
@@ -330,6 +332,10 @@ class CleanCheckoutAssetsTests(unittest.TestCase):
         self.assertIn("camera_order", cameras)
         self.assertIn("cameras", cameras)
         self.assertIn("performance", cameras)
+        self.assertEqual(
+            DEFAULT_PROCESS_FPS,
+            cameras["performance"]["process_fps"],
+        )
         self.assertIsInstance(network, dict)
         self.assertIn("output", network)
         self.assertIn("udp_legacy", network)

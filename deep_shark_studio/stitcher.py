@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from pathlib import Path
 from typing import Any
@@ -10,7 +10,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .calibration import undistort_image
+from .calibration import scale_camera_matrix_for_resolution
 from .masks import crop_image_by_line
 from .topology import (
     compose_horizontal_feather,
@@ -27,6 +27,20 @@ class CameraCalibration:
     name: str
     source_points: np.ndarray
     target_points: np.ndarray
+    _matrix: np.ndarray = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.source_points.shape != (4, 2) or self.target_points.shape != (4, 2):
+            raise ValueError(f"{self.name} perspective points must both have shape (4, 2).")
+        if not np.all(np.isfinite(self.source_points)) or not np.all(
+            np.isfinite(self.target_points)
+        ):
+            raise ValueError(f"{self.name} perspective points must be finite.")
+        object.__setattr__(
+            self,
+            "_matrix",
+            cv2.getPerspectiveTransform(self.source_points, self.target_points),
+        )
 
     @classmethod
     def from_config(cls, name: str, config: dict[str, Any]) -> "CameraCalibration":
@@ -38,7 +52,7 @@ class CameraCalibration:
 
     @property
     def matrix(self) -> np.ndarray:
-        return cv2.getPerspectiveTransform(self.source_points, self.target_points)
+        return self._matrix
 
 
 class SurroundStitcher:
@@ -73,6 +87,13 @@ class SurroundStitcher:
         self.camera_intrinsics = config.get("camera_intrinsics", {})
         self._masks: dict[str, np.ndarray] = {}
         self._source_diagnostic_sizes: dict[str, tuple[int, int]] = {}
+        self._intrinsics_remap_cache: dict[
+            tuple[str, int, int],
+            tuple[np.ndarray, np.ndarray, np.ndarray],
+        ] = {}
+        self._geometry_mask_cache: dict[tuple[str, int, int], np.ndarray] = {}
+        self._runtime_geometry_cache_limit = max(4, len(self.active_camera_keys) * 2)
+        self._validate_intrinsics_contract()
 
     def source_diagnostics(
         self,
@@ -95,7 +116,23 @@ class SurroundStitcher:
             actual_raw_size,
         )
 
+    @property
+    def geometry_mask_cache_entries(self) -> int:
+        return len(self._geometry_mask_cache)
+
+    @property
+    def intrinsics_remap_cache_entries(self) -> int:
+        return len(self._intrinsics_remap_cache)
+
     def warp(self, image: np.ndarray, camera_name: str) -> np.ndarray:
+        warped, _mask = self.warp_with_mask(image, camera_name)
+        return warped
+
+    def warp_with_mask(
+        self,
+        image: np.ndarray,
+        camera_name: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
         calibration = self.cameras[camera_name]
         raw_size = (int(image.shape[1]), int(image.shape[0]))
         if (
@@ -109,34 +146,96 @@ class SurroundStitcher:
             )["warnings"]:
                 LOGGER.warning("Source coordinate warning: %s", warning)
         matrix = calibration.matrix.copy()
+        processed = image
         if self.max_input_width and image.shape[1] > self.max_input_width:
-            scale = self.max_input_width / float(image.shape[1])
-            image = cv2.resize(image, (self.max_input_width, int(image.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+            scale_x = self.max_input_width / float(image.shape[1])
+            resized_height = max(1, int(round(image.shape[0] * scale_x)))
+            scale_y = resized_height / float(image.shape[0])
+            processed = cv2.resize(
+                image,
+                (self.max_input_width, resized_height),
+                interpolation=cv2.INTER_AREA,
+            )
             scale_matrix = np.array(
-                [[1.0 / scale, 0.0, 0.0], [0.0, 1.0 / scale, 0.0], [0.0, 0.0, 1.0]],
+                [
+                    [1.0 / scale_x, 0.0, 0.0],
+                    [0.0, 1.0 / scale_y, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
                 dtype=np.float64,
             )
             matrix = matrix @ scale_matrix
-        if self.use_intrinsics and camera_name in self.camera_intrinsics:
-            image = undistort_image(image, self.camera_intrinsics[camera_name])
-        return cv2.warpPerspective(
-            image,
+        source_valid: np.ndarray | None = None
+        if self.use_intrinsics:
+            map_x, map_y, source_valid = self._intrinsics_remap(
+                camera_name,
+                (int(processed.shape[1]), int(processed.shape[0])),
+            )
+            processed = cv2.remap(
+                processed,
+                map_x,
+                map_y,
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+        warped = cv2.warpPerspective(
+            processed,
             matrix,
             (self.output_width, self.output_height),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=(0, 0, 0),
         )
+        cache_key = (camera_name, raw_size[0], raw_size[1])
+        valid_mask = self._geometry_mask_cache.get(cache_key)
+        if valid_mask is None:
+            if source_valid is None:
+                source_valid = np.ones(processed.shape[:2], dtype=np.uint8)
+            valid_mask = cv2.warpPerspective(
+                np.asarray(source_valid, dtype=np.uint8),
+                matrix,
+                (self.output_width, self.output_height),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ).astype(bool)
+            valid_mask.flags.writeable = False
+            self._store_bounded_runtime_geometry(
+                self._geometry_mask_cache,
+                cache_key,
+                valid_mask,
+            )
+        warped = cv2.copyTo(
+            warped,
+            np.ascontiguousarray(valid_mask, dtype=np.uint8),
+        )
+        return warped, valid_mask
 
     def warp_all(self, frames: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        warped, _valid_masks = self.warp_all_with_masks(frames)
+        return warped
+
+    def warp_all_with_masks(
+        self,
+        frames: dict[str, np.ndarray],
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
         warped: dict[str, np.ndarray] = {}
+        valid_masks: dict[str, np.ndarray] = {}
         for camera_name, frame in frames.items():
             if camera_name not in self.cameras or camera_name not in self.active_camera_keys:
                 continue
-            warped[camera_name] = self.warp(frame, camera_name)
-        return warped
+            warped[camera_name], valid_masks[camera_name] = self.warp_with_mask(
+                frame,
+                camera_name,
+            )
+        return warped, valid_masks
 
-    def stitch(self, warped_images: dict[str, np.ndarray]) -> np.ndarray:
+    def stitch(
+        self,
+        warped_images: dict[str, np.ndarray],
+        valid_masks: dict[str, np.ndarray] | None = None,
+    ) -> np.ndarray:
         if self.composition.get("mode") == "horizontal_feather":
             return compose_horizontal_feather(
                 warped_images,
@@ -145,6 +244,7 @@ class SurroundStitcher:
                 self.stitch_points,
                 self.overlaps,
                 int(self.composition.get("feather_width", 120)),
+                valid_masks=valid_masks,
             )
 
         self._ensure_masks()
@@ -163,8 +263,100 @@ class SurroundStitcher:
         return canvas
 
     def process(self, frames: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], np.ndarray]:
-        warped = self.warp_all(frames)
-        return warped, self.stitch(warped)
+        warped, valid_masks = self.warp_all_with_masks(frames)
+        return warped, self.stitch(warped, valid_masks=valid_masks)
+
+    def _validate_intrinsics_contract(self) -> None:
+        if not self.use_intrinsics:
+            return
+        missing = [
+            camera
+            for camera in self.active_camera_keys
+            if camera not in self.camera_intrinsics
+        ]
+        if missing:
+            raise ValueError(
+                "Pinhole intrinsics are enabled but missing for active cameras: "
+                + ", ".join(missing)
+            )
+        reference_sizes: set[tuple[int, int]] = set()
+        for camera in self.active_camera_keys:
+            intrinsics = self.camera_intrinsics[camera]
+            image_size = intrinsics.get("image_size")
+            if not isinstance(image_size, (list, tuple)) or len(image_size) != 2:
+                raise ValueError(f"{camera} intrinsics.image_size must contain width and height.")
+            size = (int(image_size[0]), int(image_size[1]))
+            if min(size) <= 0:
+                raise ValueError(f"{camera} intrinsics.image_size must be positive.")
+            reference_sizes.add(size)
+            matrix = np.asarray(intrinsics.get("camera_matrix"), dtype=np.float64)
+            distortion = np.asarray(intrinsics.get("distortion"), dtype=np.float64)
+            if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+                raise ValueError(f"{camera} intrinsics.camera_matrix must be finite 3x3.")
+            if distortion.size < 4 or not np.all(np.isfinite(distortion)):
+                raise ValueError(f"{camera} intrinsics.distortion must be finite.")
+        if len(reference_sizes) != 1:
+            raise ValueError(
+                "Active-camera intrinsics must use one consistent calibration image_size."
+            )
+
+    def _intrinsics_remap(
+        self,
+        camera_name: str,
+        runtime_size: tuple[int, int],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        key = (camera_name, int(runtime_size[0]), int(runtime_size[1]))
+        cached = self._intrinsics_remap_cache.get(key)
+        if cached is not None:
+            return cached
+        intrinsics = self.camera_intrinsics[camera_name]
+        calibration_size = tuple(int(value) for value in intrinsics["image_size"])
+        camera_matrix = scale_camera_matrix_for_resolution(
+            np.asarray(intrinsics["camera_matrix"], dtype=np.float64),
+            calibration_size=calibration_size,
+            runtime_size=runtime_size,
+        )
+        distortion = np.asarray(intrinsics["distortion"], dtype=np.float64)
+        new_matrix, _roi = cv2.getOptimalNewCameraMatrix(
+            camera_matrix,
+            distortion,
+            runtime_size,
+            1,
+            runtime_size,
+        )
+        map_x, map_y = cv2.initUndistortRectifyMap(
+            camera_matrix,
+            distortion,
+            None,
+            new_matrix,
+            runtime_size,
+            cv2.CV_32FC1,
+        )
+        source_valid = cv2.remap(
+            np.ones((runtime_size[1], runtime_size[0]), dtype=np.uint8),
+            map_x,
+            map_y,
+            cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        cached = (map_x, map_y, source_valid)
+        self._store_bounded_runtime_geometry(
+            self._intrinsics_remap_cache,
+            key,
+            cached,
+        )
+        return cached
+
+    def _store_bounded_runtime_geometry(
+        self,
+        cache: dict[Any, Any],
+        key: Any,
+        value: Any,
+    ) -> None:
+        if key not in cache and len(cache) >= self._runtime_geometry_cache_limit:
+            cache.pop(next(iter(cache)))
+        cache[key] = value
 
     def _ensure_masks(self) -> None:
         if self._masks:

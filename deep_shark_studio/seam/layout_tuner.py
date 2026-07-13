@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+import math
 from pathlib import Path
 from typing import Any
 
@@ -106,10 +107,16 @@ class LayoutPreviewParamsV2:
     output_height_px: int = 700
     vertical_safe_ratio: float = 1.00
     side_vertical_fade_px: int = 0
+    vertical_safety_enabled_override: bool | None = None
 
     def __post_init__(self) -> None:
         if self.camera_adjust is None:
             object.__setattr__(self, "camera_adjust", identity_camera_adjust())
+        if (
+            self.vertical_safety_enabled_override is not None
+            and not isinstance(self.vertical_safety_enabled_override, bool)
+        ):
+            raise ValueError("vertical_safety_enabled_override must be a boolean or None.")
 
     @property
     def layout_id(self) -> str:
@@ -137,6 +144,8 @@ class LayoutPreviewParamsV2:
         )
 
     def vertical_safety_enabled(self, canvas_height: int | None = None) -> bool:
+        if self.vertical_safety_enabled_override is not None:
+            return self.vertical_safety_enabled_override
         height_changed = (
             canvas_height is not None
             and int(self.output_height_px) < int(canvas_height)
@@ -533,9 +542,10 @@ def _float_or_none(value: Any) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return None
+    return result if math.isfinite(result) else None
 
 
 def _from_layout_result(

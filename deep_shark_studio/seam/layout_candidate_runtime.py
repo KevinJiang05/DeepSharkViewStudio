@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,7 @@ class LayoutRuntimeCandidate:
             output_height_px=self.output_height_px,
             vertical_safe_ratio=self.vertical_safe_ratio,
             side_vertical_fade_px=self.side_vertical_fade_px,
+            vertical_safety_enabled_override=self.vertical_safety_enabled,
         )
 
     @property
@@ -121,7 +123,11 @@ def load_layout_candidate_for_runtime(
     output_width = _bounded_int(output, "width_px", 1, 5000, "output.width_px")
     output_height = _bounded_int(output, "height_px", 1, 3000, "output.height_px")
     vertical = _required_mapping(data, "vertical_safety")
-    vertical_enabled = bool(vertical.get("enabled", False))
+    vertical_enabled = _required_bool(
+        vertical,
+        "enabled",
+        "vertical_safety.enabled",
+    )
     vertical_safe_ratio = _bounded_float(
         vertical,
         "vertical_safe_ratio",
@@ -152,6 +158,21 @@ def load_layout_candidate_for_runtime(
         )
 
     profile = active_stitch_profile(load_yaml(calibration_path))
+    canvas_width, canvas_height = _profile_canvas_size(profile)
+    if output_width > canvas_width or output_height > canvas_height:
+        raise LayoutCandidateRuntimeError(
+            f"Candidate output {output_width}x{output_height} exceeds active profile "
+            f"canvas {canvas_width}x{canvas_height}."
+        )
+    if not vertical_enabled and (
+        output_height != canvas_height
+        or not math.isclose(vertical_safe_ratio, 1.0, rel_tol=0.0, abs_tol=1.0e-9)
+        or side_vertical_fade != 0
+    ):
+        raise LayoutCandidateRuntimeError(
+            "vertical_safety is disabled but output height, safe ratio, or side fade "
+            "requests an active vertical adjustment."
+        )
     pair_candidates = layout_tuner_pair_candidates(profile)
     if not pair_candidates:
         raise LayoutCandidateRuntimeError(
@@ -256,7 +277,7 @@ def _parse_camera_adjust(raw: dict[str, Any]) -> dict[str, CameraAdjustParams]:
         parsed[camera] = CameraAdjustParams(
             x_offset_px=_bounded_int(values, "x_offset_px", -240, 240, f"camera_adjust.{camera}.x_offset_px"),
             y_offset_px=_bounded_int(values, "y_offset_px", -160, 160, f"camera_adjust.{camera}.y_offset_px"),
-            scale=_bounded_float(values, "scale", 0.5, 1.5, f"camera_adjust.{camera}.scale"),
+            scale=_bounded_float(values, "scale", 0.8, 1.2, f"camera_adjust.{camera}.scale"),
         )
     return parsed
 
@@ -296,6 +317,35 @@ def _required_str(data: dict[str, Any], key: str) -> str:
     return value
 
 
+def _required_bool(data: dict[str, Any], key: str, label: str) -> bool:
+    value = data.get(key)
+    if not isinstance(value, bool):
+        raise LayoutCandidateRuntimeError(f"{label} must be a boolean.")
+    return value
+
+
+def _profile_canvas_size(profile: dict[str, Any]) -> tuple[int, int]:
+    canvas = profile.get("canvas")
+    if not isinstance(canvas, dict):
+        raise LayoutCandidateRuntimeError("Active profile canvas is missing.")
+    width = canvas.get("width")
+    height = canvas.get("height")
+    if (
+        isinstance(width, bool)
+        or isinstance(height, bool)
+        or not isinstance(width, (int, float))
+        or not isinstance(height, (int, float))
+        or not math.isfinite(float(width))
+        or not math.isfinite(float(height))
+    ):
+        raise LayoutCandidateRuntimeError("Active profile canvas dimensions must be finite.")
+    width_px = int(round(float(width)))
+    height_px = int(round(float(height)))
+    if width_px <= 0 or height_px <= 0:
+        raise LayoutCandidateRuntimeError("Active profile canvas dimensions must be positive.")
+    return width_px, height_px
+
+
 def _bounded_int(
     data: dict[str, Any],
     key: str,
@@ -306,7 +356,10 @@ def _bounded_int(
     value = data.get(key)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise LayoutCandidateRuntimeError(f"{label} must be numeric.")
-    result = int(round(float(value)))
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        raise LayoutCandidateRuntimeError(f"{label} must be finite.")
+    result = int(round(numeric))
     if result < minimum or result > maximum:
         raise LayoutCandidateRuntimeError(
             f"{label}={result} is outside [{minimum}, {maximum}]."
@@ -325,6 +378,8 @@ def _bounded_float(
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise LayoutCandidateRuntimeError(f"{label} must be numeric.")
     result = float(value)
+    if not math.isfinite(result):
+        raise LayoutCandidateRuntimeError(f"{label} must be finite.")
     if result < minimum or result > maximum:
         raise LayoutCandidateRuntimeError(
             f"{label}={result} is outside [{minimum}, {maximum}]."

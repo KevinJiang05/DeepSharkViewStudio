@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from deep_shark_studio.config import DEFAULT_PROCESS_FPS
 from deep_shark_studio.qgc import runtime_service
 from deep_shark_studio.qgc.runtime_service import (
     DeepSharkRuntimeService,
@@ -113,6 +114,16 @@ class FakeController:
 
 
 class QGCRuntimeServiceTests(unittest.TestCase):
+    def test_headless_default_process_fps_uses_shared_p95_safe_default(self) -> None:
+        parsed = runtime_service._argument_parser().parse_args([])
+
+        self.assertEqual(4, DEFAULT_PROCESS_FPS)
+        self.assertEqual(float(DEFAULT_PROCESS_FPS), parsed.process_fps)
+        self.assertEqual(
+            float(DEFAULT_PROCESS_FPS),
+            DeepSharkRuntimeServiceConfig().process_fps,
+        )
+
     def test_build_stream_configs_uses_active_topology_cameras_only(self) -> None:
         configs = build_stream_configs(_camera_config(), _calibration_config())
 

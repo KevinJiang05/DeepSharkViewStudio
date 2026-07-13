@@ -75,7 +75,7 @@ class RuntimeStitchController:
                 Path(self.config.far_field_layout_candidate_path)
             )
         if self.layout_candidate is not None:
-            self.config = self._config_with_candidate_projection(self.config)
+            self._validate_candidate_projection_selection()
 
     def process(
         self,
@@ -195,6 +195,7 @@ class RuntimeStitchController:
                 "Near-field mode requires a loaded Layout Candidate V2."
             )
         projection = self._near_field_projection_provider().project(frames)
+        self._validate_near_field_projected_canvas(projection.warped_images)
         compositor_start = time.perf_counter()
         near = render_near_field_from_warped(
             projection.warped_images,
@@ -248,29 +249,51 @@ class RuntimeStitchController:
                 )
         return self._projection_provider
 
-    def _config_with_candidate_projection(
+    def _validate_candidate_projection_selection(self) -> None:
+        if self.layout_candidate is None or self.config.mode != StitchRuntimeMode.NEAR_FIELD:
+            return
+        selected = self.config.projection_source
+        if selected not in {
+            ProjectionSource.CURRENT_PERSPECTIVE,
+            ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE,
+        }:
+            return
+        candidate_source = self.layout_candidate.projection.source
+        if selected != candidate_source:
+            raise RuntimeError(
+                f"Near-field candidate projection {candidate_source.value!r} does not "
+                f"match selected projection {selected.value!r}. Select a matching view "
+                "or load a matching candidate."
+            )
+
+    def _validate_near_field_projected_canvas(
         self,
-        config: RuntimeStitchConfig,
-    ) -> RuntimeStitchConfig:
+        warped_images: Mapping[str, np.ndarray],
+    ) -> None:
         if self.layout_candidate is None:
-            return config
-        projection = self.layout_candidate.projection
+            return
+        required = ("front_left", "front", "front_right")
+        missing = [camera for camera in required if camera not in warped_images]
+        if missing:
+            raise RuntimeError(
+                "Near-field projection is missing warped images for: " + ", ".join(missing)
+            )
+        shapes = {
+            camera: tuple(np.asarray(warped_images[camera]).shape[:2])
+            for camera in required
+        }
+        if len(set(shapes.values())) != 1:
+            raise RuntimeError(f"Near-field projected canvas sizes do not match: {shapes}")
+        canvas_height, canvas_width = next(iter(shapes.values()))
         if (
-            config.projection_source != ProjectionSource.CURRENT_PERSPECTIVE
-            or projection.source == ProjectionSource.CURRENT_PERSPECTIVE
+            self.layout_candidate.output_width_px > canvas_width
+            or self.layout_candidate.output_height_px > canvas_height
         ):
-            return config
-        return RuntimeStitchConfig(
-            mode=config.mode,
-            projection_source=projection.source,
-            layout_candidate_path=config.layout_candidate_path,
-            use_far_field_custom_layout=config.use_far_field_custom_layout,
-            far_field_layout_candidate_path=config.far_field_layout_candidate_path,
-            projection_intrinsics_source_path=projection.intrinsics_source_path,
-            fisheye_balance=projection.balance,
-            fisheye_fov_scale=projection.fov_scale,
-            auto_enabled=config.auto_enabled,
-        ).normalized()
+            raise RuntimeError(
+                f"Near-field candidate output {self.layout_candidate.output_width_px}x"
+                f"{self.layout_candidate.output_height_px} exceeds projected canvas "
+                f"{canvas_width}x{canvas_height}."
+            )
 
 
 def _elapsed_ms(start: float) -> float:

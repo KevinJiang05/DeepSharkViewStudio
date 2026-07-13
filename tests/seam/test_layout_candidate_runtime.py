@@ -140,6 +140,95 @@ class LayoutCandidateRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(LayoutCandidateRuntimeError, "left_pair"):
                 load_layout_candidate_for_runtime(path)
 
+    def test_loader_rejects_nonfinite_float_fields(self) -> None:
+        cases = (
+            (
+                "camera scale",
+                lambda data: data["camera_adjust"]["front"].__setitem__(
+                    "scale", float("nan")
+                ),
+            ),
+            (
+                "side fraction",
+                lambda data: data["left_pair"].__setitem__(
+                    "side_visible_fraction", float("inf")
+                ),
+            ),
+            (
+                "vertical ratio",
+                lambda data: data["vertical_safety"].__setitem__(
+                    "vertical_safe_ratio", float("nan")
+                ),
+            ),
+            (
+                "projection balance",
+                lambda data: (
+                    data.__setitem__("schema_version", 3),
+                    data.__setitem__(
+                        "projection",
+                        {"source": "current_perspective", "balance": float("inf")},
+                    ),
+                ),
+            ),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temp:
+                data = _candidate_data()
+                mutate(data)
+                path = _write_candidate(Path(temp), data)
+
+                with self.assertRaises(LayoutCandidateRuntimeError):
+                    load_layout_candidate_for_runtime(path)
+
+    def test_loader_enforces_camera_scale_runtime_contract(self) -> None:
+        for scale in (0.79, 1.21):
+            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as temp:
+                data = _candidate_data()
+                data["camera_adjust"]["front"]["scale"] = scale
+                path = _write_candidate(Path(temp), data)
+
+                with self.assertRaisesRegex(LayoutCandidateRuntimeError, "scale"):
+                    load_layout_candidate_for_runtime(path)
+
+    def test_loader_rejects_oversize_output_for_active_profile(self) -> None:
+        for dimension, value in (("width_px", 2201), ("height_px", 701)):
+            with self.subTest(dimension=dimension), tempfile.TemporaryDirectory() as temp:
+                data = _candidate_data()
+                data["output"][dimension] = value
+                path = _write_candidate(Path(temp), data)
+
+                with self.assertRaisesRegex(LayoutCandidateRuntimeError, "exceeds"):
+                    load_layout_candidate_for_runtime(path)
+
+    def test_loader_requires_boolean_vertical_enabled(self) -> None:
+        for value in (0, 1, "false", None):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temp:
+                data = _candidate_data()
+                data["vertical_safety"]["enabled"] = value
+                path = _write_candidate(Path(temp), data)
+
+                with self.assertRaisesRegex(LayoutCandidateRuntimeError, "enabled"):
+                    load_layout_candidate_for_runtime(path)
+
+    def test_runtime_params_honor_explicit_vertical_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = _candidate_data()
+            data["vertical_safety"]["enabled"] = True
+            candidate = load_layout_candidate_for_runtime(
+                _write_candidate(Path(temp), data)
+            )
+
+        self.assertTrue(candidate.to_layout_params().vertical_safety_enabled(700))
+
+    def test_loader_rejects_disabled_vertical_safety_with_active_adjustments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = _candidate_data()
+            data["vertical_safety"]["vertical_safe_ratio"] = 0.9
+            path = _write_candidate(Path(temp), data)
+
+            with self.assertRaisesRegex(LayoutCandidateRuntimeError, "disabled"):
+                load_layout_candidate_for_runtime(path)
+
     def test_loader_reports_calibration_hash_warning(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = _write_candidate(Path(temp), _candidate_data("not-current"))

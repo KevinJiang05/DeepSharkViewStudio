@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 from typing import Any
 
 import cv2
@@ -50,6 +51,7 @@ def apply_post_warp_camera_adjustments(
     for camera, image in warped_images.items():
         params = camera_adjust.get(camera, CameraAdjustParams())
         mask = input_masks.get(camera)
+        has_explicit_valid_mask = mask is not None
         if mask is None:
             # Temporary runtime-compatible validity heuristic: current formal
             # warped images use black fill for invalid canvas regions.
@@ -61,42 +63,83 @@ def apply_post_warp_camera_adjustments(
                 raise ValueError(f"valid_mask size mismatch for {camera}")
             mask = mask_array.astype(bool)
         height, width = image.shape[:2]
-        center = _valid_bbox_center(mask, width, height)
-        scale = float(np.clip(params.scale, 0.80, 1.20))
+        try:
+            scale = float(params.scale)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"camera_adjust.{camera}.scale must be numeric.") from exc
+        if not math.isfinite(scale) or scale < 0.80 or scale > 1.20:
+            raise ValueError(
+                f"camera_adjust.{camera}.scale={scale} is outside the finite "
+                "runtime range [0.8, 1.2]."
+            )
+        x_offset = int(params.x_offset_px)
+        y_offset = int(params.y_offset_px)
+        identity_fast_path = (
+            has_explicit_valid_mask
+            and x_offset == 0
+            and y_offset == 0
+            and scale == 1.0
+        )
+        if identity_fast_path:
+            # For an identity transform the scale center is mathematically
+            # invariant. Use the canvas center so the fast path does not scan
+            # the full validity mask merely to find its bounding box.
+            center = ((width - 1) / 2.0, (height - 1) / 2.0)
+        else:
+            center = _valid_bbox_center(mask, width, height)
         matrix = _camera_adjust_matrix(
             center=center,
             scale=scale,
-            x_offset=int(params.x_offset_px),
-            y_offset=int(params.y_offset_px),
+            x_offset=x_offset,
+            y_offset=y_offset,
         )
-        adjusted_image = cv2.warpAffine(
-            image,
-            matrix,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(0, 0, 0),
+        if identity_fast_path:
+            # Preserve the old non-aliasing result contract and invalid-region
+            # black fill without paying for two identity affine warps.
+            adjusted_image = np.zeros_like(image)
+            cv2.copyTo(
+                image,
+                np.ascontiguousarray(mask, dtype=np.uint8),
+                adjusted_image,
+            )
+            adjusted_mask = mask.copy()
+        else:
+            adjusted_image = cv2.warpAffine(
+                image,
+                matrix,
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=(0, 0, 0),
+            )
+            adjusted_mask = cv2.warpAffine(
+                mask.astype(np.uint8),
+                matrix,
+                (width, height),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ).astype(bool)
+        if not identity_fast_path:
+            adjusted_image[~adjusted_mask] = 0
+        valid_count_before = int(np.count_nonzero(mask))
+        valid_count_after = (
+            valid_count_before
+            if identity_fast_path
+            else int(np.count_nonzero(adjusted_mask))
         )
-        adjusted_mask = cv2.warpAffine(
-            mask.astype(np.uint8),
-            matrix,
-            (width, height),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        ).astype(bool)
-        adjusted_image[~adjusted_mask] = 0
         adjusted[camera] = adjusted_image
         adjusted_masks[camera] = adjusted_mask
         transforms[camera] = matrix
         cameras[camera] = {
-            "x_offset_px": int(params.x_offset_px),
-            "y_offset_px": int(params.y_offset_px),
+            "x_offset_px": x_offset,
+            "y_offset_px": y_offset,
             "scale": scale,
             "scale_center": [float(center[0]), float(center[1])],
             "matrix": matrix.tolist(),
-            "valid_ratio_before": float(np.count_nonzero(mask) / max(1, mask.size)),
-            "valid_ratio_after": float(np.count_nonzero(adjusted_mask) / max(1, adjusted_mask.size)),
+            "valid_ratio_before": float(valid_count_before / max(1, mask.size)),
+            "valid_ratio_after": float(valid_count_after / max(1, adjusted_mask.size)),
+            "identity_fast_path": identity_fast_path,
         }
     return AdjustedWarpResult(
         warped_images=adjusted,

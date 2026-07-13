@@ -9,7 +9,7 @@ import numpy as np
 from deep_shark_studio.config import load_config
 from deep_shark_studio.stitch_processing import StitchProcessingManager
 from deep_shark_studio.stitcher import SurroundStitcher
-from deep_shark_studio.topology import resolve_stitch_config, seam_x
+from deep_shark_studio.topology import compose_horizontal_feather, resolve_stitch_config, seam_x
 
 
 def solid_frame(bgr: tuple[int, int, int]) -> np.ndarray:
@@ -114,6 +114,24 @@ class TopologyImageTests(unittest.TestCase):
         self.assertGreater(int(canvas[350, 1100, 1]), 220)
         self.assertGreater(int(canvas[350, 1950, 0]), 220)
         self.assertGreater(float(np.any(canvas != 0, axis=2).mean()), 0.95)
+
+    def test_horizontal_feather_honors_valid_black_geometry(self) -> None:
+        black = np.zeros((2, 4, 3), dtype=np.uint8)
+        red = np.zeros_like(black)
+        red[:, :, 2] = 200
+        full_mask = np.ones((2, 4), dtype=bool)
+
+        canvas = compose_horizontal_feather(
+            {"front_left": black, "front": red},
+            4,
+            2,
+            {},
+            [],
+            1,
+            valid_masks={"front_left": full_mask, "front": full_mask},
+        )
+
+        self.assertTrue(np.all(canvas[:, :, 2] == 100))
 
     def test_live_worker_uses_selected_topology(self) -> None:
         manager = StitchProcessingManager()

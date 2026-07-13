@@ -48,9 +48,13 @@ class CurrentPerspectiveProjectionProvider:
     def project(self, frames: Mapping[str, np.ndarray]) -> ProjectionResult:
         total_start = time.perf_counter()
         warp_start = time.perf_counter()
-        warped = self.stitcher.warp_all(dict(frames))
+        geometry_masks_available = hasattr(self.stitcher, "warp_all_with_masks")
+        if geometry_masks_available:
+            warped, valid_masks = self.stitcher.warp_all_with_masks(dict(frames))
+        else:
+            warped = self.stitcher.warp_all(dict(frames))
+            valid_masks = derive_nonzero_valid_masks(warped)
         warp_all_ms = _elapsed_ms(warp_start)
-        valid_masks = derive_nonzero_valid_masks(warped)
         warnings: list[str] = []
         uses_intrinsics = bool(getattr(self.stitcher, "use_intrinsics", False))
         if uses_intrinsics:
@@ -64,7 +68,11 @@ class CurrentPerspectiveProjectionProvider:
             "uses_intrinsics": uses_intrinsics,
             "uses_fisheye": False,
             "uses_remap": False,
-            "valid_mask_source": "nonzero_pixels_runtime_compatible",
+            "valid_mask_source": (
+                "perspective_warp_geometry_mask"
+                if geometry_masks_available
+                else "nonzero_pixels_legacy_fallback"
+            ),
             "warning_reasons": warnings,
         }
         return ProjectionResult(
@@ -119,6 +127,7 @@ class B2CandidateProjectionProvider:
                 "Far-field layout tuning uses B-2 per-camera warped images, not the flattened B-2 final canvas.",
             ],
             "_b2_weight_maps": self._weight_maps_for_warped(warped),
+            "_b2_selection_masks": self._selection_masks_for_warped(warped),
         }
         return ProjectionResult(
             warped_images=warped,
@@ -147,7 +156,10 @@ class B2CandidateProjectionProvider:
             if mask is not None and mask.shape == image.shape[:2]:
                 masks[camera] = np.asarray(mask, dtype=bool)
             else:
-                masks[camera] = np.any(image != 0, axis=2).astype(bool)
+                raise RuntimeError(
+                    "B-2 candidate projection is missing its geometric valid mask "
+                    f"for {camera}; pixel color cannot be used as geometry."
+                )
         return masks
 
     def _weight_maps_for_warped(
@@ -161,6 +173,29 @@ class B2CandidateProjectionProvider:
             if weight is not None and weight.shape == image.shape[:2]:
                 weights[camera] = np.asarray(weight, dtype=np.float32)
         return weights
+
+    def _selection_masks_for_warped(
+        self,
+        warped: Mapping[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        """Expose the processor's immutable winner plan for identity layouts.
+
+        CandidatePanoramaProcessor builds these masks once from the same B-2
+        per-camera weights used by its final canvas.  Keeping the mapping in
+        private ProjectionResult metadata lets Far Custom reuse that plan
+        without allocating and reducing a three-map float stack every frame.
+        """
+        camera_order = tuple(getattr(self.processor, "camera_order", ()))
+        available = tuple(camera for camera in camera_order if camera in warped)
+        plans = getattr(self.processor, "_selection_masks_by_available", {})
+        selection = plans.get(available, {}) if isinstance(plans, Mapping) else {}
+        result: dict[str, np.ndarray] = {}
+        for camera in available:
+            mask = selection.get(camera) if isinstance(selection, Mapping) else None
+            image = warped[camera]
+            if mask is not None and np.asarray(mask).shape == image.shape[:2]:
+                result[camera] = np.asarray(mask, dtype=bool)
+        return result
 
 
 @dataclass(frozen=True)

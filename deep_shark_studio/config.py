@@ -14,6 +14,13 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = PROJECT_ROOT / "configs"
 
+# The slowest supported runtime view measured just under 4.8 results/second at
+# p95 on the reference machine.  Four FPS is therefore the highest whole-number
+# package default with observable p95 headroom; explicit user configs may still
+# request a different rate.
+DEFAULT_PROCESS_FPS = 4
+DEFAULT_PREVIEW_FPS = 2
+
 
 class ConfigConflictError(RuntimeError):
     """Raised when a stale window tries to overwrite a newer config file."""

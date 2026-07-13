@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from deep_shark_studio.config import CONFIG_DIR, load_yaml
+from deep_shark_studio.config import CONFIG_DIR, DEFAULT_PROCESS_FPS, load_yaml
 from deep_shark_studio.calibration_candidate import CandidatePanoramaProcessor
 from deep_shark_studio.stream_manager import CameraStreamConfig, CameraStreamManager
 from deep_shark_studio.stitch_runtime_controller import RuntimeStitchController, RuntimeStitchResult
@@ -48,7 +48,7 @@ class DeepSharkRuntimeServiceConfig:
     fisheye_fov_scale: float = 1.0
     max_input_width: int | None = 960
     use_intrinsics: bool = False
-    process_fps: float = 15.0
+    process_fps: float = float(DEFAULT_PROCESS_FPS)
     require_all_active_cameras: bool = True
     max_frame_age_seconds: float = 3.0
     failure_backoff_initial_seconds: float = 0.1
@@ -629,7 +629,11 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--projection-intrinsics-source", default="")
     parser.add_argument("--fisheye-balance", type=float, default=0.6)
     parser.add_argument("--fisheye-fov-scale", type=float, default=1.0)
-    parser.add_argument("--process-fps", type=float, default=15.0)
+    parser.add_argument(
+        "--process-fps",
+        type=float,
+        default=float(DEFAULT_PROCESS_FPS),
+    )
     parser.add_argument("--max-frame-age-seconds", type=float, default=3.0)
     parser.add_argument("--failure-backoff-initial", type=float, default=0.1)
     parser.add_argument("--failure-backoff-max", type=float, default=2.0)

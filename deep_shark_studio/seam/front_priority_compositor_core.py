@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from .layout_preview import (
+    FrontPriorityLayoutRuntimePlan,
     FrontPriorityLayoutPreviewRenderer,
     LayoutPairCandidate,
     LayoutPreviewParams,
@@ -20,7 +21,12 @@ from deep_shark_studio.stitching.camera_layout_adjust import (
     identity_camera_adjust,
 )
 from .layout_tuner import LayoutPreviewParamsV2
-from .vertical_safety import VerticalSafetyParams, VerticalSafetyRenderer, VerticalSafetyResult
+from .vertical_safety import (
+    VerticalSafetyParams,
+    VerticalSafetyRenderer,
+    VerticalSafetyResult,
+    VerticalSafetyRuntimePlan,
+)
 
 
 @dataclass(frozen=True)
@@ -39,10 +45,16 @@ class FrontPriorityCoreResult:
 
 @dataclass(frozen=True)
 class RuntimeNearFieldPlan:
-    """Placeholder for future precomputed masks and alpha tables."""
+    """Internal geometry plan guarded by near_field_compositor's full key."""
 
-    precomputed_masks: dict[str, np.ndarray] | None = None
-    precomputed_alpha: dict[str, np.ndarray] | None = None
+    layout: FrontPriorityLayoutRuntimePlan
+    vertical: VerticalSafetyRuntimePlan | None = None
+
+    @property
+    def memory_bytes(self) -> int:
+        if self.vertical is not None:
+            return int(self.vertical.memory_bytes)
+        return int(self.layout.memory_bytes)
 
 
 def render_front_priority_layout_core(
@@ -53,7 +65,6 @@ def render_front_priority_layout_core(
     plan: RuntimeNearFieldPlan | None = None,
 ) -> FrontPriorityCoreResult:
     """Render a clean runtime canvas without preview labels or overlays."""
-    del plan  # Reserved for RuntimeNearFieldPlan mask/alpha caches.
     total_start = time.perf_counter()
     affine_start = time.perf_counter()
     adjusted = apply_post_warp_camera_adjustments(
@@ -68,6 +79,10 @@ def render_front_priority_layout_core(
     pair_params = params.pair_layout_params()
     safety_params = params.to_vertical_params()
     use_vertical = params.vertical_safety_enabled(canvas_height)
+    if plan is not None and use_vertical != (plan.vertical is not None):
+        raise ValueError(
+            "Runtime Near-field plan does not match vertical_safety parameters."
+        )
 
     composition_start = time.perf_counter()
     if use_vertical:
@@ -80,6 +95,7 @@ def render_front_priority_layout_core(
             pair_params=pair_params,
             draw_label=False,
             valid_masks=adjusted.valid_masks,
+            plan=plan.vertical if plan is not None else None,
         )
         composition_ms = _elapsed_ms(base_start)
         vertical_safety_ms = composition_ms
@@ -92,6 +108,7 @@ def render_front_priority_layout_core(
             pair_params=pair_params,
             draw_label=False,
             valid_masks=adjusted.valid_masks,
+            plan=plan.layout if plan is not None else None,
         )
         composition_ms = _elapsed_ms(composition_start)
         vertical_safety_ms = 0.0
@@ -103,6 +120,7 @@ def render_front_priority_layout_core(
         "post_warp_affine_ms": post_warp_affine_ms,
         "composition_ms": composition_ms,
         "vertical_safety_ms": vertical_safety_ms,
+        "runtime_plan_used": plan is not None,
     }
     return FrontPriorityCoreResult(
         image=core.image,
@@ -115,6 +133,38 @@ def render_front_priority_layout_core(
         layout_id=core.layout_id,
         vertical_safety_enabled=core.vertical_safety_enabled,
         adjusted=adjusted,
+    )
+
+
+def build_runtime_near_field_plan(
+    adjusted: AdjustedWarpResult,
+    pair_candidates: list[LayoutPairCandidate],
+    params: LayoutPreviewParamsV2,
+) -> RuntimeNearFieldPlan:
+    """Build an internal plan from one already-rendered adjusted frame set.
+
+    Callers must route reuse through ``near_field_compositor`` so candidate,
+    seam, shape, and mask-content invalidation is enforced.
+    """
+    layout_params = params.to_layout_params()
+    pair_params = params.pair_layout_params()
+    layout_plan = FrontPriorityLayoutPreviewRenderer().build_runtime_plan(
+        adjusted.warped_images,
+        pair_candidates,
+        layout_params,
+        pair_params=pair_params,
+        valid_masks=adjusted.valid_masks,
+    )
+    canvas_height = _front_canvas_height(adjusted.warped_images)
+    vertical_plan = None
+    if params.vertical_safety_enabled(canvas_height):
+        vertical_plan = VerticalSafetyRenderer().build_runtime_plan(
+            layout_plan,
+            params.to_vertical_params(),
+        )
+    return RuntimeNearFieldPlan(
+        layout=layout_plan,
+        vertical=vertical_plan,
     )
 
 

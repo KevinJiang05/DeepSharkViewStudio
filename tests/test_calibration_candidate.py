@@ -23,6 +23,67 @@ from deep_shark_studio.stitcher import save_image
 from deep_shark_studio.stitch_processing import StitchProcessingManager
 
 
+class _FakeCandidateArchive:
+    def __init__(self) -> None:
+        self._items = {
+            "map_x": np.asarray([[0.0, 1.0], [0.0, 1.0]], dtype=np.float32),
+            "map_y": np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32),
+            "valid_mask": np.ones((2, 2), dtype=np.uint8),
+        }
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        return None
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        return self._items[key]
+
+
+class _FakeOpenCLDevice:
+    def name(self) -> str:
+        return "Mock OpenCL Device"
+
+
+class _FakeOpenCLRuntime:
+    def __init__(
+        self,
+        *,
+        available: bool = True,
+        activation_succeeds: bool = True,
+    ) -> None:
+        self.available = available
+        self.activation_succeeds = activation_succeeds
+        self.active = False
+        self.set_calls: list[bool] = []
+        self.finish_calls = 0
+
+    def haveOpenCL(self) -> bool:
+        return self.available
+
+    def setUseOpenCL(self, enabled: bool) -> None:
+        self.set_calls.append(bool(enabled))
+        self.active = bool(enabled and self.available and self.activation_succeeds)
+
+    def useOpenCL(self) -> bool:
+        return self.active
+
+    def Device_getDefault(self) -> _FakeOpenCLDevice:
+        return _FakeOpenCLDevice()
+
+    def finish(self) -> None:
+        self.finish_calls += 1
+
+
+class _FakeUMat:
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = np.asarray(array).copy()
+
+    def get(self) -> np.ndarray:
+        return self.array.copy()
+
+
 def rotation_y(angle: float) -> np.ndarray:
     return cv2.Rodrigues(
         np.asarray([0.0, angle, 0.0], dtype=np.float64)
@@ -238,6 +299,76 @@ def create_synthetic_session(root: Path) -> CalibrationSession:
 
 
 class CalibrationCandidateTests(unittest.TestCase):
+    def _mock_runtime_processor(
+        self,
+        *,
+        use_opencl: bool,
+        opencl_runtime: _FakeOpenCLRuntime,
+    ) -> CandidatePanoramaProcessor:
+        rays = np.zeros((2, 2, 3), dtype=np.float64)
+        rays[:, :, 2] = 1.0
+        candidate = {
+            "resolution": [2, 2],
+            "topology": "triple_front_panorama",
+            "experimental": True,
+            "rig": {
+                "complete": True,
+                "transforms": {
+                    camera: {
+                        "rotation_camera_to_front": np.eye(3).tolist(),
+                    }
+                    for camera in calibration_candidate.CAMERA_KEYS
+                },
+            },
+            "virtual_panorama": {
+                "canvas_size": [2, 2],
+                "files": {
+                    "remaps": {
+                        camera: f"{camera}.npz"
+                        for camera in calibration_candidate.CAMERA_KEYS
+                    },
+                },
+            },
+        }
+        with (
+            patch.object(
+                calibration_candidate,
+                "load_calibration_candidate",
+                return_value=(candidate, {}),
+            ),
+            patch.object(
+                calibration_candidate,
+                "_panorama_rays",
+                return_value=rays,
+            ),
+            patch.object(
+                calibration_candidate.np,
+                "load",
+                side_effect=lambda _path: _FakeCandidateArchive(),
+            ),
+            patch.object(calibration_candidate.cv2, "ocl", opencl_runtime),
+            patch.object(
+                calibration_candidate.cv2,
+                "UMat",
+                side_effect=lambda array: _FakeUMat(array),
+            ),
+        ):
+            return CandidatePanoramaProcessor(
+                "D:/mock-candidate",
+                use_opencl=use_opencl,
+            )
+
+    @staticmethod
+    def _mock_runtime_frames() -> dict[str, np.ndarray]:
+        return {
+            camera: np.full((2, 2, 3), value, dtype=np.uint8)
+            for camera, value in (
+                ("front_left", 30),
+                ("front", 120),
+                ("front_right", 220),
+            )
+        }
+
     def test_experimental_candidate_is_reproducible_and_report_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -327,6 +458,9 @@ class CalibrationCandidateTests(unittest.TestCase):
                 tuple(processor.camera_order),
                 processor._selection_masks_by_available,
             )
+            self.assertTrue(
+                all(weight.dtype == np.float32 for weight in processor._weights.values())
+            )
             self.assertTrue(processor.last_timings["precomputed_selection_masks"])
             self.assertGreaterEqual(processor.last_timings["candidate_remap_ms"], 0.0)
             self.assertGreaterEqual(processor.last_timings["candidate_compose_ms"], 0.0)
@@ -377,6 +511,152 @@ class CalibrationCandidateTests(unittest.TestCase):
                 )
             finally:
                 self.assertTrue(manager.shutdown())
+
+    def test_cpu_backend_truth_is_observable_when_opencl_is_not_requested(self) -> None:
+        opencl_runtime = _FakeOpenCLRuntime()
+        processor = self._mock_runtime_processor(
+            use_opencl=False,
+            opencl_runtime=opencl_runtime,
+        )
+
+        warped, canvas = processor.process(self._mock_runtime_frames())
+
+        self.assertEqual(
+            {"front_left", "front", "front_right"},
+            set(warped),
+        )
+        self.assertEqual((2, 2, 3), canvas.shape)
+        self.assertEqual([], opencl_runtime.set_calls)
+        self.assertEqual(
+            {
+                "opencl_requested": False,
+                "opencl_active": False,
+                "backend": "cpu",
+                "device": "CPU",
+                "fallback_reason": "",
+                "warped_preview_state": "available",
+            },
+            processor.backend_status(),
+        )
+        self.assertEqual("cpu", processor.last_timings["candidate_backend"])
+        self.assertFalse(processor.last_timings["opencl_active"])
+
+    def test_opencl_activation_is_verified_before_backend_is_reported_active(self) -> None:
+        opencl_runtime = _FakeOpenCLRuntime(activation_succeeds=False)
+        processor = self._mock_runtime_processor(
+            use_opencl=True,
+            opencl_runtime=opencl_runtime,
+        )
+
+        _warped, _canvas = processor.process(self._mock_runtime_frames())
+
+        self.assertEqual([True], opencl_runtime.set_calls)
+        status = processor.backend_status()
+        self.assertTrue(status["opencl_requested"])
+        self.assertFalse(status["opencl_active"])
+        self.assertEqual("cpu", status["backend"])
+        self.assertEqual("CPU", status["device"])
+        self.assertEqual("opencl_activation_failed", status["fallback_reason"])
+        self.assertEqual(
+            "opencl_activation_failed",
+            processor.last_timings["candidate_backend_fallback_reason"],
+        )
+
+    def test_opencl_backend_reports_device_and_synchronized_stage_timings(self) -> None:
+        opencl_runtime = _FakeOpenCLRuntime()
+        processor = self._mock_runtime_processor(
+            use_opencl=True,
+            opencl_runtime=opencl_runtime,
+        )
+        frames = self._mock_runtime_frames()
+
+        def fake_remap(source, _map_x, _map_y, _interpolation, **_kwargs):
+            return _FakeUMat(source.array)
+
+        def fake_copy_to(source, mask, destination) -> None:
+            selected = mask.array.astype(bool)
+            destination.array[selected] = source.array[selected]
+
+        with (
+            patch.object(calibration_candidate.cv2, "ocl", opencl_runtime),
+            patch.object(calibration_candidate.cv2, "UMat", _FakeUMat),
+            patch.object(
+                calibration_candidate.cv2,
+                "remap",
+                side_effect=fake_remap,
+            ),
+            patch.object(
+                calibration_candidate.cv2,
+                "copyTo",
+                side_effect=fake_copy_to,
+            ),
+        ):
+            warped, canvas = processor.process(frames)
+
+        self.assertEqual({}, warped)
+        self.assertEqual((2, 2, 3), canvas.shape)
+        self.assertGreaterEqual(opencl_runtime.finish_calls, 4)
+        self.assertEqual(
+            {
+                "opencl_requested": True,
+                "opencl_active": True,
+                "backend": "opencl",
+                "device": "Mock OpenCL Device",
+                "fallback_reason": "",
+                "warped_preview_state": "not_downloaded_opencl_canvas_only",
+            },
+            processor.backend_status(),
+        )
+        self.assertTrue(processor.last_timings["candidate_timing_synchronized"])
+        self.assertEqual("opencl", processor.last_timings["candidate_backend"])
+        self.assertEqual(
+            "Mock OpenCL Device",
+            processor.last_timings["candidate_backend_device"],
+        )
+        for key in (
+            "candidate_total_ms",
+            "candidate_remap_ms",
+            "candidate_compose_ms",
+            "candidate_download_ms",
+        ):
+            self.assertGreaterEqual(processor.last_timings[key], 0.0)
+
+    def test_opencl_cv_error_latches_cpu_fallback_for_later_frames(self) -> None:
+        opencl_runtime = _FakeOpenCLRuntime()
+        processor = self._mock_runtime_processor(
+            use_opencl=True,
+            opencl_runtime=opencl_runtime,
+        )
+        frames = self._mock_runtime_frames()
+
+        with patch.object(
+            processor,
+            "_process_opencl",
+            side_effect=cv2.error("simulated OpenCL remap failure"),
+        ) as opencl_process:
+            first_warped, first_canvas = processor.process(frames)
+            second_warped, second_canvas = processor.process(frames)
+
+        self.assertEqual(1, opencl_process.call_count)
+        self.assertEqual(set(frames), set(first_warped))
+        self.assertEqual(set(frames), set(second_warped))
+        np.testing.assert_array_equal(first_canvas, second_canvas)
+        status = processor.backend_status()
+        self.assertTrue(status["opencl_requested"])
+        self.assertFalse(status["opencl_active"])
+        self.assertEqual("cpu", status["backend"])
+        self.assertEqual("CPU", status["device"])
+        self.assertEqual({}, processor._opencl_maps)
+        self.assertEqual({}, processor._opencl_selection_masks_by_available)
+        self.assertIn("opencl_runtime_error", status["fallback_reason"])
+        self.assertIn(
+            "simulated OpenCL remap failure",
+            status["fallback_reason"],
+        )
+        self.assertEqual(
+            status["fallback_reason"],
+            processor.last_timings["candidate_backend_fallback_reason"],
+        )
 
     def test_runtime_candidate_rejects_wrong_frame_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

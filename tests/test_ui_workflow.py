@@ -12,6 +12,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from deep_shark_studio.gui.main_window import MainWindow, i18n, rejection_advice
+from deep_shark_studio.gui.runtime_workflow import RuntimeViewPreset
 from deep_shark_studio.stitch_runtime_modes import (
     ProjectionSource,
     RuntimeStitchConfig,
@@ -174,6 +175,26 @@ class UiWorkflowTests(unittest.TestCase):
             self.app.processEvents()
             ensure_live.assert_called_once_with()
 
+            ensure_live.reset_mock()
+            window.hide()
+            self.app.processEvents()
+            index = window.runtime_view_combo.findData("near_current")
+            window.runtime_view_combo.setCurrentIndex(index)
+            self.app.processEvents()
+            ensure_live.assert_not_called()
+
+            window.show()
+            self.app.processEvents()
+            ensure_live.assert_called_once_with()
+
+            ensure_live.reset_mock()
+            window._runtime_view_selection_dirty = False
+            window.hide()
+            self.app.processEvents()
+            window.show()
+            self.app.processEvents()
+            ensure_live.assert_not_called()
+
             window.close()
             window.deleteLater()
             self.app.processEvents()
@@ -218,9 +239,14 @@ class UiWorkflowTests(unittest.TestCase):
             self.window.selected_projection_source(),
         )
         self.assertTrue(self.window._runtime_view_selection_dirty)
-        self.assertTrue(
-            "Selected" in self.window.runtime_effective_status_label.text()
-            or "已选择" in self.window.runtime_effective_status_label.text()
+        status_text = self.window.runtime_effective_status_label.text()
+        self.assertIn(
+            self.window.runtime_view_display_name(RuntimeViewPreset.NEAR_CURRENT),
+            status_text,
+        )
+        self.assertIn(
+            self.window.runtime_view_display_name(RuntimeViewPreset.FAR_DEFAULT),
+            status_text,
         )
 
     def test_apply_maps_each_named_view_to_the_existing_runtime_contract(self) -> None:

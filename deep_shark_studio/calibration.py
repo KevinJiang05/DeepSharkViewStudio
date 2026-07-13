@@ -142,8 +142,50 @@ def undistort_image(image: np.ndarray, intrinsics: dict) -> np.ndarray:
     camera_matrix = np.asarray(intrinsics["camera_matrix"], dtype=np.float64)
     distortion = np.asarray(intrinsics["distortion"], dtype=np.float64)
     height, width = image.shape[:2]
+    calibration_size = intrinsics.get("image_size")
+    if calibration_size is not None:
+        camera_matrix = scale_camera_matrix_for_resolution(
+            camera_matrix,
+            calibration_size=tuple(int(value) for value in calibration_size),
+            runtime_size=(width, height),
+        )
     new_matrix, _ = cv2.getOptimalNewCameraMatrix(camera_matrix, distortion, (width, height), 1, (width, height))
     return cv2.undistort(image, camera_matrix, distortion, None, new_matrix)
+
+
+def scale_camera_matrix_for_resolution(
+    camera_matrix: np.ndarray,
+    *,
+    calibration_size: tuple[int, int],
+    runtime_size: tuple[int, int],
+) -> np.ndarray:
+    """Scale one pinhole K matrix to an aspect-compatible runtime size."""
+    matrix = np.asarray(camera_matrix, dtype=np.float64)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        raise ValueError("camera_matrix must be a finite 3x3 matrix.")
+    calibration_width, calibration_height = (
+        int(calibration_size[0]),
+        int(calibration_size[1]),
+    )
+    runtime_width, runtime_height = int(runtime_size[0]), int(runtime_size[1])
+    if min(calibration_width, calibration_height, runtime_width, runtime_height) <= 0:
+        raise ValueError("Calibration and runtime image sizes must be positive.")
+    calibration_aspect = calibration_width / float(calibration_height)
+    runtime_aspect = runtime_width / float(runtime_height)
+    if not np.isclose(calibration_aspect, runtime_aspect, rtol=1.0e-3, atol=1.0e-6):
+        raise ValueError(
+            "Runtime image aspect ratio does not match the intrinsics calibration resolution."
+        )
+    scale_x = runtime_width / float(calibration_width)
+    scale_y = runtime_height / float(calibration_height)
+    scaled = matrix.copy()
+    scaled[0, 0] *= scale_x
+    scaled[0, 1] *= scale_x
+    scaled[0, 2] *= scale_x
+    scaled[1, 0] *= scale_y
+    scaled[1, 1] *= scale_y
+    scaled[1, 2] *= scale_y
+    return scaled
 
 
 def write_calibration_report(path: str | Path, camera_key: str, result: dict, spec: ChessboardSpec) -> None:

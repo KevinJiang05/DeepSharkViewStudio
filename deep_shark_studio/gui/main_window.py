@@ -97,6 +97,8 @@ from deep_shark_studio.app_logging import (
 )
 from deep_shark_studio.config import (
     CONFIG_DIR,
+    DEFAULT_PREVIEW_FPS,
+    DEFAULT_PROCESS_FPS,
     PROJECT_ROOT,
     ConfigConflictError,
     config_revision,
@@ -108,6 +110,12 @@ from deep_shark_studio.geometry_diagnostics import (
     NO_FEATHER,
     GeometryDiagnosticResult,
     run_geometry_diagnostics as compute_geometry_diagnostics,
+)
+from deep_shark_studio.layout_tuner_cache import (
+    LayoutTunerCacheKey,
+    frame_content_signature,
+    mapping_revision,
+    runtime_source_revision,
 )
 from deep_shark_studio.project import backup_configs, export_runtime_config, load_project, save_project
 from deep_shark_studio.project_package import (
@@ -259,6 +267,7 @@ ZH_CN = {
     "No B-2 candidate available. Create one in Calibration & Candidates.": "没有可用的 B-2 候选；请先在“标定与候选”中生成。",
     "Effective: {view}": "当前实际运行：{view}",
     "Selected, not applied: {view}": "已选择但尚未应用：{view}",
+    "Selected: {selected} / Effective: {effective}": "已选择：{selected} / 当前实际运行：{effective}",
     "Topology": "拓扑",
     "Cameras": "相机",
     "Layout": "布局",
@@ -285,6 +294,7 @@ ZH_CN = {
     "Source-coordinate warnings are present; see Diagnostics & Logs.": "存在 source 坐标警告；请查看“诊断与日志”。",
     "The current profile failed overlap/seam validation.": "当前 Profile 未通过 overlap/seam 校验。",
     "The latest stitch failed: {error}": "最近一次拼接失败：{error}",
+    "Runtime view apply failed: {error}": "运行视图应用失败：{error}",
     "Runtime configuration is pending; the current result still comes from the configured worker.": "运行配置有待应用；当前结果仍来自已配置的 worker。",
     "Worker configuration and the latest result disagree.": "worker 配置状态与最近结果状态不一致。",
     "The active candidate is experimental and intended for diagnostics only.": "当前候选为实验候选，仅供诊断。",
@@ -1902,6 +1912,12 @@ class MainWindow(QMainWindow):
         self.auto_preview_on_view_change = bool(auto_preview_on_view_change)
         self._initial_auto_preview_requested = False
         self._auto_preview_request_pending = False
+        self._runtime_fisheye_apply_timer = QTimer(self)
+        self._runtime_fisheye_apply_timer.setSingleShot(True)
+        self._runtime_fisheye_apply_timer.setInterval(150)
+        self._runtime_fisheye_apply_timer.timeout.connect(
+            self.schedule_selected_runtime_view_preview
+        )
 
         self.input_dir = PROJECT_ROOT / "samples" / "input"
         self.output_dir = PROJECT_ROOT / "samples" / "output"
@@ -1940,6 +1956,8 @@ class MainWindow(QMainWindow):
         self.layout_tuner_source_info: dict[str, Any] = {}
         self.layout_tuner_projection_metadata: dict[str, Any] = {}
         self.layout_tuner_fisheye_intrinsics_source: FisheyeIntrinsicsRuntimeSource | None = None
+        self.layout_tuner_cache_key: LayoutTunerCacheKey | None = None
+        self.layout_tuner_cache_stale_reason = "Capture a preview frame."
         self.stream_manager = CameraStreamManager()
         self.stream_snapshots = {}
         self.stream_error_log_counts: dict[str, int] = {}
@@ -1965,6 +1983,7 @@ class MainWindow(QMainWindow):
         self.last_stitched_raw_preview_time = 0.0
         self.source_contract_log_messages: set[str] = set()
         self.last_stitch_ui_error = ""
+        self.last_runtime_apply_error = ""
         self.last_runtime_stitch_status = ""
         self.last_runtime_result_session_id = 0
         self.last_runtime_result_configuration_id = 0
@@ -2042,7 +2061,10 @@ class MainWindow(QMainWindow):
         self.ensure_window_frame_inside_available_screen()
         if (
             self.auto_preview_on_view_change
-            and not self._initial_auto_preview_requested
+            and (
+                not self._initial_auto_preview_requested
+                or self._runtime_view_selection_dirty
+            )
         ):
             self._initial_auto_preview_requested = True
             self.schedule_selected_runtime_view_preview()
@@ -2278,6 +2300,9 @@ class MainWindow(QMainWindow):
         self.layout_tuner_fisheye_intrinsics_source = (
             selection.runtime_fisheye_intrinsics_source
         )
+        self.invalidate_layout_tuner_cache(
+            "Active project runtime selection changed."
+        )
 
     def restore_active_project_runtime_defaults(
         self,
@@ -2348,6 +2373,7 @@ class MainWindow(QMainWindow):
         self.minimum_stitch_result_request_id = 0
         self.awaiting_current_frame_set_result = False
         self.last_stitch_ui_error = ""
+        self.last_runtime_apply_error = ""
         self.last_runtime_stitch_status = ""
         self.last_runtime_result_session_id = 0
         self.last_runtime_result_configuration_id = 0
@@ -2415,7 +2441,10 @@ class MainWindow(QMainWindow):
             runtime_config,
             live_stitch_mode,
         )
-        if self.preview_content_mode == PreviewContentMode.LIVE:
+        if (
+            self.preview_content_mode == PreviewContentMode.LIVE
+            and self.stream_manager.has_active_workers()
+        ):
             next_session_id = self.preview_session_id + 1
             try:
                 self.configure_live_stitch_processor(
@@ -2424,18 +2453,19 @@ class MainWindow(QMainWindow):
                     live_stitch_mode=processor_mode,
                 )
             except Exception as exc:
-                self.last_stitch_ui_error = str(exc).splitlines()[0][:220]
-                self.live_health_state = LiveHealthState.FAILED
+                self.last_runtime_apply_error = str(exc).splitlines()[0][:220]
                 self.log(
                     f"Runtime reconfiguration failed ({reason}): {exc}",
                     level="ERROR",
                 )
+                self.update_live_health_state()
                 self.update_preview_status_summary()
                 return False
             self._set_preview_session(next_session_id)
 
         self.runtime_stitch_config = runtime_config.normalized()
         self.live_stitch_mode = processor_mode
+        self.last_runtime_apply_error = ""
         self.last_runtime_warning_log_text = ""
         self.warped.clear()
         self.canvas = None
@@ -2541,30 +2571,38 @@ class MainWindow(QMainWindow):
             Path(path),
             expected_profile_id=self.current_runtime_profile_id(),
         )
-        self.runtime_layout_candidate = candidate
         projection = candidate.projection
+        next_runtime_source = previous_runtime_source
+        next_tuner_source = previous_tuner_source
         if projection.source == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE:
             if projection.intrinsics_source_path is None:
                 raise LayoutCandidateRuntimeError(
                     "Fisheye Rectilinear candidate is missing intrinsics_source_path."
                 )
-            self.runtime_fisheye_intrinsics_source = load_fisheye_intrinsics_source(
+            next_runtime_source = load_fisheye_intrinsics_source(
                 projection.intrinsics_source_path
             )
-            self.layout_tuner_fisheye_intrinsics_source = self.runtime_fisheye_intrinsics_source
-        self.runtime_stitch_config = RuntimeStitchConfig(
-            mode=self.runtime_stitch_config.mode,
+            next_tuner_source = next_runtime_source
+        next_config = RuntimeStitchConfig(
+            mode=previous_config.mode,
             projection_source=projection.source,
             layout_candidate_path=candidate.path,
-            use_far_field_custom_layout=self.runtime_stitch_config.use_far_field_custom_layout,
-            far_field_layout_candidate_path=self.runtime_stitch_config.far_field_layout_candidate_path,
+            use_far_field_custom_layout=previous_config.use_far_field_custom_layout,
+            far_field_layout_candidate_path=previous_config.far_field_layout_candidate_path,
             projection_intrinsics_source_path=projection.intrinsics_source_path,
             fisheye_balance=projection.balance,
             fisheye_fov_scale=projection.fov_scale,
-            auto_enabled=self.runtime_stitch_config.auto_enabled,
+            auto_enabled=previous_config.auto_enabled,
         )
-        if was_active_near_field and not self.commit_live_runtime_selection(
-            self.runtime_stitch_config,
+        should_update_config = was_active_near_field or (
+            not self._runtime_view_selection_dirty
+            and previous_config.mode == StitchRuntimeMode.NEAR_FIELD
+        )
+        self.runtime_layout_candidate = candidate
+        self.runtime_fisheye_intrinsics_source = next_runtime_source
+        self.layout_tuner_fisheye_intrinsics_source = next_tuner_source
+        if should_update_config and not self.commit_live_runtime_selection(
+            next_config,
             self.live_stitch_mode,
             reason="replace active Near-field candidate",
         ):
@@ -2573,11 +2611,13 @@ class MainWindow(QMainWindow):
             self.layout_tuner_fisheye_intrinsics_source = previous_tuner_source
             self.runtime_stitch_config = previous_config
             self.refresh_stitch_runtime_controls()
-            raise RuntimeError(self.last_stitch_ui_error)
-        if not was_active_near_field:
+            raise RuntimeError(self.last_runtime_apply_error)
+        if not should_update_config:
             self.refresh_stitch_runtime_controls()
             self.update_preview_status_summary()
+        self.invalidate_layout_tuner_cache("Near-field candidate source changed.")
         self.log(f"Loaded runtime layout candidate: {candidate.path}")
+        self.schedule_auto_runtime_retry_if_dirty()
         return candidate
 
     def clear_runtime_layout_candidate(self) -> None:
@@ -2606,6 +2646,8 @@ class MainWindow(QMainWindow):
             self.runtime_layout_candidate = previous_candidate
             self.runtime_stitch_config = previous_config
             self.refresh_stitch_runtime_controls()
+            return
+        self.invalidate_layout_tuner_cache("Near-field candidate source cleared.")
 
     def choose_far_field_layout_candidate(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2639,31 +2681,37 @@ class MainWindow(QMainWindow):
             Path(path),
             expected_profile_id=self.current_runtime_profile_id(),
         )
-        self.far_field_layout_candidate = candidate
-        self.runtime_stitch_config = RuntimeStitchConfig(
-            mode=self.runtime_stitch_config.mode,
-            projection_source=self.runtime_stitch_config.projection_source,
-            layout_candidate_path=self.runtime_stitch_config.layout_candidate_path,
+        next_config = RuntimeStitchConfig(
+            mode=previous_config.mode,
+            projection_source=previous_config.projection_source,
+            layout_candidate_path=previous_config.layout_candidate_path,
             use_far_field_custom_layout=True,
             far_field_layout_candidate_path=candidate.path,
-            projection_intrinsics_source_path=self.runtime_stitch_config.projection_intrinsics_source_path,
-            fisheye_balance=self.runtime_stitch_config.fisheye_balance,
-            fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
-            auto_enabled=self.runtime_stitch_config.auto_enabled,
+            projection_intrinsics_source_path=previous_config.projection_intrinsics_source_path,
+            fisheye_balance=previous_config.fisheye_balance,
+            fisheye_fov_scale=previous_config.fisheye_fov_scale,
+            auto_enabled=previous_config.auto_enabled,
         )
-        if was_active_far_custom and not self.commit_live_runtime_selection(
-            self.runtime_stitch_config,
+        should_update_config = was_active_far_custom or (
+            not self._runtime_view_selection_dirty
+            and previous_config.use_far_field_custom_layout
+        )
+        self.far_field_layout_candidate = candidate
+        if should_update_config and not self.commit_live_runtime_selection(
+            next_config,
             self.live_stitch_mode,
             reason="replace active Far-field candidate",
         ):
             self.far_field_layout_candidate = previous_candidate
             self.runtime_stitch_config = previous_config
             self.refresh_stitch_runtime_controls()
-            raise RuntimeError(self.last_stitch_ui_error)
-        if not was_active_far_custom:
+            raise RuntimeError(self.last_runtime_apply_error)
+        if not should_update_config:
             self.refresh_stitch_runtime_controls()
             self.update_preview_status_summary()
+        self.invalidate_layout_tuner_cache("Far-field candidate source changed.")
         self.log(f"Loaded Far-field layout candidate: {candidate.path}")
+        self.schedule_auto_runtime_retry_if_dirty()
         return candidate
 
     def clear_far_field_layout_candidate(self) -> None:
@@ -2689,6 +2737,8 @@ class MainWindow(QMainWindow):
             self.far_field_layout_candidate = previous_candidate
             self.runtime_stitch_config = previous_config
             self.refresh_stitch_runtime_controls()
+            return
+        self.invalidate_layout_tuner_cache("Far-field candidate source cleared.")
 
     def choose_runtime_fisheye_intrinsics_source(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -2718,23 +2768,29 @@ class MainWindow(QMainWindow):
         previous_config = self.runtime_stitch_config
         self.runtime_fisheye_intrinsics_source = source
         self.layout_tuner_fisheye_intrinsics_source = source
-        self.runtime_stitch_config = RuntimeStitchConfig(
-            mode=self.runtime_stitch_config.mode,
-            projection_source=self.runtime_stitch_config.projection_source,
-            layout_candidate_path=self.runtime_stitch_config.layout_candidate_path,
-            use_far_field_custom_layout=self.runtime_stitch_config.use_far_field_custom_layout,
-            far_field_layout_candidate_path=self.runtime_stitch_config.far_field_layout_candidate_path,
+        next_config = RuntimeStitchConfig(
+            mode=previous_config.mode,
+            projection_source=previous_config.projection_source,
+            layout_candidate_path=previous_config.layout_candidate_path,
+            use_far_field_custom_layout=previous_config.use_far_field_custom_layout,
+            far_field_layout_candidate_path=previous_config.far_field_layout_candidate_path,
             projection_intrinsics_source_path=source.path,
             fisheye_balance=float(getattr(self, "runtime_fisheye_balance", None).value())
             if hasattr(self, "runtime_fisheye_balance")
-            else self.runtime_stitch_config.fisheye_balance,
+            else previous_config.fisheye_balance,
             fisheye_fov_scale=float(getattr(self, "runtime_fisheye_fov_scale", None).value())
             if hasattr(self, "runtime_fisheye_fov_scale")
-            else self.runtime_stitch_config.fisheye_fov_scale,
-            auto_enabled=self.runtime_stitch_config.auto_enabled,
+            else previous_config.fisheye_fov_scale,
+            auto_enabled=previous_config.auto_enabled,
         )
-        if was_active_fisheye and not self.commit_live_runtime_selection(
-            self.runtime_stitch_config,
+        should_update_config = was_active_fisheye or (
+            not self._runtime_view_selection_dirty
+            and previous_config.mode == StitchRuntimeMode.NEAR_FIELD
+            and previous_config.projection_source
+            == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE
+        )
+        if should_update_config and not self.commit_live_runtime_selection(
+            next_config,
             self.live_stitch_mode,
             reason="replace active fisheye intrinsics",
         ):
@@ -2744,10 +2800,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 self.t("Fisheye intrinsics source load failed"),
-                self.last_stitch_ui_error,
+                self.last_runtime_apply_error,
             )
+            return
+        self.invalidate_layout_tuner_cache("Fisheye intrinsics source changed.")
         self.refresh_stitch_runtime_controls()
         self.update_preview_status_summary()
+        self.schedule_auto_runtime_retry_if_dirty()
 
     def clear_runtime_fisheye_intrinsics_source(self) -> None:
         previous_runtime_source = self.runtime_fisheye_intrinsics_source
@@ -2756,11 +2815,6 @@ class MainWindow(QMainWindow):
         self.runtime_fisheye_intrinsics_source = None
         self.layout_tuner_fisheye_intrinsics_source = None
         self.layout_tuner_candidate_dir = None
-        self.layout_tuner_source_info = {}
-        self.layout_tuner_projection_metadata = {}
-        self.layout_tuner_warped = {}
-        self.layout_tuner_valid_masks = {}
-        self.layout_tuner_preview_result = None
         projection = self.runtime_stitch_config.projection_source
         if projection == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE:
             projection = ProjectionSource.CURRENT_PERSPECTIVE
@@ -2784,6 +2838,8 @@ class MainWindow(QMainWindow):
             self.layout_tuner_fisheye_intrinsics_source = previous_tuner_source
             self.runtime_stitch_config = previous_config
             self.refresh_stitch_runtime_controls()
+            return
+        self.invalidate_layout_tuner_cache("Fisheye intrinsics source cleared.")
 
     def open_runtime_layout_candidate_folder(self) -> None:
         if self.runtime_layout_candidate is not None:
@@ -2842,6 +2898,88 @@ class MainWindow(QMainWindow):
             else 1.0
         )
         return balance, fov_scale
+
+    def layout_tuner_effective_projection_source(self) -> str:
+        if self.selected_layout_tuner_target() == "far_field":
+            return B2_FAR_FIELD_PROJECTION_SOURCE
+        return self.selected_layout_tuner_projection_source().value
+
+    def build_layout_tuner_cache_key(
+        self,
+        frame_signature: str,
+        *,
+        verify_source_revision: bool = True,
+    ) -> LayoutTunerCacheKey:
+        target = self.selected_layout_tuner_target()
+        projection_source = self.layout_tuner_effective_projection_source()
+        source_path: Path | None = None
+        balance = 0.0
+        fov_scale = 1.0
+        if projection_source == B2_FAR_FIELD_PROJECTION_SOURCE:
+            source_path = self.current_b2_candidate_directory()
+        elif projection_source == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value:
+            source = (
+                self.layout_tuner_fisheye_intrinsics_source
+                or self.runtime_fisheye_intrinsics_source
+            )
+            source_path = source.path if source is not None else None
+            balance, fov_scale = self.selected_layout_tuner_fisheye_params()
+        if (
+            not verify_source_revision
+            and self.layout_tuner_cache_key is not None
+        ):
+            projection_revision = self.layout_tuner_cache_key.projection_revision
+        else:
+            projection_revision = runtime_source_revision(source_path)
+        return LayoutTunerCacheKey(
+            target=target,
+            projection_source=projection_source,
+            calibration_revision=str(config_revision("calibration.yaml") or "missing"),
+            profile_revision=mapping_revision(self.current_stitch_profile()),
+            projection_revision=projection_revision,
+            balance=float(balance),
+            fov_scale=float(fov_scale),
+            frame_signature=str(frame_signature),
+        )
+
+    def layout_tuner_cache_is_current(
+        self,
+        *,
+        verify_source_revision: bool = False,
+    ) -> bool:
+        cached = self.layout_tuner_cache_key
+        if cached is None or not self.layout_tuner_warped:
+            return False
+        current = self.build_layout_tuner_cache_key(
+            cached.frame_signature,
+            verify_source_revision=verify_source_revision,
+        )
+        return cached.same_selection_as(current)
+
+    def invalidate_layout_tuner_cache(self, reason: str) -> None:
+        self.layout_tuner_cache_key = None
+        self.layout_tuner_cache_stale_reason = str(reason)
+        self.layout_tuner_warped = {}
+        self.layout_tuner_valid_masks = {}
+        self.layout_tuner_projection_metadata = {}
+        self.layout_tuner_source_info = {}
+        self.layout_tuner_preview_result = None
+        if hasattr(self, "layout_tuner_save_button"):
+            self.layout_tuner_save_button.setEnabled(False)
+        if hasattr(self, "layout_tuner_view"):
+            self.layout_tuner_view.set_placeholder(
+                self.t("Projection inputs changed. Capture a new preview frame before saving.")
+            )
+        if hasattr(self, "layout_tuner_metrics"):
+            self.layout_tuner_metrics.setPlainText(
+                "stale: " + self.layout_tuner_cache_stale_reason
+            )
+
+    def on_layout_tuner_projection_changed(self, _value: Any = None) -> None:
+        self.invalidate_layout_tuner_cache("Projection source changed.")
+
+    def on_layout_tuner_projection_params_changed(self, _value: Any = None) -> None:
+        self.invalidate_layout_tuner_cache("Fisheye projection parameters changed.")
 
     def fisheye_intrinsics_source_status_text(self, source_path: Path) -> str:
         parts = source_path.parts
@@ -3009,7 +3147,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 self.t("Stitch Runtime Mode"),
-                self.last_stitch_ui_error,
+                self.last_runtime_apply_error,
             )
             self.refresh_stitch_runtime_controls()
             return False
@@ -3158,15 +3296,21 @@ class MainWindow(QMainWindow):
         selected = self.selected_runtime_view_preset()
         effective = preset_for_effective_status(self.effective_runtime_status())
         self.runtime_selection_summary.setText(descriptions[selected])
-        label_key = (
-            "Selected, not applied: {view}"
-            if self._runtime_view_selection_dirty
-            else "Effective: {view}"
-        )
-        label_preset = selected if self._runtime_view_selection_dirty else effective
-        self.runtime_effective_status_label.setText(
-            self.t(label_key, view=self.runtime_view_display_name(label_preset))
-        )
+        if self._runtime_view_selection_dirty:
+            self.runtime_effective_status_label.setText(
+                self.t(
+                    "Selected: {selected} / Effective: {effective}",
+                    selected=self.runtime_view_display_name(selected),
+                    effective=self.runtime_view_display_name(effective),
+                )
+            )
+        else:
+            self.runtime_effective_status_label.setText(
+                self.t(
+                    "Effective: {view}",
+                    view=self.runtime_view_display_name(effective),
+                )
+            )
         if self.live_candidate_directory is None:
             self.stitch_runtime_mode_panel.b2_candidate_status.setText(
                 self.t(
@@ -3544,6 +3688,12 @@ class MainWindow(QMainWindow):
         self.runtime_view_combo.currentIndexChanged.connect(
             self.on_runtime_view_preset_changed
         )
+        self.runtime_fisheye_balance.valueChanged.connect(
+            self.on_runtime_fisheye_params_changed
+        )
+        self.runtime_fisheye_fov_scale.valueChanged.connect(
+            self.on_runtime_fisheye_params_changed
+        )
         self.runtime_load_candidate_button.clicked.connect(
             self.choose_runtime_layout_candidate
         )
@@ -3592,6 +3742,21 @@ class MainWindow(QMainWindow):
         if self.auto_preview_on_view_change:
             self.schedule_selected_runtime_view_preview()
 
+    def on_runtime_fisheye_params_changed(self, _value: float) -> None:
+        if self.selected_runtime_view_preset() != RuntimeViewPreset.NEAR_FISHEYE:
+            return
+        self._runtime_view_selection_dirty = True
+        self.refresh_stitch_runtime_controls(sync_selection=False)
+        if self.auto_preview_on_view_change:
+            self._runtime_fisheye_apply_timer.start()
+
+    def schedule_auto_runtime_retry_if_dirty(self) -> None:
+        if (
+            self.auto_preview_on_view_change
+            and self._runtime_view_selection_dirty
+        ):
+            self.schedule_selected_runtime_view_preview()
+
     def schedule_selected_runtime_view_preview(self) -> None:
         """Coalesce selector changes and apply the latest choice on the UI loop."""
 
@@ -3602,7 +3767,10 @@ class MainWindow(QMainWindow):
 
     def _run_scheduled_runtime_view_preview(self) -> None:
         self._auto_preview_request_pending = False
-        if not self.auto_preview_on_view_change or not self.isVisible():
+        if not self.auto_preview_on_view_change:
+            return
+        if not self.isVisible():
+            self._initial_auto_preview_requested = False
             return
         self.ensure_selected_runtime_view_live()
 
@@ -3669,6 +3837,9 @@ class MainWindow(QMainWindow):
             self.t("Fisheye Rectilinear [Experimental]"),
             ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value,
         )
+        self.layout_tuner_projection_combo.currentIndexChanged.connect(
+            self.on_layout_tuner_projection_changed
+        )
         self.layout_tuner_projection_combo.setToolTip(
             self.t("Fisheye Rectilinear is experimental and only affects Near-field preview/runtime.")
         )
@@ -3677,11 +3848,17 @@ class MainWindow(QMainWindow):
         self.layout_tuner_fisheye_balance.setSingleStep(0.05)
         self.layout_tuner_fisheye_balance.setDecimals(2)
         self.layout_tuner_fisheye_balance.setValue(0.6)
+        self.layout_tuner_fisheye_balance.valueChanged.connect(
+            self.on_layout_tuner_projection_params_changed
+        )
         self.layout_tuner_fisheye_fov_scale = NoWheelDoubleSpinBox()
         self.layout_tuner_fisheye_fov_scale.setRange(0.8, 1.2)
         self.layout_tuner_fisheye_fov_scale.setSingleStep(0.05)
         self.layout_tuner_fisheye_fov_scale.setDecimals(2)
         self.layout_tuner_fisheye_fov_scale.setValue(1.0)
+        self.layout_tuner_fisheye_fov_scale.valueChanged.connect(
+            self.on_layout_tuner_projection_params_changed
+        )
         self.layout_tuner_load_fisheye_button = QPushButton(
             self.t("Load Fisheye Intrinsics Source...")
         )
@@ -3901,6 +4078,7 @@ class MainWindow(QMainWindow):
         self.layout_tuner_save_button = QPushButton(
             self.t("Save Near-field Layout Candidate")
         )
+        self.layout_tuner_save_button.setEnabled(False)
         self.layout_tuner_export_button = QPushButton(self.t("Export Preview PNG"))
         self.layout_tuner_open_button = QPushButton(self.t("Open Candidate Folder"))
         self.layout_tuner_capture_button.clicked.connect(
@@ -4253,7 +4431,7 @@ class MainWindow(QMainWindow):
                 if far_field
                 else self.t("Near-field Layout Tuner Note")
             )
-        self.layout_tuner_preview_result = None
+        self.invalidate_layout_tuner_cache("Layout tuner target changed.")
         self.schedule_layout_tuner_preview()
 
     def reset_layout_tuner_to_baseline(self, schedule: bool = True) -> None:
@@ -4297,6 +4475,7 @@ class MainWindow(QMainWindow):
         self.layout_tuner_preview_timer.start()
 
     def capture_layout_tuner_preview_frame(self) -> None:
+        self.invalidate_layout_tuner_cache("Capturing a new projection input.")
         captured_at = time.time()
         frame_ages: dict[str, float | None] = {}
         active = set(active_topology_camera_keys(self.calibration_config))
@@ -4318,78 +4497,65 @@ class MainWindow(QMainWindow):
                 for key, frame in self.frames.items()
                 if key in active and frame is not None
             }
-        if not frames and self.warped:
-            if self.selected_layout_tuner_target() == "far_field":
-                QMessageBox.information(
-                    self,
-                    self.t("Layout Tuner"),
-                    self.t(
-                        "Far-field layout tuning requires a B-2 candidate projection. Generate or load a B-2 candidate first."
-                    ),
-                )
-                return
-            self.layout_tuner_warped = {
-                key: image.copy()
-                for key, image in self.warped.items()
-                if key in active
-            }
-            self.layout_tuner_valid_masks = {
-                key: np.any(image != 0, axis=2)
-                for key, image in self.layout_tuner_warped.items()
-            }
-            self.layout_tuner_projection_metadata = {
-                "projection_source": ProjectionSource.CURRENT_PERSPECTIVE.value,
-                "valid_mask_source": "nonzero_pixels_runtime_compatible",
-            }
-            self.layout_tuner_source_info = {
-                "mode": "current_warped_cache",
-                "frame_info": {"warning": "Used existing warped cache because no raw frames were available."},
-                "projection": dict(self.layout_tuner_projection_metadata),
-            }
-        else:
-            required = {"front_left", "front", "front_right"}
-            missing = sorted(required - set(frames))
-            if missing:
-                QMessageBox.information(
-                    self,
-                    self.t("Layout Tuner"),
-                    self.t(
-                        "Missing frames for layout tuner: {cameras}",
-                        cameras=", ".join(missing),
-                    ),
-                )
-                return
-            try:
-                self.log_source_coordinate_warnings(frames)
-                projection = self.project_layout_tuner_frames(frames)
-                self.layout_tuner_warped = projection.warped_images
-                self.layout_tuner_valid_masks = projection.valid_masks
-                self.layout_tuner_projection_metadata = projection.metadata
-            except Exception as exc:
-                self.log(
-                    self.t("Layout tuner capture failed: {error}", error=exc)
-                    + f"\n{traceback.format_exc()}",
-                    level="ERROR",
-                )
-                QMessageBox.warning(self, self.t("Layout Tuner"), str(exc))
-                return
-            self.layout_tuner_source_info = {
-                "mode": (
-                    "live_latest"
-                    if self.preview_content_mode == PreviewContentMode.LIVE
-                    else "snapshot_preview"
+        required = {"front_left", "front", "front_right"}
+        missing = sorted(required - set(frames))
+        if missing:
+            QMessageBox.information(
+                self,
+                self.t("Layout Tuner"),
+                self.t(
+                    "Missing frames for layout tuner: {cameras}",
+                    cameras=", ".join(missing),
                 ),
-                "frame_info": {
-                    "cameras": sorted(frames),
-                    "frame_age_seconds": frame_ages,
-                    "warped_keys": sorted(self.layout_tuner_warped),
-                    "projection_source": self.layout_tuner_projection_metadata.get(
-                        "projection_source",
-                        ProjectionSource.CURRENT_PERSPECTIVE.value,
-                    ),
-                },
-                "projection": dict(self.layout_tuner_projection_metadata),
-            }
+            )
+            return
+        frame_signature = frame_content_signature(frames)
+        try:
+            self.log_source_coordinate_warnings(frames)
+            projection = self.project_layout_tuner_frames(frames)
+            missing_masks = sorted(set(projection.warped_images) - set(projection.valid_masks))
+            if missing_masks:
+                raise RuntimeError(
+                    "Projection result is missing geometric valid masks for: "
+                    + ", ".join(missing_masks)
+                )
+            self.layout_tuner_warped = projection.warped_images
+            self.layout_tuner_valid_masks = projection.valid_masks
+            self.layout_tuner_projection_metadata = dict(projection.metadata)
+            cache_key = self.build_layout_tuner_cache_key(
+                frame_signature,
+                verify_source_revision=True,
+            )
+        except Exception as exc:
+            self.invalidate_layout_tuner_cache("Projection capture failed.")
+            self.log(
+                self.t("Layout tuner capture failed: {error}", error=exc)
+                + f"\n{traceback.format_exc()}",
+                level="ERROR",
+            )
+            QMessageBox.warning(self, self.t("Layout Tuner"), str(exc))
+            return
+        self.layout_tuner_cache_key = cache_key
+        self.layout_tuner_cache_stale_reason = ""
+        self.layout_tuner_source_info = {
+            "mode": (
+                "live_latest"
+                if self.preview_content_mode == PreviewContentMode.LIVE
+                else "snapshot_preview"
+            ),
+            "frame_info": {
+                "cameras": sorted(frames),
+                "frame_age_seconds": frame_ages,
+                "frame_signature": frame_signature,
+                "warped_keys": sorted(self.layout_tuner_warped),
+                "projection_source": self.layout_tuner_projection_metadata.get(
+                    "projection_source",
+                    ProjectionSource.CURRENT_PERSPECTIVE.value,
+                ),
+            },
+            "projection": dict(self.layout_tuner_projection_metadata),
+            "cache_key": cache_key.to_dict(),
+        }
         self.refresh_layout_tuner_preview()
 
     def refresh_layout_tuner_preview(self) -> None:
@@ -4403,16 +4569,18 @@ class MainWindow(QMainWindow):
                 self.t("No cached warped images. Click Capture Preview Frame.")
             )
             return
+        if not self.layout_tuner_cache_is_current(verify_source_revision=False):
+            self.invalidate_layout_tuner_cache(
+                "Projection inputs changed after the cached frame was captured."
+            )
+            return
         start = time.perf_counter()
         try:
             tuner_params = self.current_layout_tuner_params()
             if self.selected_layout_tuner_target() == "far_field":
                 projection = ProjectionResult(
                     warped_images=self.layout_tuner_warped,
-                    valid_masks=self.layout_tuner_valid_masks or {
-                        key: np.any(image != 0, axis=2)
-                        for key, image in self.layout_tuner_warped.items()
-                    },
+                    valid_masks=self.layout_tuner_valid_masks,
                     metadata={
                         **dict(self.layout_tuner_projection_metadata),
                         "projection_source": self.layout_tuner_projection_metadata.get(
@@ -4505,11 +4673,24 @@ class MainWindow(QMainWindow):
         if warnings:
             lines.append("warnings: " + ", ".join(str(item) for item in warnings))
         self.layout_tuner_metrics.setPlainText("\n".join(lines))
+        self.layout_tuner_save_button.setEnabled(True)
         self.statusBar().showMessage(
             self.t("Layout tuner preview rendered in {ms:.1f} ms", ms=elapsed_ms)
         )
 
     def save_layout_tuner_candidate(self) -> None:
+        if not self.layout_tuner_cache_is_current(verify_source_revision=True):
+            self.invalidate_layout_tuner_cache(
+                "Projection source changed after capture; a new frame is required."
+            )
+            QMessageBox.information(
+                self,
+                self.t("Layout Tuner"),
+                self.t(
+                    "Projection inputs changed. Capture a new preview frame before saving."
+                ),
+            )
+            return
         if self.layout_tuner_preview_result is None:
             self.refresh_layout_tuner_preview()
         if self.layout_tuner_preview_result is None:
@@ -4555,6 +4736,18 @@ class MainWindow(QMainWindow):
         self.log(self.t("Layout candidate saved: {path}", path=directory))
 
     def export_layout_tuner_preview_png(self) -> None:
+        if not self.layout_tuner_cache_is_current(verify_source_revision=True):
+            self.invalidate_layout_tuner_cache(
+                "Projection source changed after capture; a new frame is required."
+            )
+            QMessageBox.information(
+                self,
+                self.t("Layout Tuner"),
+                self.t(
+                    "Projection inputs changed. Capture a new preview frame before saving."
+                ),
+            )
+            return
         if self.layout_tuner_preview_result is None:
             self.refresh_layout_tuner_preview()
         if self.layout_tuner_preview_result is None:
@@ -4662,10 +4855,14 @@ class MainWindow(QMainWindow):
         perf_form = QFormLayout(perf_group)
         self.process_fps = NoWheelSpinBox()
         self.process_fps.setRange(1, 60)
-        self.process_fps.setValue(int(self.performance_config.get("process_fps", 5)))
+        self.process_fps.setValue(
+            int(self.performance_config.get("process_fps", DEFAULT_PROCESS_FPS))
+        )
         self.preview_fps = NoWheelSpinBox()
         self.preview_fps.setRange(1, 60)
-        self.preview_fps.setValue(int(self.performance_config.get("preview_fps", 2)))
+        self.preview_fps.setValue(
+            int(self.performance_config.get("preview_fps", DEFAULT_PREVIEW_FPS))
+        )
         self.max_input_width = NoWheelSpinBox()
         self.max_input_width.setRange(0, 4096)
         self.max_input_width.setSpecialValueText(self.t("Original"))
@@ -6011,6 +6208,13 @@ class MainWindow(QMainWindow):
                     error=self.last_stitch_ui_error,
                 )
             )
+        if self.last_runtime_apply_error:
+            warnings.append(
+                self.t(
+                    "Runtime view apply failed: {error}",
+                    error=self.last_runtime_apply_error,
+                )
+            )
         warnings.extend(self.t(message) for message in self.last_runtime_warnings)
         warnings.extend(
             self.t(message)
@@ -6113,6 +6317,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "preview_status_summary"):
             return
         active_keys = self.active_camera_keys()[:4]
+        processing_state = self.stitch_processor.state()
         status_counts = {
             STREAM_LIVE: 0,
             STREAM_CONNECTING: 0,
@@ -6193,6 +6398,49 @@ class MainWindow(QMainWindow):
             summary += f"  |  {self.t('Warnings')}: {len(warnings)}"
         else:
             summary += f"  |  {self.t('Warnings')}: {self.t('None')}"
+        frame_ages: list[float] = []
+        for key in active_keys:
+            snapshot = self.stream_snapshots.get(key)
+            if snapshot is None:
+                continue
+            try:
+                frame_timestamp = float(snapshot.frame_timestamp)
+            except (TypeError, ValueError):
+                continue
+            if frame_timestamp <= 0.0 or not np.isfinite(frame_timestamp):
+                continue
+            frame_age = status_now - frame_timestamp
+            if np.isfinite(frame_age):
+                frame_ages.append(max(0.0, frame_age))
+        age_suffix = ""
+        if frame_ages:
+            age_suffix = self.bt(
+                " / max frame age {frame_age:.1f} s",
+                " / 最大帧龄 {frame_age:.1f} s",
+                frame_age=max(frame_ages),
+            )
+        summary += "  |  " + self.bt(
+            (
+                "Worker: submitted {submitted} / dropped {dropped} / "
+                "completed {completed} / failed {failed} / "
+                "result FPS {result_fps:.1f} / p50 {p50_ms:.1f} ms / "
+                "p95 {p95_ms:.1f} ms{age_suffix}"
+            ),
+            (
+                "工作线程：提交 {submitted} / 丢弃 {dropped} / "
+                "完成 {completed} / 失败 {failed} / "
+                "结果 FPS {result_fps:.1f} / p50 {p50_ms:.1f} ms / "
+                "p95 {p95_ms:.1f} ms{age_suffix}"
+            ),
+            submitted=processing_state.submitted,
+            dropped=processing_state.dropped,
+            completed=processing_state.completed,
+            failed=processing_state.failed,
+            result_fps=processing_state.rolling_result_fps,
+            p50_ms=processing_state.rolling_elapsed_p50_ms,
+            p95_ms=processing_state.rolling_elapsed_p95_ms,
+            age_suffix=age_suffix,
+        )
         self.preview_status_summary.setText(summary)
         self.preview_status_summary.setToolTip("\n".join(warnings))
         self.preview_status_summary.setStyleSheet(
@@ -6266,7 +6514,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 self.t("Stitched View"),
-                self.last_stitch_ui_error,
+                self.last_runtime_apply_error,
             )
             return
         self.log(
@@ -6578,7 +6826,10 @@ class MainWindow(QMainWindow):
     def update_live_preview(self) -> None:
         now = time.perf_counter()
         preview_interval = self.effective_preview_interval()
-        process_interval = 1.0 / max(1, int(self.performance_config.get("process_fps", 5)))
+        process_interval = 1.0 / max(
+            1,
+            int(self.performance_config.get("process_fps", DEFAULT_PROCESS_FPS)),
+        )
         should_refresh_preview = (now - self.last_preview_time) >= preview_interval
         should_submit_stitch = (now - self.last_process_time) >= process_interval
 
@@ -6640,9 +6891,13 @@ class MainWindow(QMainWindow):
                 )
                 if (
                     self.awaiting_current_frame_set_result
+                    and self.minimum_stitch_result_request_id <= 0
                     and isinstance(request_id, int)
                     and request_id > 0
                 ):
+                    # Pin the first request for this camera set. Advancing this
+                    # gate on every latest-only submission can starve the UI
+                    # whenever submit FPS is higher than result FPS.
                     self.minimum_stitch_result_request_id = request_id
 
         workers_active = self.stream_manager.has_active_workers()
@@ -6657,7 +6912,10 @@ class MainWindow(QMainWindow):
         self.apply_latest_stitch_result()
 
     def effective_preview_interval(self) -> float:
-        configured_interval = 1.0 / max(1, int(self.performance_config.get("preview_fps", 2)))
+        configured_interval = 1.0 / max(
+            1,
+            int(self.performance_config.get("preview_fps", DEFAULT_PREVIEW_FPS)),
+        )
         if self.qgc_output_active:
             return max(configured_interval, 1.0 / 5.0)
         return configured_interval
@@ -6665,11 +6923,11 @@ class MainWindow(QMainWindow):
     def should_render_canvas_now(self, *, force: bool = False) -> bool:
         if not self.should_render_canvas():
             return False
-        if force or not self.qgc_output_active:
+        if force:
             self.last_canvas_render_time = time.perf_counter()
             return True
         now = time.perf_counter()
-        if now - self.last_canvas_render_time >= 1.0 / 5.0:
+        if now - self.last_canvas_render_time >= self.effective_preview_interval():
             self.last_canvas_render_time = now
             return True
         return False
@@ -6756,12 +7014,9 @@ class MainWindow(QMainWindow):
                 )
 
     def should_render_canvas(self) -> bool:
-        if not hasattr(self, "preview_tabs"):
-            return False
-        if self.preview_layout_mode == PreviewLayoutMode.STITCHED:
-            return True
         return (
-            hasattr(self, "root_tabs")
+            hasattr(self, "preview_tabs")
+            and hasattr(self, "root_tabs")
             and self.root_tabs.currentIndex() == 0
             and self.preview_tabs.isVisible()
             and self.preview_tabs.currentIndex() == self.canvas_tab_index
@@ -6813,6 +7068,7 @@ class MainWindow(QMainWindow):
         if result.request_id < self.minimum_stitch_result_request_id:
             return
 
+        was_awaiting_current_frame_set = self.awaiting_current_frame_set_result
         self.awaiting_current_frame_set_result = False
         self.displayed_stitch_result_id = result.result_id
         self.last_stitch_ms = result.elapsed_ms
@@ -6849,8 +7105,16 @@ class MainWindow(QMainWindow):
         self.canvas = result.canvas
         self.write_qgc_output_frame(self.canvas)
         self.refresh_warped_views()
+        canvas_rendered = False
         if self.canvas is not None and self.should_render_canvas_now():
             self.render_canvas_view()
+            canvas_rendered = True
+        if was_awaiting_current_frame_set:
+            self.log(
+                "Accepted first stitched result for current camera set: "
+                f"session={result.session_id}, request={result.request_id}, "
+                f"result={result.result_id}, canvas_rendered={canvas_rendered}"
+            )
         message = self.t(
             "{status}: {count} active frames | stitch {ms:.1f} ms",
             status=self.t("Live frame"),
@@ -7119,6 +7383,9 @@ class MainWindow(QMainWindow):
         self.update_topology_diagnostics()
         self.refresh_pairwise_pair_choices()
         self.refresh_project_active_status()
+        self.invalidate_layout_tuner_cache(
+            "Configuration or active project state was reloaded."
+        )
         for level, message in active_runtime_logs:
             self.log(message, level=level)
 
@@ -7132,10 +7399,20 @@ class MainWindow(QMainWindow):
                 row.apply_config(cameras.get(key, {}))
 
             self.process_fps.setValue(
-                int(self.performance_config.get("process_fps", 5))
+                int(
+                    self.performance_config.get(
+                        "process_fps",
+                        DEFAULT_PROCESS_FPS,
+                    )
+                )
             )
             self.preview_fps.setValue(
-                int(self.performance_config.get("preview_fps", 2))
+                int(
+                    self.performance_config.get(
+                        "preview_fps",
+                        DEFAULT_PREVIEW_FPS,
+                    )
+                )
             )
             self.max_input_width.setValue(
                 int(self.performance_config.get("max_input_width", 960))
@@ -8887,6 +9164,7 @@ class MainWindow(QMainWindow):
         )
         activated_new_candidate = False
         self.live_candidate_directory = output_dir
+        self.invalidate_layout_tuner_cache("B-2 projection candidate changed.")
         self._candidate_ui_cache_path = None
         self._candidate_ui_cache = {}
         if was_active_candidate:
@@ -8901,7 +9179,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 self.t("Calibration Wizard"),
-                self.last_stitch_ui_error,
+                self.last_runtime_apply_error,
             )
         self.apply_live_stitch_mode_controls()
         self.update_preview_status_summary()
@@ -8925,6 +9203,7 @@ class MainWindow(QMainWindow):
             )
         dialog = CalibrationCandidateDialog(output_dir, self)
         dialog.exec()
+        self.schedule_auto_runtime_retry_if_dirty()
 
     def calibration_session_status_text(self) -> str:
         if self.calibration_session is None:

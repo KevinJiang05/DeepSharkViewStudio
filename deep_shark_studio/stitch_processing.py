@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from threading import Condition, Thread
 import time
@@ -50,7 +51,15 @@ class StitchResult:
 
 @dataclass(frozen=True)
 class StitchProcessingState:
-    """Observable worker configuration and lifecycle state."""
+    """Observable worker configuration, lifecycle state, and telemetry.
+
+    Counters are lifetime totals for accepted requests. ``superseded`` is the
+    subset of ``dropped`` replaced while still pending; ``dropped`` also counts
+    pending or in-flight work invalidated by reconfigure, session invalidation,
+    or shutdown. Successful reconfigure and session invalidation reset rolling
+    timing/FPS samples, which otherwise describe only successful results from
+    the current configuration.
+    """
 
     session_id: int
     configuration_id: int
@@ -63,10 +72,22 @@ class StitchProcessingState:
     thread_started: bool
     thread_alive: bool
     thread_daemon: bool
+    submitted: int = 0
+    superseded: int = 0
+    dropped: int = 0
+    completed: int = 0
+    failed: int = 0
+    busy: bool = False
+    rolling_elapsed_p50_ms: float = 0.0
+    rolling_elapsed_p95_ms: float = 0.0
+    rolling_result_fps: float = 0.0
 
 
 class StitchProcessingWorker:
     """Single long-lived worker that processes only the newest pending request."""
+
+    _TELEMETRY_SAMPLE_LIMIT = 120
+    _RESULT_FPS_WINDOW_SECONDS = 5.0
 
     def __init__(self):
         self._condition = Condition()
@@ -93,6 +114,18 @@ class StitchProcessingWorker:
         self._runtime_status = ""
         self._projection_source = ""
         self._started = False
+        self._submitted = 0
+        self._superseded = 0
+        self._dropped = 0
+        self._completed = 0
+        self._failed = 0
+        self._busy = False
+        self._rolling_elapsed_ms: deque[float] = deque(
+            maxlen=self._TELEMETRY_SAMPLE_LIMIT,
+        )
+        self._rolling_result_times: deque[float] = deque(
+            maxlen=self._TELEMETRY_SAMPLE_LIMIT,
+        )
 
     def start(self) -> None:
         with self._condition:
@@ -181,8 +214,11 @@ class StitchProcessingWorker:
             self._runtime_mode = runtime_mode
             self._runtime_status = runtime_status
             self._projection_source = projection_source
+            if self._pending_request is not None:
+                self._dropped += 1
             self._pending_request = None
             self._latest_result = None
+            self._reset_rolling_telemetry_locked()
             self._condition.notify_all()
 
     def submit_latest(self, session_id: int, frames: dict[str, np.ndarray]) -> int:
@@ -192,6 +228,10 @@ class StitchProcessingWorker:
             if self._stitcher is None or session_id != self._active_session_id:
                 return self._request_id
             self._request_id += 1
+            self._submitted += 1
+            if self._pending_request is not None:
+                self._superseded += 1
+                self._dropped += 1
             self._pending_request = StitchRequest(
                 session_id=session_id,
                 request_id=self._request_id,
@@ -214,8 +254,11 @@ class StitchProcessingWorker:
             self._runtime_mode = ""
             self._runtime_status = ""
             self._projection_source = ""
+            if self._pending_request is not None:
+                self._dropped += 1
             self._pending_request = None
             self._latest_result = None
+            self._reset_rolling_telemetry_locked()
             self._condition.notify_all()
 
     def take_latest_result(self) -> StitchResult | None:
@@ -224,6 +267,17 @@ class StitchProcessingWorker:
 
     def state(self) -> StitchProcessingState:
         with self._condition:
+            elapsed_samples = tuple(self._rolling_elapsed_ms)
+            rolling_elapsed_p50_ms = (
+                float(np.percentile(elapsed_samples, 50.0))
+                if elapsed_samples
+                else 0.0
+            )
+            rolling_elapsed_p95_ms = (
+                float(np.percentile(elapsed_samples, 95.0))
+                if elapsed_samples
+                else 0.0
+            )
             return StitchProcessingState(
                 session_id=self._active_session_id,
                 configuration_id=self._configuration_id,
@@ -236,6 +290,15 @@ class StitchProcessingWorker:
                 thread_started=self._started,
                 thread_alive=self._thread.is_alive(),
                 thread_daemon=self._thread.daemon,
+                submitted=self._submitted,
+                superseded=self._superseded,
+                dropped=self._dropped,
+                completed=self._completed,
+                failed=self._failed,
+                busy=self._busy,
+                rolling_elapsed_p50_ms=rolling_elapsed_p50_ms,
+                rolling_elapsed_p95_ms=rolling_elapsed_p95_ms,
+                rolling_result_fps=self._rolling_result_fps_locked(),
             )
 
     def shutdown(self, timeout: float = 2.0) -> bool:
@@ -248,6 +311,8 @@ class StitchProcessingWorker:
             self._runtime_mode = ""
             self._runtime_status = ""
             self._projection_source = ""
+            if self._pending_request is not None:
+                self._dropped += 1
             self._pending_request = None
             self._latest_result = None
             self._condition.notify_all()
@@ -267,8 +332,12 @@ class StitchProcessingWorker:
                     request = self._pending_request
                     self._pending_request = None
                     stitcher = self._stitcher
+                    self._busy = request is not None and stitcher is not None
 
                 if request is None or stitcher is None:
+                    with self._condition:
+                        self._busy = False
+                        self._condition.notify_all()
                     continue
 
                 start_time = time.perf_counter()
@@ -303,12 +372,15 @@ class StitchProcessingWorker:
                 elapsed_ms = (time.perf_counter() - start_time) * 1000.0
 
                 with self._condition:
+                    self._busy = False
                     if (
                         self._shutdown
                         or request.session_id != self._active_session_id
                         or request.configuration_id != self._configuration_id
                         or stitcher is not self._stitcher
                     ):
+                        self._dropped += 1
+                        self._condition.notify_all()
                         continue
                     self._result_id += 1
                     self._latest_result = StitchResult(
@@ -327,6 +399,13 @@ class StitchProcessingWorker:
                         runtime_warnings=runtime_warnings,
                         runtime_metrics=runtime_metrics,
                     )
+                    if error:
+                        self._failed += 1
+                    else:
+                        self._completed += 1
+                        self._rolling_elapsed_ms.append(elapsed_ms)
+                        self._rolling_result_times.append(time.monotonic())
+                    self._condition.notify_all()
         finally:
             with self._condition:
                 self._stitcher = None
@@ -335,7 +414,27 @@ class StitchProcessingWorker:
                 self._runtime_status = ""
                 self._projection_source = ""
                 self._pending_request = None
+                self._busy = False
                 self._condition.notify_all()
+
+    def _reset_rolling_telemetry_locked(self) -> None:
+        """Reset generation-scoped samples while preserving lifetime totals."""
+
+        self._rolling_elapsed_ms.clear()
+        self._rolling_result_times.clear()
+
+    def _rolling_result_fps_locked(self) -> float:
+        """Return successful result throughput over the recent rolling window."""
+
+        cutoff = time.monotonic() - self._RESULT_FPS_WINDOW_SECONDS
+        while self._rolling_result_times and self._rolling_result_times[0] < cutoff:
+            self._rolling_result_times.popleft()
+        if len(self._rolling_result_times) < 2:
+            return 0.0
+        elapsed = self._rolling_result_times[-1] - self._rolling_result_times[0]
+        if elapsed <= 0.0:
+            return 0.0
+        return (len(self._rolling_result_times) - 1) / elapsed
 
 
 class StitchProcessingManager:

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import cv2
 import numpy as np
 import yaml
 
@@ -14,6 +15,7 @@ from deep_shark_studio.projection.runtime_providers import (
     CurrentPerspectiveProjectionProvider,
 )
 from deep_shark_studio.seam.far_field_custom_compositor import (
+    _compose_b2_weight_selection,
     render_far_field_custom_from_projection,
 )
 from deep_shark_studio.seam.far_field_layout_candidate_runtime import (
@@ -81,6 +83,7 @@ def _candidate_data_b2(candidate_directory: Path) -> dict:
         "candidate_directory": str(candidate_directory),
         "note": "unit test B-2 source",
     }
+    data["far_field_blend"]["mode"] = "b2_weight_selection"
     return data
 
 
@@ -141,10 +144,14 @@ class FakeB2CandidateProcessor:
             for camera, image in _warped_images().items()
         }
         self._weights = {
-            "front_left": self._masks["front_left"].astype(np.float32) * 0.2,
-            "front": self._masks["front"].astype(np.float32) * 0.8,
-            "front_right": self._masks["front_right"].astype(np.float32) * 0.4,
+            camera: np.where(mask, score, -np.inf).astype(np.float32)
+            for camera, mask, score in (
+                ("front_left", self._masks["front_left"], 0.2),
+                ("front", self._masks["front"], 0.8),
+                ("front_right", self._masks["front_right"], 0.4),
+            )
         }
+        self._weights["front"][20, 40] = np.nan
         self.process_calls = 0
 
     def process(self, frames):
@@ -163,6 +170,56 @@ class FarFieldCustomLayoutTests(unittest.TestCase):
 
         self.assertEqual(10, result.metadata["cameras"]["front"]["x_offset_px"])
         self.assertEqual(warped["front"].shape, result.warped_images["front"].shape)
+
+    def test_shared_camera_adjust_rejects_scale_outside_runtime_contract(self) -> None:
+        warped = _warped_images()
+        masks = {camera: np.any(image != 0, axis=2) for camera, image in warped.items()}
+        for scale in (0.79, 1.21, float("nan"), float("inf")):
+            with self.subTest(scale=scale):
+                with self.assertRaisesRegex(ValueError, "scale"):
+                    apply_post_warp_camera_adjustments(
+                        warped,
+                        valid_masks=masks,
+                        camera_adjust={"front": CameraAdjustParams(scale=scale)},
+                    )
+
+    def test_far_field_candidate_loader_rejects_nonfinite_or_out_of_range_scale(self) -> None:
+        for scale in (0.79, 1.21, float("nan"), float("inf")):
+            with self.subTest(scale=scale), tempfile.TemporaryDirectory() as temp:
+                data = _candidate_data()
+                data["camera_adjust"]["front"]["scale"] = scale
+                path = _write_candidate(Path(temp), data)
+
+                with self.assertRaisesRegex(FarFieldLayoutCandidateError, "scale"):
+                    load_far_field_layout_candidate(path)
+
+    def test_far_field_candidate_loader_enforces_projection_blend_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            b2_dir = root / "b2"
+            b2_dir.mkdir()
+            mismatches = (
+                (_candidate_data(), "b2_weight_selection"),
+                (_candidate_data_b2(b2_dir), "current_horizontal_feather"),
+            )
+            for index, (data, blend_mode) in enumerate(mismatches):
+                with self.subTest(blend_mode=blend_mode):
+                    data["far_field_blend"]["mode"] = blend_mode
+                    candidate_dir = root / f"candidate_{index}"
+                    candidate_dir.mkdir()
+                    path = _write_candidate(candidate_dir, data)
+
+                    with self.assertRaisesRegex(
+                        FarFieldLayoutCandidateError,
+                        "projection.*far_field_blend|far_field_blend.*projection",
+                    ):
+                        load_far_field_layout_candidate(path)
+
+    def test_far_field_runtime_candidate_persists_blend_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = load_far_field_layout_candidate(_write_candidate(Path(temp)))
+
+        self.assertEqual("current_horizontal_feather", candidate.blend_mode)
 
     def test_far_field_candidate_loader_rejects_near_field_candidate(self) -> None:
         near_data = {
@@ -197,6 +254,29 @@ class FarFieldCustomLayoutTests(unittest.TestCase):
         self.assertEqual((30, 80), result.image.shape[:2])
         self.assertEqual("far_field_custom", result.metrics["runtime_mode"])
         self.assertIn("far_field_composition_ms", result.metrics["timing"])
+
+    def test_far_field_custom_compositor_rejects_projection_mismatch(self) -> None:
+        stitcher = FakeStitcher()
+        projection = CurrentPerspectiveProjectionProvider(stitcher).project({})
+        projection.metadata["projection_source"] = B2_FAR_FIELD_PROJECTION_SOURCE
+        with tempfile.TemporaryDirectory() as temp:
+            candidate = load_far_field_layout_candidate(_write_candidate(Path(temp)))
+
+            with self.assertRaisesRegex(ValueError, "projection source"):
+                render_far_field_custom_from_projection(projection, candidate, stitcher)
+
+    def test_far_field_custom_compositor_rejects_oversize_crop(self) -> None:
+        stitcher = FakeStitcher()
+        projection = CurrentPerspectiveProjectionProvider(stitcher).project({})
+        with tempfile.TemporaryDirectory() as temp:
+            data = _candidate_data()
+            data["output"]["width_px"] = 101
+            candidate = load_far_field_layout_candidate(
+                _write_candidate(Path(temp), data)
+            )
+
+            with self.assertRaisesRegex(ValueError, "exceeds.*canvas"):
+                render_far_field_custom_from_projection(projection, candidate, stitcher)
 
     def test_far_field_default_still_calls_process(self) -> None:
         stitcher = FakeStitcher()
@@ -255,6 +335,100 @@ class FarFieldCustomLayoutTests(unittest.TestCase):
             result.metrics["projection"]["projection_source"],
         )
         self.assertEqual("b2_weight_selection", result.metrics["composition_mode"])
+        self.assertEqual((0, 180, 0), tuple(result.canvas[15, 38]))
+
+    def test_b2_weight_affine_sanitizes_nonfinite_values_before_warp(self) -> None:
+        warped = _warped_images()
+        masks = {camera: np.any(image != 0, axis=2) for camera, image in warped.items()}
+        adjusted = apply_post_warp_camera_adjustments(
+            warped,
+            valid_masks=masks,
+            camera_adjust={camera: CameraAdjustParams() for camera in warped},
+        )
+        weights = {
+            camera: np.where(mask, score, -np.inf).astype(np.float32)
+            for camera, mask, score in (
+                ("front_left", masks["front_left"], 0.2),
+                ("front", masks["front"], 0.8),
+                ("front_right", masks["front_right"], 0.4),
+            )
+        }
+        weights["front"][20, 50] = np.nan
+
+        canvas = _compose_b2_weight_selection(adjusted, weights, 100, 40)
+
+        self.assertEqual((0, 180, 0), tuple(canvas[20, 50]))
+
+    def test_b2_identity_layout_reuses_precomputed_selection_plan(self) -> None:
+        warped = _warped_images()
+        masks = {camera: np.any(image != 0, axis=2) for camera, image in warped.items()}
+        adjusted = apply_post_warp_camera_adjustments(
+            warped,
+            valid_masks=masks,
+            camera_adjust={camera: CameraAdjustParams() for camera in warped},
+        )
+        weights = {
+            camera: np.where(mask, score, -np.inf).astype(np.float32)
+            for camera, mask, score in (
+                ("front_left", masks["front_left"], 0.2),
+                ("front", masks["front"], 0.8),
+                ("front_right", masks["front_right"], 0.4),
+            )
+        }
+        stacked = np.stack([weights[camera] for camera in warped], axis=0)
+        selected = np.argmax(stacked, axis=0)
+        valid_any = np.any(np.isfinite(stacked), axis=0)
+        selection_masks = {
+            camera: valid_any & (selected == index) & masks[camera]
+            for index, camera in enumerate(warped)
+        }
+        expected = _compose_b2_weight_selection(adjusted, weights, 100, 40)
+
+        with patch(
+            "deep_shark_studio.seam.far_field_custom_compositor.cv2.warpAffine"
+        ) as warp_affine:
+            actual = _compose_b2_weight_selection(
+                adjusted,
+                weights,
+                100,
+                40,
+                precomputed_selection_masks=selection_masks,
+            )
+
+        warp_affine.assert_not_called()
+        self.assertTrue(np.array_equal(expected, actual))
+
+    def test_b2_nonidentity_layout_ignores_precomputed_selection_plan(self) -> None:
+        warped = _warped_images()
+        masks = {camera: np.any(image != 0, axis=2) for camera, image in warped.items()}
+        adjusted = apply_post_warp_camera_adjustments(
+            warped,
+            valid_masks=masks,
+            camera_adjust={"front": CameraAdjustParams(x_offset_px=1)},
+        )
+        weights = {
+            camera: np.where(mask, score, -np.inf).astype(np.float32)
+            for camera, mask, score in (
+                ("front_left", masks["front_left"], 0.2),
+                ("front", masks["front"], 0.8),
+                ("front_right", masks["front_right"], 0.4),
+            )
+        }
+        stale_plan = {camera: np.ones((40, 100), dtype=bool) for camera in warped}
+
+        with patch(
+            "deep_shark_studio.seam.far_field_custom_compositor.cv2.warpAffine",
+            wraps=cv2.warpAffine,
+        ) as warp_affine:
+            _compose_b2_weight_selection(
+                adjusted,
+                weights,
+                100,
+                40,
+                precomputed_selection_masks=stale_plan,
+            )
+
+        self.assertEqual(3, warp_affine.call_count)
 
     def test_save_far_field_candidate_does_not_modify_calibration(self) -> None:
         before = file_revision(CONFIG_DIR / "calibration.yaml")
@@ -339,6 +513,7 @@ class FarFieldCustomLayoutTests(unittest.TestCase):
 
         self.assertEqual(B2_FAR_FIELD_PROJECTION_SOURCE, saved["projection"]["source"])
         self.assertEqual(B2_FAR_FIELD_PROJECTION_SOURCE, loaded.projection_source)
+        self.assertEqual("b2_weight_selection", loaded.blend_mode)
         self.assertEqual(b2_dir, loaded.b2_candidate_directory)
 
 

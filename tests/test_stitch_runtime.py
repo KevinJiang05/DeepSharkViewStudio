@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,7 @@ from deep_shark_studio.stitch_runtime_modes import (
     RuntimeStitchConfig,
     StitchRuntimeMode,
 )
+from deep_shark_studio.stream_manager import CameraStreamSnapshot, STREAM_LIVE
 
 
 def _candidate_data() -> dict:
@@ -73,10 +75,58 @@ def _candidate_data() -> dict:
     }
 
 
-def _write_candidate(directory: Path) -> Path:
+def _write_candidate(directory: Path, data: dict | None = None) -> Path:
     path = directory / "candidate.yaml"
-    path.write_text(yaml.safe_dump(_candidate_data(), sort_keys=False), encoding="utf-8")
+    path.write_text(
+        yaml.safe_dump(data or _candidate_data(), sort_keys=False),
+        encoding="utf-8",
+    )
     return path
+
+
+def _write_fisheye_layout_candidate(directory: Path) -> Path:
+    source_dir = directory / "fisheye_source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    intrinsics = {
+        camera: {
+            "status": "success",
+            "model": "opencv_fisheye",
+            "resolution": [32, 24],
+            "camera_matrix": [
+                [24.0, 0.0, 16.0],
+                [0.0, 24.0, 12.0],
+                [0.0, 0.0, 1.0],
+            ],
+            "distortion_coefficients": [0.0, 0.0, 0.0, 0.0],
+            "rms_px": 0.1,
+            "accepted_input_count": 8,
+        }
+        for camera in ("front_left", "front", "front_right")
+    }
+    source_path = source_dir / "candidate.yaml"
+    source_path.write_text(
+        yaml.safe_dump(
+            {
+                "format": "DeepSharkFisheyeCalibrationCandidate",
+                "topology": "triple_front_panorama",
+                "resolution": [32, 24],
+                "experimental": True,
+                "apply_allowed": False,
+                "intrinsics": intrinsics,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    data = _candidate_data()
+    data["schema_version"] = 3
+    data["projection"] = {
+        "source": "fisheye_rectilinear",
+        "intrinsics_source_path": str(source_path),
+        "balance": 0.6,
+        "fov_scale": 1.0,
+    }
+    return _write_candidate(directory, data)
 
 
 def _warped_images(width: int = 2200, height: int = 700) -> dict[str, np.ndarray]:
@@ -179,12 +229,13 @@ class StitchRuntimeTests(unittest.TestCase):
     def test_fisheye_projection_requires_intrinsics_source(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stitcher = FakeStitcher()
+            candidate_path = _write_fisheye_layout_candidate(Path(temp))
             controller = RuntimeStitchController(
                 stitcher,
                 RuntimeStitchConfig(
                     mode=StitchRuntimeMode.NEAR_FIELD,
                     projection_source=ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE,
-                    layout_candidate_path=_write_candidate(Path(temp)),
+                    layout_candidate_path=candidate_path,
                 ),
             )
 
@@ -260,12 +311,13 @@ class StitchRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             stitcher = FakeStitcher()
             provider = FakeProjectionProvider(stitcher.warped)
+            candidate_path = _write_fisheye_layout_candidate(Path(temp))
             result = RuntimeStitchController(
                 stitcher,
                 RuntimeStitchConfig(
                     mode=StitchRuntimeMode.NEAR_FIELD,
                     projection_source=ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE,
-                    layout_candidate_path=_write_candidate(Path(temp)),
+                    layout_candidate_path=candidate_path,
                 ),
                 projection_provider=provider,
             ).process({})
@@ -276,6 +328,50 @@ class StitchRuntimeTests(unittest.TestCase):
                 "near_field_fisheye_rectilinear",
                 result.status,
             )
+
+    def test_near_field_rejects_selected_current_with_fisheye_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            candidate_path = _write_fisheye_layout_candidate(Path(temp))
+
+            with self.assertRaisesRegex(RuntimeError, "does not match selected"):
+                RuntimeStitchController(
+                    FakeStitcher(),
+                    RuntimeStitchConfig(
+                        mode=StitchRuntimeMode.NEAR_FIELD,
+                        projection_source=ProjectionSource.CURRENT_PERSPECTIVE,
+                        layout_candidate_path=candidate_path,
+                    ),
+                )
+
+    def test_near_field_rejects_selected_fisheye_with_current_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            candidate_path = _write_candidate(Path(temp))
+
+            with self.assertRaisesRegex(RuntimeError, "does not match selected"):
+                RuntimeStitchController(
+                    FakeStitcher(),
+                    RuntimeStitchConfig(
+                        mode=StitchRuntimeMode.NEAR_FIELD,
+                        projection_source=ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE,
+                        layout_candidate_path=candidate_path,
+                    ),
+                )
+
+    def test_near_field_rejects_candidate_crop_larger_than_projected_canvas(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            small_warped = _warped_images(width=100, height=40)
+            provider = FakeProjectionProvider(small_warped)
+            controller = RuntimeStitchController(
+                FakeStitcher(),
+                RuntimeStitchConfig(
+                    mode=StitchRuntimeMode.NEAR_FIELD,
+                    layout_candidate_path=_write_candidate(Path(temp)),
+                ),
+                projection_provider=provider,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "exceeds.*projected canvas"):
+                controller.process({})
 
     def test_far_field_does_not_use_projection_provider(self) -> None:
         stitcher = FakeStitcher()
@@ -614,10 +710,93 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         self.window.qgc_output_active = True
         self.window.last_canvas_render_time = time.perf_counter()
 
-        self.assertFalse(self.window.should_render_canvas_now())
+        with patch.object(self.window, "should_render_canvas", return_value=True):
+            self.assertFalse(self.window.should_render_canvas_now())
 
-        self.window.last_canvas_render_time -= 0.25
-        self.assertTrue(self.window.should_render_canvas_now())
+            self.window.last_canvas_render_time -= 0.25
+            self.assertTrue(self.window.should_render_canvas_now())
+
+    def test_canvas_render_is_gated_by_visible_realtime_canvas_page(self) -> None:
+        self.window.show()
+        self.app.processEvents()
+        self.window.root_tabs.setCurrentIndex(0)
+        self.window.set_preview_layout_mode(PreviewLayoutMode.STITCHED)
+
+        self.assertTrue(self.window.should_render_canvas())
+
+        previous_render_time = self.window.last_canvas_render_time
+        self.window.root_tabs.setCurrentIndex(1)
+        self.assertFalse(self.window.should_render_canvas())
+        self.assertFalse(self.window.should_render_canvas_now(force=True))
+        self.assertEqual(previous_render_time, self.window.last_canvas_render_time)
+
+        self.window.root_tabs.setCurrentIndex(0)
+        self.window.preview_tabs.hide()
+        self.assertFalse(self.window.should_render_canvas())
+
+        self.window.preview_tabs.show()
+        self.window.preview_tabs.setCurrentIndex(self.window.warped_tab_index)
+        self.assertFalse(self.window.should_render_canvas())
+
+    def test_canvas_render_respects_preview_fps_without_qgc(self) -> None:
+        self.window.performance_config["preview_fps"] = 10
+        self.window.qgc_output_active = False
+        self.window.last_canvas_render_time = time.perf_counter()
+
+        with patch.object(self.window, "should_render_canvas", return_value=True):
+            self.assertFalse(self.window.should_render_canvas_now())
+
+            self.window.last_canvas_render_time -= 0.11
+            self.assertTrue(self.window.should_render_canvas_now())
+
+    def test_preview_summary_reports_worker_telemetry_and_frame_age(self) -> None:
+        self.window.language = "en"
+        active_key = self.window.active_camera_keys()[0]
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        self.window.frames = {
+            active_key: np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+        self.window.stream_snapshots = {
+            active_key: CameraStreamSnapshot(
+                key=active_key,
+                status=STREAM_LIVE,
+                frame_timestamp=999.6,
+                frame_count=4,
+                thread_alive=True,
+            ),
+        }
+        telemetry = replace(
+            self.window.stitch_processor.state(),
+            submitted=12,
+            dropped=3,
+            completed=8,
+            failed=1,
+            rolling_result_fps=6.2,
+            rolling_elapsed_p50_ms=11.2,
+            rolling_elapsed_p95_ms=18.7,
+        )
+
+        with (
+            patch.object(
+                self.window.stitch_processor,
+                "state",
+                return_value=telemetry,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.time.time",
+                return_value=1000.0,
+            ),
+        ):
+            self.window.update_preview_status_summary()
+
+        summary = self.window.preview_status_summary.text()
+        self.assertIn(
+            "Worker: submitted 12 / dropped 3 / completed 8 / failed 1",
+            summary,
+        )
+        self.assertIn("result FPS 6.2", summary)
+        self.assertIn("p50 11.2 ms / p95 18.7 ms", summary)
+        self.assertIn("max frame age 0.4 s", summary)
 
     def test_stitch_fps_limit_allows_higher_qgc_rates(self) -> None:
         self.assertGreaterEqual(self.window.process_fps.maximum(), 60)
@@ -744,6 +923,120 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         self.window.layout_tuner_target_combo.setCurrentIndex(index)
 
         self.assertIn("B-2", self.window.layout_tuner_note.text())
+
+    def test_layout_tuner_target_switch_invalidates_cached_projection(self) -> None:
+        image = np.zeros((4, 6, 3), dtype=np.uint8)
+        self.window.layout_tuner_warped = {"front": image}
+        self.window.layout_tuner_valid_masks = {
+            "front": np.ones(image.shape[:2], dtype=bool)
+        }
+        self.window.layout_tuner_cache_key = (
+            self.window.build_layout_tuner_cache_key("frozen-frame")
+        )
+        self.window.layout_tuner_save_button.setEnabled(True)
+
+        index = self.window.layout_tuner_target_combo.findData("far_field")
+        self.window.layout_tuner_target_combo.setCurrentIndex(index)
+
+        self.assertIsNone(self.window.layout_tuner_cache_key)
+        self.assertEqual({}, self.window.layout_tuner_warped)
+        self.assertFalse(self.window.layout_tuner_save_button.isEnabled())
+
+    def test_layout_tuner_projection_parameter_change_invalidates_cache(self) -> None:
+        image = np.zeros((4, 6, 3), dtype=np.uint8)
+        self.window.layout_tuner_warped = {"front": image}
+        self.window.layout_tuner_valid_masks = {
+            "front": np.ones(image.shape[:2], dtype=bool)
+        }
+        self.window.layout_tuner_cache_key = (
+            self.window.build_layout_tuner_cache_key("frozen-frame")
+        )
+
+        self.window.layout_tuner_fisheye_balance.setValue(0.65)
+
+        self.assertIsNone(self.window.layout_tuner_cache_key)
+        self.assertEqual({}, self.window.layout_tuner_warped)
+
+    def test_layout_tuner_capture_requires_raw_frames_not_legacy_warp_cache(self) -> None:
+        image = np.zeros((4, 6, 3), dtype=np.uint8)
+        self.window.frames = {}
+        self.window.warped = {
+            camera: image.copy()
+            for camera in ("front_left", "front", "front_right")
+        }
+
+        with patch(
+            "deep_shark_studio.gui.main_window.QMessageBox.information"
+        ) as information:
+            self.window.capture_layout_tuner_preview_frame()
+
+        self.assertTrue(information.called)
+        self.assertEqual({}, self.window.layout_tuner_warped)
+        self.assertIsNone(self.window.layout_tuner_cache_key)
+
+    def test_layout_tuner_capture_records_projection_provenance_key(self) -> None:
+        frames = {
+            camera: np.full((4, 6, 3), index, dtype=np.uint8)
+            for index, camera in enumerate(
+                ("front_left", "front", "front_right"),
+                start=1,
+            )
+        }
+        masks = {
+            camera: np.ones(frame.shape[:2], dtype=bool)
+            for camera, frame in frames.items()
+        }
+        projection = ProjectionResult(
+            warped_images={camera: frame.copy() for camera, frame in frames.items()},
+            valid_masks=masks,
+            metadata={
+                "projection_source": ProjectionSource.CURRENT_PERSPECTIVE.value,
+                "valid_mask_source": "geometry",
+            },
+            timings={"projection_total_ms": 1.0},
+        )
+        self.window.frames = frames
+
+        with (
+            patch.object(
+                self.window,
+                "project_layout_tuner_frames",
+                return_value=projection,
+            ),
+            patch.object(self.window, "refresh_layout_tuner_preview") as refresh,
+        ):
+            self.window.capture_layout_tuner_preview_frame()
+
+        self.assertIsNotNone(self.window.layout_tuner_cache_key)
+        self.assertEqual(
+            self.window.layout_tuner_cache_key.to_dict(),
+            self.window.layout_tuner_source_info["cache_key"],
+        )
+        self.assertEqual(
+            self.window.layout_tuner_cache_key.frame_signature,
+            self.window.layout_tuner_source_info["frame_info"]["frame_signature"],
+        )
+        refresh.assert_called_once_with()
+
+    def test_layout_tuner_save_rejects_stale_projection_cache(self) -> None:
+        self.window.layout_tuner_preview_result = SimpleNamespace(
+            image=np.zeros((4, 6, 3), dtype=np.uint8),
+            metrics={},
+        )
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.QMessageBox.information"
+            ) as information,
+            patch(
+                "deep_shark_studio.gui.main_window.save_layout_tuner_candidate"
+            ) as save_candidate,
+        ):
+            self.window.save_layout_tuner_candidate()
+
+        self.assertTrue(information.called)
+        save_candidate.assert_not_called()
+        self.assertIsNone(self.window.layout_tuner_preview_result)
 
     def test_spin_boxes_do_not_use_mouse_wheel_classes(self) -> None:
         spin_boxes = self.window.findChildren(NoWheelSpinBox)

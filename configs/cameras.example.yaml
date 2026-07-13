@@ -39,7 +39,7 @@ cameras:
     source: samples/input/right
 language: zh_CN
 performance:
-  process_fps: 5
+  process_fps: 4
   preview_fps: 2
   max_input_width: 960
   refresh_warped_preview: false

@@ -31,6 +31,34 @@ def wait_for_result(
     return None
 
 
+def wait_for_request_result(
+    manager: StitchProcessingManager,
+    request_id: int,
+    timeout: float = 1.0,
+):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = manager.take_latest_result()
+        if result is not None and result.request_id == request_id:
+            return result
+        time.sleep(0.005)
+    return None
+
+
+def wait_for_state(
+    manager: StitchProcessingManager,
+    predicate,
+    timeout: float = 1.0,
+):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        state = manager.state()
+        if predicate(state):
+            return state
+        time.sleep(0.005)
+    return manager.state()
+
+
 class ImmediateProcessor:
     def __init__(self, value: int = 1):
         self.value = value
@@ -287,11 +315,161 @@ class StitchProcessingStateTests(unittest.TestCase):
             )
             self.assertEqual(0, request_id)
             self.assertIsNone(manager.take_latest_result())
+            self.assertEqual(0, manager.state().submitted)
         finally:
             self.assertTrue(manager.shutdown())
 
 
 class StitchProcessingGenerationTests(unittest.TestCase):
+    def test_telemetry_counts_pending_supersession_and_worker_busy_state(self) -> None:
+        processor = BlockingProcessor(value=3)
+        manager = StitchProcessingManager()
+        try:
+            with (
+                patch.object(stitch_processing, "SurroundStitcher", return_value=object()),
+                patch.object(
+                    stitch_processing,
+                    "RuntimeStitchController",
+                    return_value=processor,
+                ),
+            ):
+                manager.configure(25, {}, None, False)
+
+            first_request_id = manager.submit_latest(
+                25,
+                {"front": np.zeros((1, 1, 3), dtype=np.uint8)},
+            )
+            self.assertTrue(processor.started.wait(timeout=1.0))
+            processing = manager.state()
+            self.assertEqual(1, processing.submitted)
+            self.assertTrue(processing.busy)
+
+            second_request_id = manager.submit_latest(
+                25,
+                {"front": np.ones((1, 1, 3), dtype=np.uint8)},
+            )
+            third_request_id = manager.submit_latest(
+                25,
+                {"front": np.full((1, 1, 3), 2, dtype=np.uint8)},
+            )
+            self.assertGreater(second_request_id, first_request_id)
+            self.assertGreater(third_request_id, second_request_id)
+
+            queued = manager.state()
+            self.assertEqual(3, queued.submitted)
+            self.assertEqual(1, queued.superseded)
+            self.assertEqual(1, queued.dropped)
+            self.assertEqual(0, queued.completed)
+            self.assertEqual(0, queued.failed)
+            self.assertTrue(queued.busy)
+
+            processor.release.set()
+            result = wait_for_request_result(manager, third_request_id)
+            self.assertIsNotNone(result)
+            finished = wait_for_state(manager, lambda state: not state.busy)
+            self.assertEqual(2, finished.completed)
+            self.assertEqual(0, finished.failed)
+            self.assertEqual(1, finished.superseded)
+            self.assertEqual(1, finished.dropped)
+            self.assertGreater(finished.rolling_elapsed_p50_ms, 0.0)
+            self.assertGreaterEqual(
+                finished.rolling_elapsed_p95_ms,
+                finished.rolling_elapsed_p50_ms,
+            )
+        finally:
+            processor.release.set()
+            self.assertTrue(manager.shutdown())
+
+    def test_rolling_telemetry_is_generation_scoped_while_counters_are_lifetime(self) -> None:
+        first_processor = ImmediateProcessor(value=4)
+        second_processor = ImmediateProcessor(value=5)
+        manager = StitchProcessingManager()
+        try:
+            with (
+                patch.object(stitch_processing, "SurroundStitcher", return_value=object()),
+                patch.object(
+                    stitch_processing,
+                    "RuntimeStitchController",
+                    side_effect=(first_processor, second_processor),
+                ),
+                patch.object(
+                    stitch_processing.time,
+                    "perf_counter",
+                    side_effect=(10.0, 10.01, 20.0, 20.02, 30.0, 30.03),
+                ),
+            ):
+                manager.configure(26, {}, None, False)
+                for value in range(3):
+                    request_id = manager.submit_latest(
+                        26,
+                        {"front": np.full((1, 1, 3), value, dtype=np.uint8)},
+                    )
+                    self.assertIsNotNone(
+                        wait_for_request_result(manager, request_id),
+                    )
+
+                populated = manager.state()
+                self.assertEqual(3, populated.submitted)
+                self.assertEqual(3, populated.completed)
+                self.assertAlmostEqual(20.0, populated.rolling_elapsed_p50_ms)
+                self.assertAlmostEqual(29.0, populated.rolling_elapsed_p95_ms)
+                self.assertGreater(populated.rolling_result_fps, 0.0)
+
+                manager.configure(26, {}, None, False)
+
+            reconfigured = manager.state()
+            self.assertEqual(3, reconfigured.submitted)
+            self.assertEqual(3, reconfigured.completed)
+            self.assertEqual(0.0, reconfigured.rolling_elapsed_p50_ms)
+            self.assertEqual(0.0, reconfigured.rolling_elapsed_p95_ms)
+            self.assertEqual(0.0, reconfigured.rolling_result_fps)
+        finally:
+            self.assertTrue(manager.shutdown())
+
+    def test_reconfigure_drops_pending_and_inflight_old_generation_requests(self) -> None:
+        old_processor = BlockingProcessor(value=6)
+        new_processor = ImmediateProcessor(value=7)
+        manager = StitchProcessingManager()
+        try:
+            with (
+                patch.object(stitch_processing, "SurroundStitcher", return_value=object()),
+                patch.object(
+                    stitch_processing,
+                    "RuntimeStitchController",
+                    side_effect=(old_processor, new_processor),
+                ),
+            ):
+                manager.configure(27, {}, None, False)
+                manager.submit_latest(
+                    27,
+                    {"front": np.zeros((1, 1, 3), dtype=np.uint8)},
+                )
+                self.assertTrue(old_processor.started.wait(timeout=1.0))
+                manager.submit_latest(
+                    27,
+                    {"front": np.ones((1, 1, 3), dtype=np.uint8)},
+                )
+
+                manager.configure(27, {}, None, False)
+                reconfigured = manager.state()
+                self.assertEqual(2, reconfigured.submitted)
+                self.assertEqual(0, reconfigured.superseded)
+                self.assertEqual(1, reconfigured.dropped)
+                self.assertTrue(reconfigured.busy)
+
+                old_processor.release.set()
+                settled = wait_for_state(
+                    manager,
+                    lambda state: not state.busy and state.dropped == 2,
+                )
+                self.assertEqual(2, settled.dropped)
+                self.assertEqual(0, settled.completed)
+                self.assertEqual(0, settled.failed)
+                self.assertIsNone(manager.take_latest_result())
+        finally:
+            old_processor.release.set()
+            self.assertTrue(manager.shutdown())
+
     def test_same_session_reconfigure_discards_inflight_old_result(self) -> None:
         old_processor = BlockingProcessor(value=1)
         new_processor = ImmediateProcessor(value=2)
@@ -386,6 +564,12 @@ class StitchProcessingGenerationTests(unittest.TestCase):
                 ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value,
                 result.projection_source,
             )
+            telemetry = manager.state()
+            self.assertEqual(1, telemetry.submitted)
+            self.assertEqual(0, telemetry.completed)
+            self.assertEqual(1, telemetry.failed)
+            self.assertEqual(0, telemetry.dropped)
+            self.assertFalse(telemetry.busy)
         finally:
             self.assertTrue(manager.shutdown())
 

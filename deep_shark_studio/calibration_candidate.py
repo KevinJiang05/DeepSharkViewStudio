@@ -1311,9 +1311,11 @@ class CandidatePanoramaProcessor:
     def __init__(self, candidate_directory: str | Path, use_opencl: bool = False):
         self.directory = Path(candidate_directory)
         self.requested_opencl = bool(use_opencl)
-        self.use_opencl = bool(use_opencl and cv2.ocl.haveOpenCL())
-        if self.use_opencl:
-            cv2.ocl.setUseOpenCL(True)
+        self.use_opencl = False
+        self.candidate_backend = "cpu"
+        self.candidate_backend_device = "CPU"
+        self.candidate_backend_fallback_reason = ""
+        self._activate_requested_opencl_backend()
         self.candidate, _ = load_calibration_candidate(self.directory)
         if not self.candidate.get("rig", {}).get("complete"):
             raise ValueError("Candidate rig is incomplete.")
@@ -1335,7 +1337,9 @@ class CandidatePanoramaProcessor:
         )
         self.topology_name = str(self.candidate.get("topology", ""))
         self.experimental = bool(self.candidate.get("experimental"))
-        self.last_timings: dict[str, float | int | bool] = {}
+        self.last_timings: dict[str, float | int | bool | str] = (
+            self._backend_timing_metrics()
+        )
         self._maps: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._masks: dict[str, np.ndarray] = {}
         for camera, relative_path in panorama["files"]["remaps"].items():
@@ -1357,15 +1361,18 @@ class CandidatePanoramaProcessor:
                 dtype=np.float64,
             )
             rays_camera = rays.reshape(-1, 3) @ rotation
-            forward = rays_camera[:, 2].reshape(
-                self.output_height,
-                self.output_width,
+            forward = np.asarray(
+                rays_camera[:, 2].reshape(
+                    self.output_height,
+                    self.output_width,
+                ),
+                dtype=np.float32,
             )
             self._weights[camera] = np.where(
                 self._masks[camera],
                 forward,
-                -np.inf,
-            )
+                np.float32(-np.inf),
+            ).astype(np.float32, copy=False)
         self._selection_masks_by_available = self._build_selection_masks_by_available()
         self._opencl_maps: dict[str, tuple[cv2.UMat, cv2.UMat]] = {}
         self._opencl_selection_masks_by_available: dict[
@@ -1373,17 +1380,101 @@ class CandidatePanoramaProcessor:
             dict[str, cv2.UMat],
         ] = {}
         if self.use_opencl:
-            self._opencl_maps = {
-                camera: (cv2.UMat(map_x), cv2.UMat(map_y))
-                for camera, (map_x, map_y) in self._maps.items()
-            }
-            self._opencl_selection_masks_by_available = {
-                available: {
-                    camera: cv2.UMat((mask.astype(np.uint8) * 255))
-                    for camera, mask in masks.items()
+            try:
+                self._opencl_maps = {
+                    camera: (cv2.UMat(map_x), cv2.UMat(map_y))
+                    for camera, (map_x, map_y) in self._maps.items()
                 }
-                for available, masks in self._selection_masks_by_available.items()
-            }
+                self._opencl_selection_masks_by_available = {
+                    available: {
+                        camera: cv2.UMat((mask.astype(np.uint8) * 255))
+                        for camera, mask in masks.items()
+                    }
+                    for available, masks in self._selection_masks_by_available.items()
+                }
+            except cv2.error as exc:
+                self._fallback_to_cpu(
+                    self._opencl_error_reason("opencl_initialization_error", exc)
+                )
+        self.last_timings = self._backend_timing_metrics()
+
+    def _activate_requested_opencl_backend(self) -> None:
+        if not self.requested_opencl:
+            return
+        try:
+            if not cv2.ocl.haveOpenCL():
+                self._fallback_to_cpu("opencl_unavailable")
+                return
+            cv2.ocl.setUseOpenCL(True)
+            if not cv2.ocl.useOpenCL():
+                self._fallback_to_cpu("opencl_activation_failed")
+                return
+        except cv2.error as exc:
+            self._fallback_to_cpu(
+                self._opencl_error_reason("opencl_activation_error", exc)
+            )
+            return
+        self.use_opencl = True
+        self.candidate_backend = "opencl"
+        self.candidate_backend_device = self._opencl_device_name()
+        self.candidate_backend_fallback_reason = ""
+
+    @staticmethod
+    def _opencl_device_name() -> str:
+        try:
+            device = cv2.ocl.Device_getDefault()
+            name = device.name()
+        except Exception:  # Device metadata must not disable an active backend.
+            return "OpenCL device (name unavailable)"
+        return str(name).strip() or "OpenCL device (name unavailable)"
+
+    @staticmethod
+    def _opencl_error_reason(prefix: str, exc: cv2.error) -> str:
+        detail = str(exc).strip().replace("\r", " ").replace("\n", " ")
+        return f"{prefix}: {detail}" if detail else prefix
+
+    def _fallback_to_cpu(self, reason: str) -> None:
+        self.use_opencl = False
+        self.candidate_backend = "cpu"
+        self.candidate_backend_device = "CPU"
+        self.candidate_backend_fallback_reason = str(reason)
+        opencl_maps = getattr(self, "_opencl_maps", None)
+        if isinstance(opencl_maps, dict):
+            opencl_maps.clear()
+        selection_masks = getattr(
+            self,
+            "_opencl_selection_masks_by_available",
+            None,
+        )
+        if isinstance(selection_masks, dict):
+            selection_masks.clear()
+
+    def backend_status(self) -> dict[str, bool | str]:
+        return {
+            "opencl_requested": self.requested_opencl,
+            "opencl_active": self.use_opencl,
+            "backend": self.candidate_backend,
+            "device": self.candidate_backend_device,
+            "fallback_reason": self.candidate_backend_fallback_reason,
+            "warped_preview_state": (
+                "not_downloaded_opencl_canvas_only"
+                if self.use_opencl
+                else "available"
+            ),
+        }
+
+    def _backend_timing_metrics(self) -> dict[str, bool | str]:
+        status = self.backend_status()
+        return {
+            "opencl_enabled": status["opencl_active"],
+            "opencl_requested": status["opencl_requested"],
+            "opencl_active": status["opencl_active"],
+            "candidate_backend": status["backend"],
+            "candidate_backend_device": status["device"],
+            "candidate_backend_fallback_reason": status["fallback_reason"],
+            "candidate_warped_preview_state": status["warped_preview_state"],
+            "candidate_timing_synchronized": True,
+        }
 
     def _build_selection_masks_by_available(
         self,
@@ -1434,9 +1525,13 @@ class CandidatePanoramaProcessor:
                 borderMode=cv2.BORDER_CONSTANT,
             )
             remap_ms += (time.perf_counter() - remap_start) * 1000.0
-            image[~self._masks[camera]] = 0
+            image = cv2.copyTo(
+                image,
+                np.ascontiguousarray(self._masks[camera], dtype=np.uint8),
+            )
             warped[camera] = image
         self.last_timings = {
+            **self._backend_timing_metrics(),
             "candidate_total_ms": (time.perf_counter() - total_start) * 1000.0,
             "candidate_remap_ms": remap_ms,
             "candidate_compose_ms": 0.0,
@@ -1450,7 +1545,12 @@ class CandidatePanoramaProcessor:
         frames: dict[str, np.ndarray],
     ) -> tuple[dict[str, np.ndarray], np.ndarray]:
         if self.use_opencl:
-            return self._process_opencl(frames)
+            try:
+                return self._process_opencl(frames)
+            except cv2.error as exc:
+                self._fallback_to_cpu(
+                    self._opencl_error_reason("opencl_runtime_error", exc)
+                )
         total_start = time.perf_counter()
         warped = self.warp_all(frames)
         remap_ms = float(self.last_timings.get("candidate_remap_ms", 0.0))
@@ -1461,6 +1561,7 @@ class CandidatePanoramaProcessor:
         )
         if not warped:
             self.last_timings = {
+                **self._backend_timing_metrics(),
                 "candidate_total_ms": (time.perf_counter() - total_start) * 1000.0,
                 "candidate_remap_ms": remap_ms,
                 "candidate_compose_ms": (time.perf_counter() - compose_start) * 1000.0,
@@ -1471,10 +1572,14 @@ class CandidatePanoramaProcessor:
         available = tuple(camera for camera in self.camera_order if camera in warped)
         selection_masks = self._selection_masks_by_available[available]
         for camera in available:
-            selection = selection_masks[camera]
-            canvas[selection] = warped[camera][selection]
+            cv2.copyTo(
+                warped[camera],
+                np.ascontiguousarray(selection_masks[camera], dtype=np.uint8),
+                canvas,
+            )
         compose_ms = (time.perf_counter() - compose_start) * 1000.0
         self.last_timings = {
+            **self._backend_timing_metrics(),
             "candidate_total_ms": (time.perf_counter() - total_start) * 1000.0,
             "candidate_remap_ms": remap_ms,
             "candidate_compose_ms": compose_ms,
@@ -1487,12 +1592,11 @@ class CandidatePanoramaProcessor:
         self,
         frames: dict[str, np.ndarray],
     ) -> tuple[dict[str, np.ndarray], np.ndarray]:
+        cv2.ocl.finish()
         total_start = time.perf_counter()
-        remap_ms = 0.0
-        compose_ms = 0.0
-        download_ms = 0.0
         warped_umat: dict[str, cv2.UMat] = {}
         warped_preview: dict[str, np.ndarray] = {}
+        remap_start = time.perf_counter()
         for camera in self.camera_order:
             frame = frames.get(camera)
             if frame is None:
@@ -1504,7 +1608,6 @@ class CandidatePanoramaProcessor:
                     f"candidate resolution {self.input_resolution}."
                 )
             map_x, map_y = self._opencl_maps[camera]
-            remap_start = time.perf_counter()
             warped_umat[camera] = cv2.remap(
                 cv2.UMat(frame),
                 map_x,
@@ -1512,7 +1615,8 @@ class CandidatePanoramaProcessor:
                 cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_CONSTANT,
             )
-            remap_ms += (time.perf_counter() - remap_start) * 1000.0
+        cv2.ocl.finish()
+        remap_ms = (time.perf_counter() - remap_start) * 1000.0
 
         compose_start = time.perf_counter()
         canvas_umat = cv2.UMat(
@@ -1528,18 +1632,19 @@ class CandidatePanoramaProcessor:
             selection_masks = self._opencl_selection_masks_by_available[available]
             for camera in available:
                 cv2.copyTo(warped_umat[camera], selection_masks[camera], canvas_umat)
+        cv2.ocl.finish()
         compose_ms = (time.perf_counter() - compose_start) * 1000.0
         download_start = time.perf_counter()
         canvas = canvas_umat.get()
+        cv2.ocl.finish()
         download_ms = (time.perf_counter() - download_start) * 1000.0
         self.last_timings = {
+            **self._backend_timing_metrics(),
             "candidate_total_ms": (time.perf_counter() - total_start) * 1000.0,
             "candidate_remap_ms": remap_ms,
             "candidate_compose_ms": compose_ms,
             "candidate_download_ms": download_ms,
             "candidate_available_cameras": len(warped_umat),
             "precomputed_selection_masks": True,
-            "opencl_enabled": True,
-            "opencl_requested": self.requested_opencl,
         }
         return warped_preview, canvas

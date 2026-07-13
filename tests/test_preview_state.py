@@ -271,12 +271,77 @@ class PreviewStateTests(unittest.TestCase):
                 source=projection,
                 balance=0.72,
                 fov_scale=1.08,
+                intrinsics_source_path=(
+                    path.parent / "fisheye.yaml"
+                    if projection
+                    == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE
+                    else None
+                ),
             ),
             left_pair=pair,
             right_pair=pair,
             camera_adjust=camera_adjust,
             warnings=(),
         )
+
+    def test_near_candidate_embedded_intrinsics_failure_is_transactional(self) -> None:
+        previous_candidate = self.window.runtime_layout_candidate
+        previous_runtime_source = self.window.runtime_fisheye_intrinsics_source
+        previous_tuner_source = self.window.layout_tuner_fisheye_intrinsics_source
+        previous_config = self.window.runtime_stitch_config
+        candidate = self._near_runtime_candidate(Path("near/candidate.yaml"))
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.load_layout_candidate_for_runtime",
+                return_value=candidate,
+            ),
+            patch(
+                "deep_shark_studio.gui.main_window.load_fisheye_intrinsics_source",
+                side_effect=RuntimeError("invalid embedded intrinsics"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "invalid embedded intrinsics"):
+                self.window.load_runtime_layout_candidate_path(candidate.path)
+
+        self.assertIs(previous_candidate, self.window.runtime_layout_candidate)
+        self.assertIs(
+            previous_runtime_source,
+            self.window.runtime_fisheye_intrinsics_source,
+        )
+        self.assertIs(
+            previous_tuner_source,
+            self.window.layout_tuner_fisheye_intrinsics_source,
+        )
+        self.assertEqual(previous_config, self.window.runtime_stitch_config)
+
+    def test_loading_inactive_candidate_retries_dirty_auto_selection_without_config_drift(
+        self,
+    ) -> None:
+        previous_config = self.window.runtime_stitch_config
+        candidate = self._near_runtime_candidate(
+            Path("near/candidate.yaml"),
+            projection=ProjectionSource.CURRENT_PERSPECTIVE,
+        )
+        self.window.auto_preview_on_view_change = True
+        self.window._runtime_view_selection_dirty = True
+
+        with (
+            patch(
+                "deep_shark_studio.gui.main_window.load_layout_candidate_for_runtime",
+                return_value=candidate,
+            ),
+            patch.object(
+                self.window,
+                "schedule_selected_runtime_view_preview",
+            ) as schedule_preview,
+        ):
+            loaded = self.window.load_runtime_layout_candidate_path(candidate.path)
+
+        self.assertIs(candidate, loaded)
+        self.assertIs(candidate, self.window.runtime_layout_candidate)
+        self.assertEqual(previous_config, self.window.runtime_stitch_config)
+        schedule_preview.assert_called_once_with()
 
     def test_constructor_restores_active_package_runtime_before_ui_refresh(
         self,
@@ -794,6 +859,109 @@ class PreviewStateTests(unittest.TestCase):
         self.assertEqual(0, self.window.displayed_stitch_result_id)
         self.assertEqual(LiveHealthState.FAILED, self.window.live_health_state)
 
+    def test_frame_set_gate_pins_first_request_when_submit_outpaces_results(
+        self,
+    ) -> None:
+        active = self.window.active_camera_keys()
+        frames = {
+            key: np.full((12, 12, 3), index + 1, dtype=np.uint8)
+            for index, key in enumerate(active)
+        }
+        captured_at = time.time()
+
+        def snapshots(frame_count: int) -> dict[str, CameraStreamSnapshot]:
+            return {
+                key: CameraStreamSnapshot(
+                    key=key,
+                    status=STREAM_LIVE,
+                    frame=frames[key],
+                    frame_timestamp=captured_at,
+                    frame_count=frame_count,
+                    thread_alive=True,
+                )
+                for key in active
+            }
+
+        self.window.preview_content_mode = PreviewContentMode.LIVE
+        self.window.performance_config["process_fps"] = 60
+        self.window.last_preview_time = 0.0
+        self.window.last_process_time = 0.0
+
+        with (
+            patch.object(
+                self.window.stream_manager,
+                "latest_frames",
+                side_effect=[
+                    (frames, snapshots(1)),
+                    (frames, snapshots(2)),
+                ],
+            ),
+            patch.object(
+                self.window.stream_manager,
+                "has_active_workers",
+                return_value=True,
+            ),
+            patch.object(
+                self.window.stitch_processor,
+                "submit_latest",
+                side_effect=[10, 11],
+            ) as submit,
+            patch.object(
+                self.window.stitch_processor,
+                "take_latest_result",
+                return_value=None,
+            ),
+            patch.object(self.window, "refresh_raw_preview"),
+            patch.object(self.window, "update_health_table"),
+            patch(
+                "deep_shark_studio.gui.main_window.time.perf_counter",
+                side_effect=[100.0, 101.0],
+            ),
+        ):
+            self.window.update_live_preview()
+            self.window.update_live_preview()
+
+        self.assertEqual(2, submit.call_count)
+        self.assertTrue(self.window.awaiting_current_frame_set_result)
+        self.assertEqual(10, self.window.minimum_stitch_result_request_id)
+
+        accepted_canvas = np.full((12, 24, 3), 77, dtype=np.uint8)
+        first_result = StitchResult(
+            session_id=self.window.preview_session_id,
+            request_id=10,
+            result_id=1,
+            warped={},
+            canvas=accepted_canvas,
+            elapsed_ms=120.0,
+            runtime_mode="far_field",
+            runtime_status="far_field_default",
+        )
+        with (
+            patch.object(
+                self.window.stitch_processor,
+                "take_latest_result",
+                return_value=first_result,
+            ),
+            patch.object(
+                self.window,
+                "should_render_canvas_now",
+                return_value=True,
+            ),
+            patch.object(self.window, "log") as log,
+        ):
+            self.window.apply_latest_stitch_result()
+
+        self.assertFalse(self.window.awaiting_current_frame_set_result)
+        self.assertEqual(1, self.window.displayed_stitch_result_id)
+        np.testing.assert_array_equal(accepted_canvas, self.window.canvas)
+        self.assertTrue(
+            any(
+                "request=10" in str(call.args[0])
+                and "canvas_rendered=True" in str(call.args[0])
+                for call in log.call_args_list
+            )
+        )
+
     def test_stopped_and_still_labels_preserve_layout(self) -> None:
         self.window.set_preview_layout_mode(PreviewLayoutMode.STITCHED)
 
@@ -923,6 +1091,101 @@ class PreviewStateTests(unittest.TestCase):
         self.assertTrue(result)
         apply_runtime.assert_called_once_with()
         start_live.assert_not_called()
+
+    def test_auto_preview_live_without_workers_configures_only_once(self) -> None:
+        self.window._runtime_view_selection_dirty = True
+        self.window.set_preview_content_mode(PreviewContentMode.LIVE)
+
+        with (
+            patch.object(
+                self.window.stream_manager,
+                "has_active_workers",
+                side_effect=[False, False, False, True],
+            ),
+            patch.object(self.window, "collect_camera_config_from_widgets"),
+            patch.object(self.window, "stop_live_preview", return_value=True),
+            patch.object(self.window, "configure_live_stitch_processor") as configure,
+            patch.object(self.window.stream_manager, "start"),
+            patch.object(self.window.stream_manager, "snapshots", return_value={}),
+        ):
+            result = self.window.ensure_selected_runtime_view_live()
+
+        self.assertTrue(result)
+        configure.assert_called_once_with()
+        self.assertFalse(self.window._runtime_view_selection_dirty)
+
+    def test_failed_runtime_reconfigure_keeps_old_health_and_error_domains(self) -> None:
+        previous_config = self.window.runtime_stitch_config
+        previous_session = self.window.preview_session_id
+        self.window.set_preview_content_mode(PreviewContentMode.LIVE)
+        self.window.live_health_state = LiveHealthState.LIVE
+        next_config = RuntimeStitchConfig(mode=StitchRuntimeMode.NEAR_FIELD)
+
+        def preserve_live_health() -> LiveHealthState:
+            self.window.live_health_state = LiveHealthState.LIVE
+            return LiveHealthState.LIVE
+
+        with (
+            patch.object(
+                self.window.stream_manager,
+                "has_active_workers",
+                return_value=True,
+            ),
+            patch.object(
+                self.window,
+                "configure_live_stitch_processor",
+                side_effect=RuntimeError("candidate contract rejected"),
+            ),
+            patch.object(
+                self.window,
+                "update_live_health_state",
+                side_effect=preserve_live_health,
+            ),
+        ):
+            result = self.window.commit_live_runtime_selection(
+                next_config,
+                "template",
+                reason="unit test",
+            )
+
+        self.assertFalse(result)
+        self.assertEqual(previous_session, self.window.preview_session_id)
+        self.assertEqual(previous_config, self.window.runtime_stitch_config)
+        self.assertEqual(LiveHealthState.LIVE, self.window.live_health_state)
+        self.assertEqual("", self.window.last_stitch_ui_error)
+        self.assertEqual(
+            "candidate contract rejected",
+            self.window.last_runtime_apply_error,
+        )
+        self.assertTrue(
+            any(
+                "candidate contract rejected" in warning
+                for warning in self.window.preview_warning_messages()
+            )
+        )
+
+    def test_fisheye_runtime_parameters_dirty_and_debounce_auto_apply(self) -> None:
+        fisheye_index = self.window.runtime_view_combo.findData("near_fisheye")
+        self.window.runtime_view_combo.setCurrentIndex(fisheye_index)
+        self.window._runtime_view_selection_dirty = False
+        self.window._runtime_fisheye_apply_timer.stop()
+        self.window.auto_preview_on_view_change = True
+
+        self.window.runtime_fisheye_balance.setValue(
+            self.window.runtime_fisheye_balance.value() + 0.01
+        )
+
+        self.assertTrue(self.window._runtime_view_selection_dirty)
+        self.assertTrue(self.window._runtime_fisheye_apply_timer.isActive())
+
+        self.window._runtime_fisheye_apply_timer.stop()
+        self.window._runtime_view_selection_dirty = False
+        self.window.auto_preview_on_view_change = False
+        self.window.runtime_fisheye_fov_scale.setValue(
+            self.window.runtime_fisheye_fov_scale.value() + 0.01
+        )
+        self.assertTrue(self.window._runtime_view_selection_dirty)
+        self.assertFalse(self.window._runtime_fisheye_apply_timer.isActive())
 
     def test_start_live_aborts_when_selected_runtime_view_cannot_apply(self) -> None:
         self.window._runtime_view_selection_dirty = True
@@ -1772,6 +2035,10 @@ class PreviewStateTests(unittest.TestCase):
             patch.object(self.window.stream_manager, "stop") as stop,
             patch.object(self.window.stitch_processor, "configure") as configure,
             patch.object(self.window, "bump_preview_session") as bump,
+            patch.object(
+                self.window,
+                "schedule_auto_runtime_retry_if_dirty",
+            ) as retry_auto,
             patch(
                 "deep_shark_studio.gui.main_window.save_config",
             ) as save_config,
@@ -1784,6 +2051,7 @@ class PreviewStateTests(unittest.TestCase):
         stop.assert_not_called()
         configure.assert_not_called()
         bump.assert_not_called()
+        retry_auto.assert_called_once_with()
         save_config.assert_not_called()
         self.assertEqual(session_id, self.window.preview_session_id)
 
@@ -1793,6 +2061,13 @@ class PreviewStateTests(unittest.TestCase):
         )
         self.window.live_stitch_mode = "template"
         self.window.preview_content_mode = PreviewContentMode.LIVE
+        active_workers = patch.object(
+            self.window.stream_manager,
+            "has_active_workers",
+            return_value=True,
+        )
+        active_workers.start()
+        self.addCleanup(active_workers.stop)
         session_id = self.window.preview_session_id
         with (
             patch.object(
@@ -1823,6 +2098,13 @@ class PreviewStateTests(unittest.TestCase):
         save_config.assert_not_called()
 
     def test_applied_near_candidate_clear_reconfigures_live_worker(self) -> None:
+        active_workers = patch.object(
+            self.window.stream_manager,
+            "has_active_workers",
+            return_value=True,
+        )
+        active_workers.start()
+        self.addCleanup(active_workers.stop)
         with tempfile.TemporaryDirectory() as temp:
             candidate_path = Path(temp) / "candidate.yaml"
             candidate_path.write_text(
