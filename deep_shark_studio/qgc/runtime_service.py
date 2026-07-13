@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 import signal
+import sys
 import time
 from typing import Any, Mapping
 
@@ -24,6 +26,9 @@ from deep_shark_studio.stitcher import SurroundStitcher
 from deep_shark_studio.topology import active_topology_camera_keys
 
 from .video_output import FfmpegVideoSink, VideoOutputConfig, VideoSink
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -45,6 +50,10 @@ class DeepSharkRuntimeServiceConfig:
     use_intrinsics: bool = False
     process_fps: float = 15.0
     require_all_active_cameras: bool = True
+    max_frame_age_seconds: float = 3.0
+    failure_backoff_initial_seconds: float = 0.1
+    failure_backoff_max_seconds: float = 2.0
+    max_consecutive_failures: int = 300
 
     @property
     def uses_far_field_custom(self) -> bool:
@@ -69,10 +78,22 @@ class DeepSharkRuntimeServiceConfig:
 
 @dataclass(frozen=True)
 class DeepSharkRuntimeStatus:
+    running: bool
+    required_cameras: tuple[str, ...]
+    frames_submitted: int
     frames_written: int
+    duplicate_frames_skipped: int
+    consecutive_failures: int
     last_error: str
+    last_event: str
+    frame_ages_seconds: dict[str, float | None]
     last_runtime_status: str
     last_runtime_metrics: dict[str, Any] | None
+    output_state: str
+    output_pid: int | None
+    output_exit_code: int | None
+    output_restart_count: int
+    output_last_stderr_line: str
 
 
 class DeepSharkRuntimeService:
@@ -114,21 +135,63 @@ class DeepSharkRuntimeService:
                 )
         self.controller = controller
         self._running = False
-        self._frames_written = 0
+        self._stream_configs: list[CameraStreamConfig] = []
+        self._required_camera_keys: tuple[str, ...] = ()
+        self._frames_submitted = 0
+        self._duplicate_frames_skipped = 0
+        self._consecutive_failures = 0
         self._last_error = ""
+        self._last_event = "created"
+        self._last_frame_signature: tuple[tuple[str, int, float], ...] = ()
+        self._frame_ages_seconds: dict[str, float | None] = {}
         self._last_runtime_status = ""
         self._last_runtime_metrics: dict[str, Any] | None = None
 
     def start(self) -> None:
-        self.stream_manager.start(
-            build_stream_configs(self.camera_config, self.calibration_config)
+        if self._running:
+            return
+        stream_configs = build_stream_configs(
+            self.camera_config,
+            self.calibration_config,
         )
+        enabled_configs = [config for config in stream_configs if config.enabled]
+        if not enabled_configs:
+            raise RuntimeError(
+                "Headless startup preflight found no enabled cameras in the active topology."
+            )
+        missing_sources = [
+            config.key
+            for config in enabled_configs
+            if config.source in (None, "")
+        ]
+        if missing_sources:
+            raise RuntimeError(
+                "Headless startup preflight found empty camera sources: "
+                + ", ".join(missing_sources)
+            )
+        preflight = getattr(self.video_sink, "preflight", None)
+        if callable(preflight):
+            preflight()
+        self._stream_configs = stream_configs
+        self._required_camera_keys = tuple(
+            config.key for config in enabled_configs
+        )
+        self._last_frame_signature = ()
+        self._consecutive_failures = 0
+        self._last_error = ""
+        self._last_event = (
+            "starting capture for " + ", ".join(self._required_camera_keys)
+        )
+        self.stream_manager.start(stream_configs)
         self._running = True
 
     def stop(self) -> None:
+        if not self._running and self._last_event == "stopped":
+            return
         self._running = False
         self.stream_manager.stop()
         self.video_sink.close()
+        self._last_event = "stopped"
 
     def run_forever(self) -> None:
         self.start()
@@ -140,51 +203,189 @@ class DeepSharkRuntimeService:
 
         previous_sigint = signal.signal(signal.SIGINT, _request_stop)
         previous_sigterm = signal.signal(signal.SIGTERM, _request_stop)
+        last_reported_error = ""
         try:
             interval = 1.0 / max(0.1, float(self.service_config.process_fps))
             while self._running and not stop_requested:
                 loop_start = time.perf_counter()
-                self.process_once()
+                success = self.process_once()
+                if self._last_error and self._last_error != last_reported_error:
+                    LOGGER.error("Headless output: %s", self._last_error)
+                    last_reported_error = self._last_error
+                elif success:
+                    last_reported_error = ""
+                if (
+                    self.service_config.max_consecutive_failures > 0
+                    and self._consecutive_failures
+                    >= self.service_config.max_consecutive_failures
+                ):
+                    raise RuntimeError(
+                        "Headless output stopped after "
+                        f"{self._consecutive_failures} consecutive failures: "
+                        f"{self._last_error}"
+                    )
                 elapsed = time.perf_counter() - loop_start
-                time.sleep(max(0.0, interval - elapsed))
+                failure_delay = 0.0
+                if self._consecutive_failures:
+                    initial = max(
+                        0.0,
+                        float(
+                            self.service_config.failure_backoff_initial_seconds
+                        ),
+                    )
+                    maximum = max(
+                        initial,
+                        float(self.service_config.failure_backoff_max_seconds),
+                    )
+                    failure_delay = min(
+                        maximum,
+                        initial
+                        * (2 ** min(10, self._consecutive_failures - 1)),
+                    )
+                time.sleep(max(failure_delay, interval - elapsed, 0.0))
         finally:
             signal.signal(signal.SIGINT, previous_sigint)
             signal.signal(signal.SIGTERM, previous_sigterm)
             self.stop()
 
     def process_once(self) -> bool:
-        frames, _snapshots = self.stream_manager.latest_frames()
-        active = active_topology_camera_keys(self.calibration_config)
-        frames = {key: frame for key, frame in frames.items() if key in active}
+        if not self._required_camera_keys:
+            self._required_camera_keys = tuple(
+                config.key
+                for config in build_stream_configs(
+                    self.camera_config,
+                    self.calibration_config,
+                )
+                if config.enabled
+            )
+        sink_status_fn = getattr(self.video_sink, "status", None)
+        if callable(sink_status_fn):
+            sink_status = sink_status_fn()
+            if sink_status.state == "failed":
+                detail = (
+                    sink_status.last_error
+                    or sink_status.last_stderr_line
+                    or "unknown FFmpeg failure"
+                )
+                return self._record_failure(f"FFmpeg output failed: {detail}")
+        frames, snapshots = self.stream_manager.latest_frames(
+            max_frame_age_seconds=max(
+                0.0,
+                float(self.service_config.max_frame_age_seconds),
+            )
+        )
+        required = set(self._required_camera_keys)
+        frames = {
+            key: frame for key, frame in frames.items() if key in required
+        }
+        now = time.time()
+        self._frame_ages_seconds = {
+            key: (
+                max(0.0, now - float(snapshot.frame_timestamp))
+                if float(getattr(snapshot, "frame_timestamp", 0.0)) > 0.0
+                else None
+            )
+            for key, snapshot in snapshots.items()
+            if key in required
+        }
         if self.service_config.require_all_active_cameras:
-            missing = [key for key in active if key not in frames]
+            missing = [
+                key for key in self._required_camera_keys if key not in frames
+            ]
             if missing:
-                self._last_error = "Missing active camera frames: " + ", ".join(missing)
-                return False
+                return self._record_failure(
+                    "Missing enabled camera frames: " + ", ".join(missing)
+                )
         if not frames:
-            self._last_error = "No frames available."
+            return self._record_failure("No fresh enabled camera frames available.")
+        signature = tuple(
+            sorted(
+                (
+                    key,
+                    int(getattr(snapshots.get(key), "frame_count", 0)),
+                    float(
+                        getattr(snapshots.get(key), "frame_timestamp", 0.0)
+                    ),
+                )
+                for key in frames
+            )
+        )
+        if signature and signature == self._last_frame_signature:
+            self._duplicate_frames_skipped += 1
+            self._last_error = ""
+            self._last_event = "Skipped duplicate camera frame set."
             return False
         try:
             result = self.controller.process(frames)
             self._last_runtime_status = result.status
             self._last_runtime_metrics = result.metrics
             if result.canvas is None:
-                self._last_error = "Runtime stitcher returned no canvas."
-                return False
-            self.video_sink.write(result.canvas)
-            self._frames_written += 1
+                return self._record_failure(
+                    "Runtime stitcher returned no canvas."
+                )
+            accepted = self.video_sink.write(result.canvas)
+            if accepted is False:
+                return self._record_failure(
+                    "Video output rejected the stitched canvas."
+                )
+            self._frames_submitted += 1
+            self._last_frame_signature = signature
             self._last_error = ""
+            self._last_event = "Submitted a fresh stitched canvas."
+            self._consecutive_failures = 0
             return True
         except Exception as exc:
-            self._last_error = str(exc)
-            return False
+            return self._record_failure(
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _record_failure(self, message: str) -> bool:
+        self._last_error = str(message)
+        self._last_event = self._last_error
+        self._consecutive_failures += 1
+        return False
 
     def status(self) -> DeepSharkRuntimeStatus:
+        output_status_fn = getattr(self.video_sink, "status", None)
+        output_status = output_status_fn() if callable(output_status_fn) else None
+        frames_written = (
+            int(output_status.frames_written)
+            if output_status is not None
+            else self._frames_submitted
+        )
         return DeepSharkRuntimeStatus(
-            frames_written=self._frames_written,
+            running=self._running,
+            required_cameras=self._required_camera_keys,
+            frames_submitted=self._frames_submitted,
+            frames_written=frames_written,
+            duplicate_frames_skipped=self._duplicate_frames_skipped,
+            consecutive_failures=self._consecutive_failures,
             last_error=self._last_error,
+            last_event=self._last_event,
+            frame_ages_seconds=dict(self._frame_ages_seconds),
             last_runtime_status=self._last_runtime_status,
             last_runtime_metrics=self._last_runtime_metrics,
+            output_state=(
+                str(output_status.state)
+                if output_status is not None
+                else ("running" if self._running else "stopped")
+            ),
+            output_pid=(
+                output_status.pid if output_status is not None else None
+            ),
+            output_exit_code=(
+                output_status.exit_code if output_status is not None else None
+            ),
+            output_restart_count=(
+                int(output_status.restart_count)
+                if output_status is not None
+                else 0
+            ),
+            output_last_stderr_line=(
+                str(output_status.last_stderr_line)
+                if output_status is not None
+                else ""
+            ),
         )
 
 
@@ -345,10 +546,26 @@ def build_runtime_service_config(
         use_intrinsics=bool(args.use_intrinsics),
         process_fps=float(args.process_fps),
         require_all_active_cameras=not bool(args.allow_partial_frames),
+        max_frame_age_seconds=float(
+            getattr(args, "max_frame_age_seconds", 3.0)
+        ),
+        failure_backoff_initial_seconds=float(
+            getattr(args, "failure_backoff_initial", 0.1)
+        ),
+        failure_backoff_max_seconds=float(
+            getattr(args, "failure_backoff_max", 2.0)
+        ),
+        max_consecutive_failures=int(
+            getattr(args, "max_consecutive_failures", 300)
+        ),
     )
 
 
 def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     parser = _argument_parser()
     args = parser.parse_args(argv)
     camera_config = load_yaml(args.cameras_config)
@@ -358,7 +575,14 @@ def main(argv: list[str] | None = None) -> int:
         calibration_config,
         build_runtime_service_config(args, camera_config),
     )
-    service.run_forever()
+    try:
+        service.run_forever()
+    except KeyboardInterrupt:
+        logging.info("DeepShark headless service stopped by operator.")
+        return 0
+    except Exception as exc:
+        print(f"DeepShark headless service failed: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -406,6 +630,10 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fisheye-balance", type=float, default=0.6)
     parser.add_argument("--fisheye-fov-scale", type=float, default=1.0)
     parser.add_argument("--process-fps", type=float, default=15.0)
+    parser.add_argument("--max-frame-age-seconds", type=float, default=3.0)
+    parser.add_argument("--failure-backoff-initial", type=float, default=0.1)
+    parser.add_argument("--failure-backoff-max", type=float, default=2.0)
+    parser.add_argument("--max-consecutive-failures", type=int, default=300)
     parser.add_argument(
         "--output-kind",
         choices=["rtsp", "udp_mpegts"],

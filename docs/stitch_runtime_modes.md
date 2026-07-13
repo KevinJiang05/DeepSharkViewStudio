@@ -7,15 +7,19 @@ This document records the runtime stitching boundaries for DeepSharkViewStudio.
 The main workspaces are organized by professional workflow:
 
 - Realtime Monitor
-- Layout Tuning
+- Layout & Projection Lab
 - Calibration & Candidates
-- Projection Research
 - Project Management
 - Diagnostics & Logs
 
 See `docs/ui_workflow.md` for the UI-level responsibilities. Runtime stitching
 rules below remain the source of truth for Far-field, Near-field, and projection
 behavior.
+
+The Realtime Monitor maps the underlying fields to five task-facing presets in
+`deep_shark_studio/gui/runtime_workflow.py`: Far Default, B-2 View, Far Custom,
+Near Current, and Near Fisheye. This view-model is the only GUI selection
+source; it does not alter the processing contracts below.
 
 ## PreviewLayoutMode
 

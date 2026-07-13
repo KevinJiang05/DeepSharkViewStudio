@@ -79,7 +79,7 @@ validation rejects absolute paths and path escape such as `../outside.yaml`.
 
 ## Export Flow
 
-`Export Project Package` copies the active `configs/*.yaml` files and currently
+`Export Portable Package` copies the active `configs/*.yaml` files and currently
 loaded candidates into a new package directory. The exporter rewrites known
 candidate references:
 
@@ -93,12 +93,14 @@ does not write `configs/calibration.yaml`.
 
 ## Import Flow
 
-`Import Project Package` first validates the selected package. Activation is a
-separate confirmation step. When activated, the current `configs/` files are
-backed up before package configs are copied into the active config directory.
+`Validate & Activate Package` first validates the selected package. Activation
+is a separate confirmation step. When activated, the current `configs/` files
+are backed up before package configs are copied into the active config
+directory.
 
-`Validate Project Package` only checks the package and writes
-`project_validation_report.yaml`; it does not activate or overwrite anything.
+`Validate Package (Read-only)` only checks the package. It does not write a
+validation report by default, activate the package, or overwrite any package or
+active-config file.
 
 ## Validation
 

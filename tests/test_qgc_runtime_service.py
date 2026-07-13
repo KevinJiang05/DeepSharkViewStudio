@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from deep_shark_studio.qgc import runtime_service
 from deep_shark_studio.qgc.runtime_service import (
     DeepSharkRuntimeService,
     DeepSharkRuntimeServiceConfig,
@@ -63,10 +64,19 @@ def _calibration_config() -> dict:
 
 
 class FakeStreamManager:
-    def __init__(self, frames: dict[str, np.ndarray]):
+    def __init__(
+        self,
+        frames: dict[str, np.ndarray],
+        *,
+        frame_counts: dict[str, int] | None = None,
+    ):
         self.frames = frames
+        self.frame_counts = frame_counts or {
+            key: 1 for key in frames
+        }
         self.started_configs = None
         self.stopped = False
+        self.requested_max_frame_age = None
 
     def start(self, configs):
         self.started_configs = list(configs)
@@ -74,8 +84,16 @@ class FakeStreamManager:
     def stop(self):
         self.stopped = True
 
-    def latest_frames(self):
-        return dict(self.frames), {}
+    def latest_frames(self, max_frame_age_seconds=None):
+        self.requested_max_frame_age = max_frame_age_seconds
+        snapshots = {
+            key: SimpleNamespace(
+                frame_count=self.frame_counts.get(key, 0),
+                frame_timestamp=100.0,
+            )
+            for key in self.frames
+        }
+        return dict(self.frames), snapshots
 
 
 class FakeController:
@@ -145,7 +163,105 @@ class QGCRuntimeServiceTests(unittest.TestCase):
         self.assertFalse(service.process_once())
 
         self.assertEqual(0, controller.calls)
-        self.assertIn("Missing active camera frames", service.status().last_error)
+        self.assertIn("Missing enabled camera frames", service.status().last_error)
+
+    def test_disabled_topology_camera_is_not_required(self) -> None:
+        camera_config = _camera_config()
+        camera_config["cameras"]["front_right"]["enabled"] = False
+        frames = {
+            "front_left": np.zeros((8, 8, 3), dtype=np.uint8),
+            "front": np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+        controller = FakeController(np.zeros((24, 64, 3), dtype=np.uint8))
+        service = DeepSharkRuntimeService(
+            camera_config,
+            _calibration_config(),
+            DeepSharkRuntimeServiceConfig(),
+            stream_manager=FakeStreamManager(frames),
+            video_sink=NullVideoSink(),
+            controller=controller,
+        )
+
+        self.assertTrue(service.process_once())
+        self.assertEqual({"front_left", "front"}, set(controller.last_frames))
+
+    def test_process_once_requests_fresh_frames_and_skips_duplicates(self) -> None:
+        frames = {
+            "front_left": np.zeros((8, 8, 3), dtype=np.uint8),
+            "front": np.zeros((8, 8, 3), dtype=np.uint8),
+            "front_right": np.zeros((8, 8, 3), dtype=np.uint8),
+        }
+        manager = FakeStreamManager(frames)
+        controller = FakeController(np.zeros((24, 64, 3), dtype=np.uint8))
+        service = DeepSharkRuntimeService(
+            _camera_config(),
+            _calibration_config(),
+            DeepSharkRuntimeServiceConfig(max_frame_age_seconds=2.5),
+            stream_manager=manager,
+            video_sink=NullVideoSink(),
+            controller=controller,
+        )
+
+        self.assertTrue(service.process_once())
+        self.assertFalse(service.process_once())
+
+        self.assertEqual(2.5, manager.requested_max_frame_age)
+        self.assertEqual(1, controller.calls)
+        self.assertEqual(1, service.status().duplicate_frames_skipped)
+
+    def test_start_runs_sink_preflight_before_camera_workers(self) -> None:
+        events: list[str] = []
+
+        class PreflightSink(NullVideoSink):
+            def preflight(self):
+                events.append("preflight")
+
+        class OrderedStreamManager(FakeStreamManager):
+            def start(self, configs):
+                events.append("capture-start")
+                super().start(configs)
+
+        service = DeepSharkRuntimeService(
+            _camera_config(),
+            _calibration_config(),
+            DeepSharkRuntimeServiceConfig(),
+            stream_manager=OrderedStreamManager({}),
+            video_sink=PreflightSink(),
+            controller=FakeController(np.zeros((24, 64, 3), dtype=np.uint8)),
+        )
+
+        service.start()
+        service.start()
+        service.stop()
+        service.stop()
+
+        self.assertEqual(["preflight", "capture-start"], events)
+
+    def test_run_forever_exits_after_configured_consecutive_failures(self) -> None:
+        service = DeepSharkRuntimeService(
+            _camera_config(),
+            _calibration_config(),
+            DeepSharkRuntimeServiceConfig(
+                process_fps=100.0,
+                failure_backoff_initial_seconds=0.0,
+                failure_backoff_max_seconds=0.0,
+                max_consecutive_failures=2,
+            ),
+            stream_manager=FakeStreamManager({}),
+            video_sink=NullVideoSink(),
+            controller=FakeController(np.zeros((24, 64, 3), dtype=np.uint8)),
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "2 consecutive failures",
+        ):
+            service.run_forever()
+
+        status = service.status()
+        self.assertFalse(status.running)
+        self.assertEqual(2, status.consecutive_failures)
+        self.assertIn("Missing enabled camera frames", status.last_error)
 
     def test_candidate_processor_mode_outputs_b2_candidate_canvas(self) -> None:
         frames = {
@@ -348,6 +464,24 @@ class QGCRuntimeServiceTests(unittest.TestCase):
         )
 
         self.assertTrue(config.candidate_use_opencl)
+
+    def test_main_treats_operator_keyboard_interrupt_as_clean_shutdown(self) -> None:
+        with (
+            patch.object(
+                runtime_service,
+                "load_yaml",
+                side_effect=[_camera_config(), _calibration_config()],
+            ),
+            patch.object(
+                runtime_service,
+                "DeepSharkRuntimeService",
+            ) as service_class,
+        ):
+            service_class.return_value.run_forever.side_effect = KeyboardInterrupt
+
+            exit_code = runtime_service.main([])
+
+        self.assertEqual(0, exit_code)
 
 
 if __name__ == "__main__":

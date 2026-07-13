@@ -54,12 +54,19 @@ class WindowsLauncherContractTests(unittest.TestCase):
             "the distributed launcher must not contain a machine-specific drive path",
         )
         self.assertIn(r".venv\scripts\python.exe", folded)
+        self.assertIn("deep_shark_python", folded)
+        self.assertIn(
+            r"..\..\envs\deep-shark-view-studio\scripts\python.exe",
+            folded,
+        )
+        self.assertIn("import numpy, cv2, yaml, pyside6", folded)
         self.assertIn("py -3", folded)
         self.assertRegex(folded, r"\bpython(?:\.exe)?\b")
+        self.assertLess(folded.index("deep_shark_python"), folded.index(r".venv\scripts\python.exe"))
         self.assertLess(folded.index(r".venv\scripts\python.exe"), folded.index("py -3"))
         self.assertLess(folded.index("py -3"), folded.rindex("python"))
         self.assertGreaterEqual(folded.count("app.py %*"), 3)
-        self.assertGreaterEqual(folded.count("exit /b %errorlevel%"), 3)
+        self.assertIn('if "%~1"=="" pause', folded)
         self.assertIn("exit /b", folded)
 
     def test_python_entrypoint_defers_gui_import_to_startup_preflight(self) -> None:

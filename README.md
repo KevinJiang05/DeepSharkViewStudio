@@ -10,20 +10,30 @@ DeepShark View Studio is a standalone surround-view development tool extracted f
 - Warps five camera views into a shared bird's-eye canvas
 - Applies seam masks based on the legacy AVM stitching rules
 - Produces a stitched surround-view canvas
-- Provides a PySide6 GUI with three core workspaces
+- Provides a PySide6 GUI with five task-oriented workspaces
 - Detects the lab chessboard calibration board
-- Keeps placeholders for future video input and streaming output
+- Keeps advanced QGC/video output separate from the normal preview workflow
 
 ## Workspaces
 
-### Realtime Preview
+### Realtime Monitor
 
 - Load a still-image directory for quick stitching checks
 - Start live preview from configured USB, RTSP, or video-file sources
 - Display raw camera frames, warped bird's-eye frames, and final stitched canvas
 - Show per-camera enabled state, source, status, and frame counts
+- Select one explicit runtime view: Far Default, B-2 View, Far Custom, Near
+  Current, or Near Fisheye
+- Distinguish a staged selection from the effective worker state
 
-### Camera Config
+### Layout & Projection Lab
+
+- Author Near front-priority and Far B-2-backed layout candidates
+- Compare Current Perspective and experimental Near Fisheye projection
+- Keep projection research and candidate authoring out of runtime operation
+- Save candidate files without changing `configs/calibration.yaml`
+
+### Camera Setup
 
 - Set active camera count from 2 to 5
 - Configure each channel name, source type, and source value
@@ -56,12 +66,19 @@ DeepShark View Studio is a standalone surround-view development tool extracted f
 - Manage a calibration image folder and scan chessboard detection status
 - Save calibration data to `configs/calibration.yaml`
 
-### Project
+### Project Management
 
-- Save all editable configs into one `.dsvs.yaml` project file
-- Open a `.dsvs.yaml` project file and restore configs
+- Export, read-only validate, and activate a Portable Project Package containing
+  configs plus active candidates
+- Use legacy `.dsvs.yaml` config-only files only from the collapsed compatibility
+  section
 - Create timestamped backups before risky calibration or seam edits
-- Export a compact runtime config for a future service/QGC bridge
+- Export an explicitly experimental Runtime Snapshot for a future service bridge
+
+### Diagnostics & Logs
+
+- Inspect and copy the application log without changing runtime state
+- Keep effective view, projection, health, and warnings beside the realtime view
 
 ## Project Layout
 
@@ -84,6 +101,8 @@ DeepSharkViewStudio/
     streaming.py
     gui/
       main_window.py
+      runtime_workflow.py
+      panels/
   tools/
     run_image_demo.py
   samples/
@@ -100,7 +119,7 @@ py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-The launcher first uses `.venv\Scripts\python.exe`, then falls back to `py -3` and `python`. It contains no machine-specific drive or environment path.
+The launcher first honors an optional `DEEP_SHARK_PYTHON` interpreter path, then tries `.venv\Scripts\python.exe`, a shared workspace environment at `..\..\envs\deep-shark-view-studio`, `py -3`, and `python`. Every candidate must provide the full runtime dependency set. It contains no machine-specific drive path, and a failed no-argument launch keeps the error window open.
 
 ## Local Configuration And First Start
 
@@ -166,14 +185,15 @@ python app.py
 The GUI currently supports:
 
 - English/Chinese language switching from the top language selector
-- Realtime Preview workspace
-- Camera Config workspace
-- Calibration workspace
-- Project workspace
+- Realtime Monitor workspace with one five-view runtime selector
+- Layout & Projection Lab workspace
+- Calibration & Candidates workspace with wizard-first navigation
+- Project Management workspace with portable-first semantics
+- Diagnostics & Logs workspace
 - Image-directory and live-source preview paths
 - Chessboard detection and intrinsics export
 - Calibration quality reports and undistortion preview
-- Project save/open/backup/export actions
+- Portable package export/validate/activate plus collapsed legacy tools
 - Perspective point editing
 - Stitched result saving
 

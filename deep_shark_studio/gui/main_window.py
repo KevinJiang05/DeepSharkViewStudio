@@ -6,6 +6,7 @@ import sys
 import time
 import traceback
 import shutil
+import re
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -27,7 +28,6 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
-    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -58,7 +58,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from deep_shark_studio.gui.panels import StitchRuntimeModePanel
+from deep_shark_studio.gui.panels import (
+    ProjectManagementPanel,
+    StitchRuntimeModePanel,
+)
+from deep_shark_studio.gui.runtime_workflow import (
+    RuntimeViewPreset,
+    preset_for_effective_status,
+    preset_for_runtime,
+    selection_for_preset,
+)
 from deep_shark_studio.calibration import (
     calibrate_camera_from_images,
     draw_chessboard_detection,
@@ -186,12 +195,15 @@ ZH_CN = {
     "English": "英文",
     "Chinese": "中文",
     "Ready": "就绪",
-    "Realtime Preview": "实时预览",
     "Realtime Monitor": "实时监看",
-    "Layout Tuning": "布局调参",
+    "Layout Lab": "布局与投影实验室",
     "Calibration & Candidates": "标定与候选",
-    "Projection Research": "投影研发",
     "Diagnostics & Logs": "诊断与日志",
+    "Realtime monitor controls capture, display layout, and the effective runtime view.": "实时监看用于采集、显示布局和当前实际运行视图。",
+    "Layout Lab creates preview-only layout and projection candidates; it never edits formal calibration.": "布局与投影实验室只生成预览候选，不会编辑正式标定。",
+    "Calibration & Candidates guides sample capture and B-2 candidate generation; advanced diagnostics remain secondary.": "标定与候选用于采样向导和 B-2 候选生成；高级诊断为次级入口。",
+    "Project Management handles portable transfer, local configuration, and advanced output settings.": "项目管理用于便携迁移、本地配置和高级输出设置。",
+    "Diagnostics & Logs is read-only operational evidence and troubleshooting output.": "诊断与日志提供只读运行证据和故障排查信息。",
     "Camera & Runtime Config": "相机与运行配置",
     "Project Files": "项目文件",
     "Camera Config": "相机配置",
@@ -214,6 +226,89 @@ ZH_CN = {
     "B-2 Candidate View [Advanced]": "B-2 候选视图 [高级]",
     "Current Profile Template": "当前正式 Profile 模板",
     "Stitch Runtime Mode": "拼接算法模式",
+    "Runtime View": "运行视图",
+    "View": "视图",
+    "Apply Runtime View": "应用运行视图",
+    "Choose one concrete processing view. Grid, Focus, and Stitched only change display layout.": "请选择一条明确的处理链路；多路、聚焦和拼接仅改变显示布局。",
+    "Apply to the current preview worker only. This does not write calibration.yaml.": "仅应用到当前预览 worker，不会写入 calibration.yaml。",
+    "Far Default": "Far Default（远景默认）",
+    "B-2 View": "B-2 View（候选诊断）",
+    "Far Custom": "Far Custom（远景自定义）",
+    "Near Current": "Near Current（当前透视）",
+    "Near Fisheye": "Near Fisheye（鱼眼矫正）",
+    "Far Default — current profile": "远景默认 — 当前正式 Profile",
+    "B-2 View — candidate diagnostics [Advanced]": "B-2 候选视图 — 候选诊断 [高级]",
+    "Far Custom — B-2 projection + custom layout": "远景自定义 — B-2 投影 + 自定义布局",
+    "Near Current — current perspective": "近景当前透视 — 当前 Perspective",
+    "Near Fisheye — rectilinear [Experimental]": "近景鱼眼 — Rectilinear [实验]",
+    "Candidate & Projection Sources": "候选与投影来源",
+    "Hide Candidate & Projection Sources": "收起候选与投影来源",
+    "B-2 Projection Candidate": "B-2 投影候选",
+    "Far Custom Layout": "远景自定义布局",
+    "Near Layout Candidate": "近景布局候选",
+    "Near Fisheye Intrinsics": "近景鱼眼内参",
+    "Load Far Custom Layout...": "加载远景自定义布局...",
+    "Load Near Layout...": "加载近景布局...",
+    "Load Fisheye Intrinsics...": "加载鱼眼内参...",
+    "Clear": "清除",
+    "Open Folder": "打开目录",
+    "Balance": "Balance",
+    "FOV Scale": "FOV Scale",
+    "No Near Layout Candidate loaded.": "未加载近景布局候选。",
+    "B-2 candidate available: {path}": "B-2 候选可用：{path}",
+    "No B-2 candidate available. Create one in Calibration & Candidates.": "没有可用的 B-2 候选；请先在“标定与候选”中生成。",
+    "Effective: {view}": "当前实际运行：{view}",
+    "Selected, not applied: {view}": "已选择但尚未应用：{view}",
+    "Topology": "拓扑",
+    "Cameras": "相机",
+    "Layout": "布局",
+    "Content": "内容",
+    "Health": "健康",
+    "Effective View": "实际运行视图",
+    "Projection": "投影",
+    "Warnings": "警告",
+    "None": "无",
+    "Grid": "多路",
+    "Focus": "聚焦",
+    "Stitched": "拼接",
+    "Still": "静态",
+    "Running": "运行中",
+    "Starting": "启动中",
+    "Degraded": "降级",
+    "B-2 per-camera projection": "B-2 每相机投影",
+    "Fisheye Rectilinear": "鱼眼 Rectilinear",
+    "Initial profile template": "初始 Profile 模板",
+    "Applied calibration": "已应用标定",
+    "Recommended candidate": "推荐候选",
+    "Experimental candidate": "实验候选",
+    "No candidate": "无候选",
+    "Source-coordinate warnings are present; see Diagnostics & Logs.": "存在 source 坐标警告；请查看“诊断与日志”。",
+    "The current profile failed overlap/seam validation.": "当前 Profile 未通过 overlap/seam 校验。",
+    "The latest stitch failed: {error}": "最近一次拼接失败：{error}",
+    "Runtime configuration is pending; the current result still comes from the configured worker.": "运行配置有待应用；当前结果仍来自已配置的 worker。",
+    "Worker configuration and the latest result disagree.": "worker 配置状态与最近结果状态不一致。",
+    "The active candidate is experimental and intended for diagnostics only.": "当前候选为实验候选，仅供诊断。",
+    "The candidate still has {count} sampling-quality risks.": "候选仍有 {count} 项采样质量风险。",
+    "The cameras are not co-located: this view prioritizes distance and may ghost nearby objects.": "三台相机非共光心：当前视图优先远景，近景可能重影。",
+    "The current capture session has not reached the minimum B-2 gate.": "当前采集会话尚未满足 B-2 最低门槛。",
+    "The current capture session still needs more pair/pose coverage.": "当前采集会话的 Pair/姿态覆盖仍需补充。",
+    "Live preview is stopped. The selected display layout is preserved for the next start.": "实时预览已停止；当前显示布局会保留到下次启动。",
+    "Static stitch view checks loaded images and does not represent live-stream health.": "静态拼接画面用于检查加载图片，不代表实时流健康状态。",
+    "Near Current uses the read-only Near layout, current perspective warp, and front-priority composition.": "Near Current 使用只读近景布局、当前 Perspective warp 和 front-priority 合成。",
+    "Near Fisheye uses the read-only Near layout and Fisheye Rectilinear projection; inspect edge stretching and nearby seams.": "Near Fisheye 使用只读近景布局和 Fisheye Rectilinear 投影；请检查边缘拉伸和接缝近物体。",
+    "Far Custom uses the loaded candidate projection and read-only custom layout.": "Far Custom 使用已加载的候选投影和只读自定义布局。",
+    "Auto is not implemented; the worker is explicitly using Far Default.": "Auto 尚未实现；worker 当前明确使用 Far Default。",
+    "B-2 View is a rotation-only distance-priority diagnostic; nearby objects may ghost.": "B-2 View 是 rotation-only 的远景优先诊断视图；近景物体可能重影。",
+    "Far Default uses the current formal profile. It is not an applied B-2 candidate. For nearby objects, use Multi-camera View or choose Near Current.": "Far Default 使用当前正式 Profile，不代表 B-2 候选已应用。检查近景物体时，请使用多路视图或选择 Near Current。",
+    "Near Fisheye stitched view": "Near Fisheye 拼接画面",
+    "Far Custom stitched view": "Far Custom 拼接画面",
+    "B-2 View stitched view": "B-2 View 拼接画面",
+    "Auto fallback Far Default stitched view": "Auto 回退 Far Default 拼接画面",
+    "Far Default uses the current formal profile and perspective pipeline.": "远景默认使用当前正式 Profile 和 Perspective 链路。",
+    "B-2 View is an advanced diagnostic view of the B-2 per-camera candidate.": "B-2 候选视图用于高级诊断，直接查看 B-2 per-camera 候选。",
+    "Far Custom uses B-2 per-camera projection plus the loaded Far Custom layout.": "远景自定义使用 B-2 per-camera 投影和已加载的远景自定义布局。",
+    "Near Current uses the loaded Near layout with current perspective projection.": "近景当前透视使用已加载的近景布局和当前 Perspective 投影。",
+    "Near Fisheye uses the loaded Near layout, fisheye intrinsics, and rectilinear projection.": "近景鱼眼使用已加载的近景布局、鱼眼内参和 Rectilinear 投影。",
     "Runtime stitching algorithm, independent from Grid / Focus / Stitched layout.": "拼接算法模式独立于 Grid / Focus / Stitched 显示布局。",
     "Mode": "模式",
     "Far-field / distance priority": "远景优先 / Far-field",
@@ -412,6 +507,41 @@ ZH_CN = {
     "Readable": "可读取",
     "Corners": "角点数",
     "Project Management": "项目管理",
+    "Project & Portability": "项目与迁移",
+    "Camera Setup": "相机设置",
+    "QGC Video Output [Advanced]": "QGC 视频输出 [高级]",
+    "Portable Project Package": "Portable Project Package（便携项目包）",
+    "Portable Project Package (Recommended)": "Portable Project Package（便携项目包，推荐）",
+    "Legacy Project File (.dsvs.yaml)": "Legacy Project File（旧版 .dsvs.yaml）",
+    "Using local configs; no portable package is active.": "当前使用本地 configs；尚未激活便携项目包。",
+    "Active portable package: {path}": "当前激活的便携项目包：{path}",
+    "Last project action: none": "最近项目操作：无",
+    "Portable packages include configs and active Far/Near/B-2/fisheye candidates. Validate is read-only; Activate backs up current configs before switching.": "便携项目包包含 configs 以及当前 Far/Near/B-2/鱼眼候选。校验为只读；激活会先备份当前配置再切换。",
+    "Export Portable Package...": "导出便携项目包...",
+    "Validate Package (Read-only)...": "只读校验项目包...",
+    "Validate & Activate Package...": "校验并激活项目包...",
+    "Show Legacy & Advanced Tools": "显示旧版与高级工具",
+    "Hide Legacy & Advanced Tools": "收起旧版与高级工具",
+    "Legacy .dsvs.yaml files contain only the three config files. They do not carry candidates and are retained for compatibility, not team transfer.": "旧版 .dsvs.yaml 只包含三份配置，不携带候选；仅为兼容保留，不建议用于团队迁移。",
+    "Save Legacy Project File...": "保存旧版项目文件...",
+    "Open Legacy Project File...": "打开旧版项目文件...",
+    "Local Maintenance": "本地维护",
+    "Backups protect active configs. Runtime Snapshot is an experimental service hand-off and is not a portable project.": "备份用于保护当前配置；Runtime Snapshot 是实验性服务交接文件，不是便携项目。",
+    "Backup Active Configs": "备份当前配置",
+    "Export Runtime Snapshot [Experimental]": "导出 Runtime Snapshot [实验]",
+    "Save legacy project file": "保存旧版项目文件",
+    "Open legacy project file": "打开旧版项目文件",
+    "Legacy Project File (*.dsvs.yaml *.yaml *.yml);;All Files (*)": "旧版项目文件 (*.dsvs.yaml *.yaml *.yml);;所有文件 (*)",
+    "Save legacy project failed": "保存旧版项目失败",
+    "Open legacy project failed": "打开旧版项目失败",
+    "Legacy project saved: {path}": "旧版项目已保存：{path}",
+    "Legacy project loaded: {path}": "旧版项目已加载：{path}",
+    "Config backup failed": "配置备份失败",
+    "Config backup created: {path}": "配置备份已创建：{path}",
+    "Export runtime snapshot": "导出 Runtime Snapshot",
+    "Runtime snapshot failed": "Runtime Snapshot 导出失败",
+    "Runtime snapshot exported: {path}": "Runtime Snapshot 已导出：{path}",
+    "Activate project package failed": "项目包激活失败",
     "QGC Video Output": "QGC 视频输出",
     "Output Type": "输出方式",
     "UDP Local Low Latency": "UDP 本机低延迟",
@@ -432,6 +562,9 @@ ZH_CN = {
     "QGC output service failed to start.": "QGC 输出服务启动失败。",
     "QGC output service already running.": "QGC 输出服务已在运行。",
     "QGC output service exited with code {code}.": "QGC 输出服务已退出，代码 {code}。",
+    "QGC output requires a current stitched canvas. Start Live preview and wait for a stitched frame first.": "QGC 输出需要当前拼接画面。请先启动实时预览并等待生成一帧拼接结果。",
+    "QGC output failed: {error}": "QGC 输出失败：{error}",
+    "Restarting": "重启中",
     "QGC output service": "QGC 输出服务",
     "Current B-2 candidate view requires an available candidate directory.": "当前 B-2 候选视图需要可用的候选目录。",
     "Start streaming the current GUI stitched canvas to QGC.": "将当前 GUI 拼接画面开始推流到 QGC。",
@@ -441,23 +574,11 @@ ZH_CN = {
     "RTSP output publishes to an RTSP server. QGC should open the same stream URL.": "RTSP 输出会发布到 RTSP 服务端，QGC 应打开同一个流地址。",
     "UDP MPEG-TS sends directly to a UDP port and is usually better for same-machine low-latency QGC preview.": "UDP MPEG-TS 直接发送到 UDP 端口，通常更适合同机低延迟 QGC 预览。",
     "Use udp://127.0.0.1:5600 for local low-latency bridge, or rtsp://127.0.0.1:8554/deepshark when using MediaMTX/RTSP service.": "同机低延迟桥接建议使用 udp://127.0.0.1:5600；使用 MediaMTX/RTSP 服务时使用 rtsp://127.0.0.1:8554/deepshark。",
-    "Projection Research Overview": "投影研发概览",
-    "Projection Research Note": "Projection 研发线用于 fisheye rectilinear / equirectangular / A-B comparison 等实验。Near-field Fisheye 只影响 Near-field；Far-field Default 不受影响；Far-field Custom 使用 B-2 per-camera projection 基底。",
-    "Runtime projection controls remain in Realtime Monitor for current preview switching; layout-specific projection controls are in Layout Tuning.": "运行态投影切换仍在实时监看的拼接算法面板中；布局候选相关投影参数在布局调参中。",
-    "No project file loaded. Current configs are stored in configs/*.yaml.": "尚未加载项目文件。当前配置保存在 configs/*.yaml。",
-    "Save Project As": "项目另存为",
-    "Open Project": "打开项目",
-    "Backup Current Configs": "备份当前配置",
-    "Export Runtime Config": "导出运行配置",
-    "Export Project Package": "导出项目包",
-    "Import Project Package": "导入项目包",
-    "Validate Project Package": "校验项目包",
     "Project Package (*.yaml *.yml);;All Files (*)": "项目包 (*.yaml *.yml);;所有文件 (*)",
     "Choose project package export folder": "选择项目包导出目录",
     "Open project package manifest": "打开项目包 manifest",
     "Validate project package manifest": "校验项目包 manifest",
     "Export project package failed": "导出项目包失败",
-    "Import project package failed": "导入项目包失败",
     "Validate project package failed": "校验项目包失败",
     "Project package exported: {path}": "项目包已导出：{path}",
     "Project package valid: {path}": "项目包校验通过：{path}",
@@ -466,8 +587,6 @@ ZH_CN = {
     "The package is valid. Activate it now?\n\nThis will back up current configs, then replace active configs with the package configs. Candidate files remain inside the package and calibration.yaml is not edited during export/validation.": "项目包校验通过。现在激活吗？\n\n激活会先备份当前 configs，然后用项目包内的 configs 替换当前配置。候选文件仍保留在项目包内；导出/校验阶段不会编辑 calibration.yaml。",
     "Project package activated: {path}": "项目包已激活：{path}",
     "Project package validated but not activated: {path}": "项目包已校验，但未激活：{path}",
-    "Project files bundle calibration.yaml, cameras.yaml, and network.yaml into one portable .dsvs.yaml file.\n\nUse backups before large calibration or seam edits. Runtime export is the compact configuration intended for a future service/QGC bridge.": "项目文件会把 calibration.yaml、cameras.yaml 和 network.yaml 打包成一个便携的 .dsvs.yaml 文件。\n\n大幅修改标定或拼接缝前建议先备份。运行配置导出用于后续独立服务或 QGC 桥接。",
-    "Project Package exports configs and active candidates into a folder with package-relative paths. Import validates first; activation backs up current configs before replacing them.": "项目包会把配置和当前候选导出到一个使用包内相对路径的目录。导入会先校验；激活前会备份当前 configs，再替换配置。",
     "No images": "没有图片",
     "No matching camera images were found.": "没有找到匹配相机名称的图片。",
     "Stitch failed": "拼接失败",
@@ -500,21 +619,7 @@ ZH_CN = {
     "Selected {path}": "已选择 {path}",
     "Saved results to {path}": "结果已保存到 {path}",
     "{status}: {count} active frames | stitch {ms:.1f} ms": "{status}：{count} 路有效画面 | 拼接 {ms:.1f} ms",
-    "Save DeepShark View Studio project": "保存 DeepShark View Studio 项目",
-    "DeepShark Project (*.yaml *.yml)": "DeepShark 项目 (*.yaml *.yml)",
-    "Save project failed": "保存项目失败",
-    "Saved project: {path}": "项目已保存：{path}",
-    "Open DeepShark View Studio project": "打开 DeepShark View Studio 项目",
-    "DeepShark Project (*.yaml *.yml);;All Files (*)": "DeepShark 项目 (*.yaml *.yml);;所有文件 (*)",
-    "Open project failed": "打开项目失败",
-    "Loaded project: {path}": "项目已加载：{path}",
-    "Loaded project version {version} from {path}": "已从 {path} 加载项目版本 {version}",
-    "Backup failed": "备份失败",
-    "Backup created: {path}": "备份已创建：{path}",
-    "Export runtime config": "导出运行配置",
     "YAML (*.yaml *.yml)": "YAML (*.yaml *.yml)",
-    "Export failed": "导出失败",
-    "Runtime config exported: {path}": "运行配置已导出：{path}",
     "Saved chessboard settings.": "标定板设置已保存。",
     "Choose calibration image": "选择标定图片",
     "Images (*.jpg *.jpeg *.png *.bmp);;All Files (*)": "图片 (*.jpg *.jpeg *.png *.bmp);;所有文件 (*)",
@@ -625,47 +730,139 @@ def i18n(language: str, text: str, **kwargs: Any) -> str:
     return translated.format(**kwargs) if kwargs else translated
 
 
-def rejection_advice(reason: str) -> str:
+def bilingual(
+    language: str,
+    english: str,
+    chinese: str,
+    **kwargs: Any,
+) -> str:
+    """Format a local bilingual message without expanding the global catalog."""
+    text = chinese if language == "zh_CN" else english
+    return text.format(**kwargs) if kwargs else text
+
+
+def rejection_advice(reason: str, language: str = "zh_CN") -> str:
     """Translate a quality-gate reason into a concrete next action."""
     text = str(reason or "").strip()
     lowered = text.lower()
     if not text:
-        return "暂无拒绝记录。"
+        return bilingual(
+            language,
+            "No rejection has been recorded.",
+            "暂无拒绝记录。",
+        )
     if "blur" in lowered or "模糊" in text:
-        return "停稳标定板约 1 秒，避免手抖和运动模糊后再拍。"
+        return bilingual(
+            language,
+            "Hold the board still for about one second, then capture again without camera shake or motion blur.",
+            "停稳标定板约 1 秒，避免手抖和运动模糊后再拍。",
+        )
     if (
         "area is too small" in lowered
         or "board area" in lowered
         or "面积太小" in text
     ):
-        return "让标定板靠近相机一些，使它在画面中占据更大区域。"
+        return bilingual(
+            language,
+            "Move the board closer so it occupies a larger area of the frame.",
+            "让标定板靠近相机一些，使它在画面中占据更大区域。",
+        )
     if (
         "duplicate" in lowered
         or "too similar" in lowered
         or "姿态重复" in text
         or "重复姿态" in text
     ):
-        return "把标定板移到尚未覆盖的边缘或角落，并改变距离和倾角。"
+        return bilingual(
+            language,
+            "Move the board to an uncovered edge or corner and vary its distance and tilt.",
+            "把标定板移到尚未覆盖的边缘或角落，并改变距离和倾角。",
+        )
     if (
         "time delta" in lowered
         or "timestamps unavailable" in lowered
         or "时间差" in text
     ):
-        return "停稳同一块标定板约 1 秒，再采集这一组 Pair。"
+        return bilingual(
+            language,
+            "Hold the same physical board still for about one second, then capture this pair again.",
+            "停稳同一块标定板约 1 秒，再采集这一组 Pair。",
+        )
     if (
         "coverage" in lowered
         or "覆盖不足" in text
         or "位置或距离" in text
     ):
-        return "补拍画面四角、边缘，以及近、中、远不同距离和倾角。"
+        return bilingual(
+            language,
+            "Add samples at the frame corners and edges, with near, medium and far distances and varied tilt.",
+            "补拍画面四角、边缘，以及近、中、远不同距离和倾角。",
+        )
     if (
         "not detected" in lowered
         or "common confirmed board points" in lowered
         or "无法识别" in text
         or "共同点" in text
     ):
-        return "确认整块标定板清晰可见、无遮挡，并核对行列数和板类型。"
-    return "查看详细拒绝原因，调整标定板位置、清晰度或可见范围后重拍。"
+        return bilingual(
+            language,
+            "Make the complete board clearly visible without occlusion, and verify its row, column and board-type settings.",
+            "确认整块标定板清晰可见、无遮挡，并核对行列数和板类型。",
+        )
+    return bilingual(
+        language,
+        "Review the detailed rejection reason, adjust board position, sharpness or visibility, and capture again.",
+        "查看详细拒绝原因，调整标定板位置、清晰度或可见范围后重拍。",
+    )
+
+
+def quality_reason_text(reason: str, language: str) -> str:
+    """Present calibration-domain gate evidence in the selected UI language."""
+    text = str(reason or "").strip()
+    if language == "zh_CN" or not text:
+        return text
+    exact = {
+        "标定板参数尚未确认。": "Calibration-board parameters are not confirmed.",
+        "Session 分辨率不是 1920×1080。": "Session resolution is not 1920×1080.",
+        "Pair 覆盖不足": "Pair coverage is insufficient.",
+        "时间戳不可用，不能确认同步。": "Timestamps are unavailable; synchronization cannot be confirmed.",
+    }
+    if text in exact:
+        return exact[text]
+    patterns = (
+        (
+            r"^(.+?) 仅有 (\d+) 张合格样本，最低需要 (\d+) 张。$",
+            r"\1 has only \2 accepted samples; at least \3 are required.",
+        ),
+        (
+            r"^(.+?) 的中心、边缘或四角覆盖仍明显不足。$",
+            r"\1 still lacks sufficient center, edge or corner coverage.",
+        ),
+        (
+            r"^(.+?) 的重复姿态拒绝过多（(\d+) 次）。$",
+            r"\1 has too many duplicate-pose rejections (\2).",
+        ),
+        (
+            r"^(.+? ↔ .+?) 仅有 (\d+) 组合格样本，最低需要 (\d+) 组。$",
+            r"\1 has only \2 accepted pair samples; at least \3 are required.",
+        ),
+        (
+            r"^(.+? ↔ .+?) 的位置或距离覆盖仍明显不足。$",
+            r"\1 still lacks sufficient position or distance coverage.",
+        ),
+        (
+            r"^(.+? ↔ .+?) 的时间差风险样本过多（(\d+) 组）。$",
+            r"\1 has too many time-delta risk samples (\2).",
+        ),
+        (
+            r"^(.+? ↔ .+?) 的重复姿态拒绝过多（(\d+) 次）。$",
+            r"\1 has too many duplicate-pose rejections (\2).",
+        ),
+    )
+    for pattern, replacement in patterns:
+        if re.match(pattern, text):
+            return re.sub(pattern, replacement, text)
+    return text
 
 
 def cv_to_pixmap(image: np.ndarray, max_width: int = 720, max_height: int = 480) -> QPixmap:
@@ -1170,23 +1367,24 @@ class CalibrationCandidateDialog(QDialog):
         parent: QWidget | None = None,
     ):
         super().__init__(parent)
+        self.language = getattr(parent, "language", "zh_CN")
         self.candidate_directory = Path(candidate_directory)
         self.candidate, self.report = load_calibration_candidate(
             self.candidate_directory
         )
         experimental = bool(self.candidate.get("experimental"))
         self.setWindowTitle(
-            "B-2 实验性候选标定"
+            self.bt("B-2 Experimental Calibration Candidate", "B-2 实验性候选标定")
             if experimental
-            else "B-2 候选标定"
+            else self.bt("B-2 Calibration Candidate", "B-2 候选标定")
         )
         self.resize(1180, 760)
         root = QVBoxLayout(self)
 
         warning = QLabel(
-            "实验性候选，仅供诊断"
+            self.bt("Experimental candidate — diagnostics only", "实验性候选，仅供诊断")
             if experimental
-            else "候选求解结果，尚未应用"
+            else self.bt("Candidate result — not applied", "候选求解结果，尚未应用")
         )
         warning.setStyleSheet(
             "QLabel { color: #b45309; font-size: 17px; "
@@ -1219,23 +1417,36 @@ class CalibrationCandidateDialog(QDialog):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         actions.addWidget(path_label, 1)
-        export_button = QPushButton("导出报告")
+        export_button = QPushButton(self.bt("Export Report", "导出报告"))
         export_button.clicked.connect(self.export_report)
-        self.apply_candidate_button = QPushButton("应用候选标定")
+        self.apply_candidate_button = QPushButton(
+            self.bt("Apply Calibration Candidate", "应用候选标定")
+        )
         self.apply_candidate_button.setEnabled(False)
         self.apply_candidate_button.setToolTip(
             (
-                "experimental 候选禁止写入正式配置。"
+                self.bt(
+                    "Experimental candidates cannot write the formal configuration.",
+                    "experimental 候选禁止写入正式配置。",
+                )
                 if experimental
-                else "本阶段未启用正式应用流程。"
+                else self.bt(
+                    "The formal apply workflow is not enabled in this phase.",
+                    "本阶段未启用正式应用流程。",
+                )
             )
         )
-        close_button = QPushButton("返回采样向导补拍")
+        close_button = QPushButton(
+            self.bt("Return to Capture Wizard", "返回采样向导补拍")
+        )
         close_button.clicked.connect(self.accept)
         actions.addWidget(export_button)
         actions.addWidget(self.apply_candidate_button)
         actions.addWidget(close_button)
         root.addLayout(actions)
+
+    def bt(self, english: str, chinese: str, **kwargs: Any) -> str:
+        return bilingual(self.language, english, chinese, **kwargs)
 
     def _safety_notice_text(self) -> str:
         reasons = []
@@ -1246,44 +1457,78 @@ class CalibrationCandidateDialog(QDialog):
             used = int(result.get("used_sample_count", 0))
             outliers = int(result.get("outlier_count", 0))
             if result.get("status") != "success":
-                reasons.append(f"{name} 的镜头参数候选未成功生成。")
+                reasons.append(
+                    self.bt(
+                        "The lens-parameter candidate for {name} was not generated successfully.",
+                        "{name} 的镜头参数候选未成功生成。",
+                        name=name,
+                    )
+                )
             elif used and outliers / max(1, used + outliers) > 0.2:
-                reasons.append(f"{name} 的异常样本比例较高，需要补拍。")
+                reasons.append(
+                    self.bt(
+                        "{name} has a high outlier ratio; capture more samples.",
+                        "{name} 的异常样本比例较高，需要补拍。",
+                        name=name,
+                    )
+                )
         for name, result in self.candidate.get("stereo_pairs", {}).items():
             used = int(result.get("used_sample_count", 0))
             outliers = int(result.get("outlier_count", 0))
             if result.get("status") != "success":
                 reasons.append(
-                    f"{name.replace('__', ' ↔ ')} 的相机位置关系候选未成功生成。"
+                    self.bt(
+                        "The camera-pose candidate for {name} was not generated successfully.",
+                        "{name} 的相机位置关系候选未成功生成。",
+                        name=name.replace("__", " ↔ "),
+                    )
                 )
             elif used and outliers / max(1, used + outliers) > 0.2:
                 reasons.append(
-                    f"{name.replace('__', ' ↔ ')} 的异常样本比例较高。"
+                    self.bt(
+                        "{name} has a high outlier ratio.",
+                        "{name} 的异常样本比例较高。",
+                        name=name.replace("__", " ↔ "),
+                    )
                 )
         panorama = self.candidate.get("virtual_panorama") or {}
         if "rotation_only" in str(panorama.get("projection", "")):
             reasons.append(
-                "三台相机光心不重合；当前仅旋转全景优先保证远景，"
-                "近处人物和物体仍可能重影。"
+                self.bt(
+                    "The three optical centers do not coincide. The rotation-only panorama prioritizes the far field; nearby people and objects may still ghost.",
+                    "三台相机光心不重合；当前仅旋转全景优先保证远景，近处人物和物体仍可能重影。",
+                )
             )
         if not reasons:
-            reasons.append("候选尚未经过正式复核，本阶段不允许写入正式配置。")
-        unique_reasons = list(dict.fromkeys(str(reason) for reason in reasons))
+            reasons.append(
+                self.bt(
+                    "The candidate has not passed formal review and cannot write the formal configuration in this phase.",
+                    "候选尚未经过正式复核，本阶段不允许写入正式配置。",
+                )
+            )
+        unique_reasons = list(
+            dict.fromkeys(
+                quality_reason_text(str(reason), self.language)
+                for reason in reasons
+            )
+        )
         suggestions = [
-            rejection_advice(reason)
+            rejection_advice(reason, self.language)
             for reason in unique_reasons
-            if "光心不重合" not in reason
+            if "光心不重合" not in reason and "optical centers" not in reason
         ]
         unique_suggestions = list(dict.fromkeys(suggestions))
         return (
-            "为什么不能应用：\n• "
+            self.bt("Why it cannot be applied:\n• ", "为什么不能应用：\n• ")
             + "\n• ".join(unique_reasons)
-            + "\n\n下一步：\n• "
+            + self.bt("\n\nNext steps:\n• ", "\n\n下一步：\n• ")
             + "\n• ".join(
                 unique_suggestions
                 or [
-                    "在 Grid 或 Focus 中检查近景，补充相邻 Pair 的位置、"
-                    "距离和倾角覆盖后重新生成候选。"
+                    self.bt(
+                        "Inspect the near field in Multi-camera or Focus view, add adjacent-pair coverage across position, distance and tilt, then regenerate the candidate.",
+                        "在多路或聚焦视图中检查近景，补充相邻 Pair 的位置、距离和倾角覆盖后重新生成候选。",
+                    )
                 ]
             )
         )
@@ -1291,40 +1536,59 @@ class CalibrationCandidateDialog(QDialog):
     def _summary_text(self) -> str:
         lines = [
             (
-                "等级：experimental / report-only"
+                self.bt("Level: experimental / report-only", "等级：experimental / report-only")
                 if self.candidate.get("experimental")
-                else "等级：candidate / report-only"
+                else self.bt("Level: candidate / report-only", "等级：candidate / report-only")
             ),
-            f"Session：{self.candidate.get('session_id', '')}",
-            f"分辨率：{self.candidate.get('resolution', [])}",
-            f"Rig 完整：{'是' if self.candidate['rig']['complete'] else '否'}",
+            self.bt("Session: {value}", "Session：{value}", value=self.candidate.get("session_id", "")),
+            self.bt("Resolution: {value}", "分辨率：{value}", value=self.candidate.get("resolution", [])),
+            self.bt(
+                "Rig complete: {value}",
+                "Rig 完整：{value}",
+                value=self.bt("yes", "是") if self.candidate["rig"]["complete"] else self.bt("no", "否"),
+            ),
             "",
-            "候选内参：",
+            self.bt("Candidate intrinsics:", "候选内参："),
         ]
         for camera, result in self.candidate["intrinsics"].items():
             lines.append(
-                f"  {camera}: {result['status']}，"
-                f"RMS={result.get('rms_px')} px，"
-                f"使用 {result.get('used_sample_count', 0)}，"
-                f"异常 {result.get('outlier_count', 0)}"
+                self.bt(
+                    "  {camera}: {status}, RMS={rms} px, used {used}, outliers {outliers}",
+                    "  {camera}: {status}，RMS={rms} px，使用 {used}，异常 {outliers}",
+                    camera=camera,
+                    status=result["status"],
+                    rms=result.get("rms_px"),
+                    used=result.get("used_sample_count", 0),
+                    outliers=result.get("outlier_count", 0),
+                )
             )
         lines.append("")
-        lines.append("候选相邻相机关系：")
+        lines.append(self.bt("Candidate adjacent-camera poses:", "候选相邻相机关系："))
         for pair, result in self.candidate["stereo_pairs"].items():
             time_stats = result.get("time_delta_statistics", {})
             lines.append(
-                f"  {pair.replace('__', ' ↔ ')}: {result['status']}，"
-                f"RMS={result.get('rms_px')} px，"
-                f"使用 {result.get('used_sample_count', 0)}，"
-                f"异常 {result.get('outlier_count', 0)}，"
-                f"时间差风险 {time_stats.get('risk_count', 0)}"
+                self.bt(
+                    "  {pair}: {status}, RMS={rms} px, used {used}, outliers {outliers}, time-delta risks {risks}",
+                    "  {pair}: {status}，RMS={rms} px，使用 {used}，异常 {outliers}，时间差风险 {risks}",
+                    pair=pair.replace("__", " ↔ "),
+                    status=result["status"],
+                    rms=result.get("rms_px"),
+                    used=result.get("used_sample_count", 0),
+                    outliers=result.get("outlier_count", 0),
+                    risks=time_stats.get("risk_count", 0),
+                )
             )
         lines.extend(
             [
                 "",
-                "限制：Pair 仅有软件时间戳；近景物体存在物理视差。",
-                "补充 Pair 的位置、距离和倾角覆盖后，"
-                "才能申请正式可应用求解。",
+                self.bt(
+                    "Limit: pairs use software timestamps only; nearby objects have physical parallax.",
+                    "限制：Pair 仅有软件时间戳；近景物体存在物理视差。",
+                ),
+                self.bt(
+                    "Add pair coverage across position, distance and tilt before requesting a formally applicable solve.",
+                    "补充 Pair 的位置、距离和倾角覆盖后，才能申请正式可应用求解。",
+                ),
             ]
         )
         for issue in self.candidate["readiness"].get(
@@ -1347,15 +1611,15 @@ class CalibrationCandidateDialog(QDialog):
             if image is not None:
                 view.set_image(image, title)
             else:
-                view.set_placeholder("预览文件读取失败")
+                view.set_placeholder(self.bt("Preview file could not be read", "预览文件读取失败"))
         else:
-            view.set_placeholder("当前候选没有生成此预览")
+            view.set_placeholder(self.bt("This preview was not generated for the candidate", "当前候选没有生成此预览"))
         self.preview_tabs.addTab(view, title)
 
     def _add_candidate_previews(self) -> None:
         panorama = self.candidate.get("virtual_panorama") or {}
         files = panorama.get("files", {})
-        self._add_preview("候选全景", files.get("canvas"))
+        self._add_preview(self.bt("Candidate Panorama", "候选全景"), files.get("canvas"))
         for camera, path in files.get("remap_previews", {}).items():
             self._add_preview(f"Remap · {camera}", path)
         for pair, pair_files in files.get("pair_previews", {}).items():
@@ -1372,7 +1636,7 @@ class CalibrationCandidateDialog(QDialog):
     def export_report(self) -> None:
         selected = QFileDialog.getExistingDirectory(
             self,
-            "选择报告导出目录",
+            self.bt("Choose Report Export Directory", "选择报告导出目录"),
             str(PROJECT_ROOT),
         )
         if not selected:
@@ -1396,8 +1660,12 @@ class CalibrationCandidateDialog(QDialog):
             shutil.copytree(previews, target / "previews")
         QMessageBox.information(
             self,
-            "导出报告",
-            f"候选报告已导出到：\n{target}",
+            self.bt("Export Report", "导出报告"),
+            self.bt(
+                "Candidate report exported to:\n{target}",
+                "候选报告已导出到：\n{target}",
+                target=target,
+            ),
         )
 
 
@@ -1627,9 +1895,13 @@ class CameraRow:
 class MainWindow(QMainWindow):
     """Main studio window with preview, camera config, and calibration workspaces."""
 
-    def __init__(self):
+    def __init__(self, *, auto_preview_on_view_change: bool = False):
         super().__init__()
         self.setWindowTitle("DeepShark View Studio")
+
+        self.auto_preview_on_view_change = bool(auto_preview_on_view_change)
+        self._initial_auto_preview_requested = False
+        self._auto_preview_request_pending = False
 
         self.input_dir = PROJECT_ROOT / "samples" / "input"
         self.output_dir = PROJECT_ROOT / "samples" / "output"
@@ -1644,9 +1916,15 @@ class MainWindow(QMainWindow):
         self.stitch_processor = StitchProcessingManager()
         self.qgc_video_sink: FfmpegVideoSink | None = None
         self.qgc_output_active = False
+        self.qgc_output_state = "stopped"
         self.qgc_output_frames_written = 0
         self.qgc_output_last_error = ""
+        self.qgc_output_last_exit_code: int | None = None
+        self.qgc_output_effective_config: dict[str, Any] | None = None
+        self._qgc_last_reported_failure = ""
         self.runtime_stitch_config = RuntimeStitchConfig()
+        self._runtime_view_selection_dirty = False
+        self.active_project_manifest_path: Path | None = None
         self.runtime_layout_candidate: LayoutRuntimeCandidate | None = None
         self.far_field_layout_candidate: FarFieldLayoutRuntimeCandidate | None = None
         self.runtime_fisheye_intrinsics_source: FisheyeIntrinsicsRuntimeSource | None = None
@@ -1752,13 +2030,22 @@ class MainWindow(QMainWindow):
     def t(self, text: str, **kwargs: Any) -> str:
         return i18n(self.language, text, **kwargs)
 
+    def bt(self, english: str, chinese: str, **kwargs: Any) -> str:
+        return bilingual(self.language, english, chinese, **kwargs)
+
     def minimumSizeHint(self) -> QSize:  # noqa: N802
         hint = super().minimumSizeHint()
-        return QSize(min(hint.width(), 1500), min(hint.height(), 700))
+        return QSize(min(hint.width(), 900), min(hint.height(), 600))
 
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         self.ensure_window_frame_inside_available_screen()
+        if (
+            self.auto_preview_on_view_change
+            and not self._initial_auto_preview_requested
+        ):
+            self._initial_auto_preview_requested = True
+            self.schedule_selected_runtime_view_preview()
 
     def fit_initial_window_to_available_screen(self) -> None:
         screen = QApplication.primaryScreen()
@@ -2017,6 +2304,7 @@ class MainWindow(QMainWindow):
             self._commit_project_runtime_selection(
                 self._default_project_runtime_selection(None)
             )
+            self.active_project_manifest_path = None
             return (
                 (
                     "ERROR",
@@ -2026,6 +2314,9 @@ class MainWindow(QMainWindow):
             )
 
         self._commit_project_runtime_selection(selection)
+        self.active_project_manifest_path = (
+            None if defaults is None else Path(defaults.manifest_path)
+        )
         if defaults is None:
             return ()
         return (
@@ -2360,8 +2651,6 @@ class MainWindow(QMainWindow):
             fisheye_fov_scale=self.runtime_stitch_config.fisheye_fov_scale,
             auto_enabled=self.runtime_stitch_config.auto_enabled,
         )
-        if hasattr(self, "far_field_custom_layout_check"):
-            self.far_field_custom_layout_check.setChecked(True)
         if was_active_far_custom and not self.commit_live_runtime_selection(
             self.runtime_stitch_config,
             self.live_stitch_mode,
@@ -2505,14 +2794,18 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
 
     def selected_runtime_mode(self) -> StitchRuntimeMode:
-        if not hasattr(self, "runtime_mode_combo"):
+        if not hasattr(self, "runtime_view_combo"):
             return self.runtime_stitch_config.mode
-        return StitchRuntimeMode(str(self.runtime_mode_combo.currentData()))
+        return selection_for_preset(
+            self.selected_runtime_view_preset()
+        ).mode
 
     def selected_projection_source(self) -> ProjectionSource:
-        if not hasattr(self, "runtime_projection_combo"):
+        if not hasattr(self, "runtime_view_combo"):
             return self.runtime_stitch_config.projection_source
-        return ProjectionSource(str(self.runtime_projection_combo.currentData()))
+        return selection_for_preset(
+            self.selected_runtime_view_preset()
+        ).projection_source
 
     def selected_runtime_fisheye_params(self) -> tuple[float, float]:
         balance = (
@@ -2624,20 +2917,19 @@ class MainWindow(QMainWindow):
         self.live_candidate_directory = candidate_directory
         return candidate_directory
 
-    def apply_stitch_runtime_config(self) -> None:
-        mode = self.selected_runtime_mode()
-        projection = (
-            self.selected_projection_source()
-            if mode == StitchRuntimeMode.NEAR_FIELD
-            else ProjectionSource.CURRENT_PERSPECTIVE
+    def apply_stitch_runtime_config(self) -> bool:
+        view_selection = selection_for_preset(
+            self.selected_runtime_view_preset()
         )
+        mode = view_selection.mode
+        projection = view_selection.projection_source
         if projection == ProjectionSource.EQUIRECTANGULAR_CANDIDATE:
             QMessageBox.information(
                 self,
                 self.t("Stitch Runtime Mode"),
                 self.t("Projection candidate is research-only and not connected to runtime yet."),
             )
-            return
+            return False
         if (
             projection == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE
             and self.runtime_fisheye_intrinsics_source is None
@@ -2647,40 +2939,41 @@ class MainWindow(QMainWindow):
                 self.t("Stitch Runtime Mode"),
                 self.t("Fisheye Rectilinear projection requires a loaded fisheye intrinsics source."),
             )
-            return
+            return False
         if mode == StitchRuntimeMode.NEAR_FIELD and self.runtime_layout_candidate is None:
             QMessageBox.information(
                 self,
                 self.t("Stitch Runtime Mode"),
                 self.t("Near-field mode requires a loaded Layout Candidate V2."),
             )
-            return
-        use_far_field_custom = (
-            mode == StitchRuntimeMode.FAR_FIELD
-            and hasattr(self, "far_field_custom_layout_check")
-            and self.far_field_custom_layout_check.isChecked()
-        )
+            return False
+        if (
+            view_selection.preset == RuntimeViewPreset.B2_VIEW
+            and self.live_candidate_directory is None
+        ):
+            QMessageBox.information(
+                self,
+                self.t("Runtime View"),
+                self.t(
+                    "Current B-2 candidate view requires an available candidate directory."
+                ),
+            )
+            return False
+        use_far_field_custom = view_selection.use_far_field_custom_layout
         if use_far_field_custom and self.far_field_layout_candidate is None:
             QMessageBox.information(
                 self,
                 self.t("Stitch Runtime Mode"),
                 self.t("Far-field custom layout requires a loaded Far-field Layout Candidate."),
             )
-            return
+            return False
         if mode == StitchRuntimeMode.AUTO:
             QMessageBox.information(
                 self,
                 self.t("Stitch Runtime Mode"),
                 self.t("Auto stitch runtime mode is not implemented; falling back to Far-field."),
             )
-        target_live_stitch_mode = self.live_stitch_mode
-        if mode == StitchRuntimeMode.NEAR_FIELD and target_live_stitch_mode == "candidate":
-            target_live_stitch_mode = "template"
-            self.log(
-                self.t(
-                    "Near-field runtime uses current perspective warp; experimental candidate stitch was switched back to template."
-                )
-            )
+        target_live_stitch_mode = view_selection.live_stitch_strategy
         balance, fov_scale = self.selected_runtime_fisheye_params()
         next_runtime_config = RuntimeStitchConfig(
             mode=mode,
@@ -2705,18 +2998,21 @@ class MainWindow(QMainWindow):
             fisheye_fov_scale=fov_scale,
             auto_enabled=False,
         )
+        was_dirty = self._runtime_view_selection_dirty
+        self._runtime_view_selection_dirty = False
         if not self.commit_live_runtime_selection(
             next_runtime_config,
             target_live_stitch_mode,
             reason="runtime apply",
         ):
+            self._runtime_view_selection_dirty = was_dirty
             QMessageBox.warning(
                 self,
                 self.t("Stitch Runtime Mode"),
                 self.last_stitch_ui_error,
             )
             self.refresh_stitch_runtime_controls()
-            return
+            return False
         if self.preview_content_mode == PreviewContentMode.STILL and self.frames:
             self._process_and_render_frames("Static preview")
         if self.preview_layout_mode != PreviewLayoutMode.STITCHED:
@@ -2725,40 +3021,25 @@ class MainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage(self.t("Stitch Runtime Mode"))
+        return True
 
     def refresh_stitch_runtime_controls(self, sync_selection: bool = True) -> None:
         if not hasattr(self, "runtime_candidate_status"):
             return
-        if sync_selection and hasattr(self, "runtime_mode_combo"):
-            index = self.runtime_mode_combo.findData(self.runtime_stitch_config.mode.value)
+        if (
+            sync_selection
+            and not self._runtime_view_selection_dirty
+            and hasattr(self, "runtime_view_combo")
+        ):
+            preset = preset_for_runtime(
+                self.runtime_stitch_config,
+                self.live_stitch_mode,
+            )
+            index = self.runtime_view_combo.findData(preset.value)
             if index >= 0:
-                self.runtime_mode_combo.blockSignals(True)
-                self.runtime_mode_combo.setCurrentIndex(index)
-                self.runtime_mode_combo.blockSignals(False)
-        if hasattr(self, "runtime_projection_combo"):
-            if sync_selection:
-                index = self.runtime_projection_combo.findData(
-                    self.runtime_stitch_config.projection_source.value
-                )
-                if index >= 0:
-                    self.runtime_projection_combo.blockSignals(True)
-                    self.runtime_projection_combo.setCurrentIndex(index)
-                    self.runtime_projection_combo.blockSignals(False)
-            near_enabled = self.selected_runtime_mode() == StitchRuntimeMode.NEAR_FIELD
-            self.runtime_projection_combo.setEnabled(near_enabled)
-            if hasattr(self, "runtime_projection_note"):
-                far_custom_enabled = (
-                    self.selected_runtime_mode() == StitchRuntimeMode.FAR_FIELD
-                    and hasattr(self, "far_field_custom_layout_check")
-                    and self.far_field_custom_layout_check.isChecked()
-                )
-                self.runtime_projection_note.setText(
-                    self.t("Near-field Projection Source")
-                    if near_enabled
-                    else self.t("Far-field Custom uses B-2 candidate projection.")
-                    if far_custom_enabled
-                    else self.t("Far-field uses current runtime projection.")
-                )
+                self.runtime_view_combo.blockSignals(True)
+                self.runtime_view_combo.setCurrentIndex(index)
+                self.runtime_view_combo.blockSignals(False)
         if sync_selection and hasattr(self, "runtime_fisheye_balance"):
             self.runtime_fisheye_balance.blockSignals(True)
             self.runtime_fisheye_balance.setValue(float(self.runtime_stitch_config.fisheye_balance))
@@ -2767,12 +3048,6 @@ class MainWindow(QMainWindow):
             self.runtime_fisheye_fov_scale.blockSignals(True)
             self.runtime_fisheye_fov_scale.setValue(float(self.runtime_stitch_config.fisheye_fov_scale))
             self.runtime_fisheye_fov_scale.blockSignals(False)
-        if sync_selection and hasattr(self, "far_field_custom_layout_check"):
-            self.far_field_custom_layout_check.blockSignals(True)
-            self.far_field_custom_layout_check.setChecked(
-                bool(self.runtime_stitch_config.use_far_field_custom_layout)
-            )
-            self.far_field_custom_layout_check.blockSignals(False)
         if hasattr(self, "far_field_layout_candidate_status"):
             if self.far_field_layout_candidate is None:
                 self.far_field_layout_candidate_status.setText(
@@ -2820,42 +3095,125 @@ class MainWindow(QMainWindow):
                     str(self.layout_tuner_fisheye_intrinsics_source.path)
                 )
         if self.runtime_layout_candidate is None:
-            self.runtime_candidate_status.setText(self.t("No Layout Candidate V2 loaded."))
+            self.runtime_candidate_status.setText(
+                self.t("No Near Layout Candidate loaded.")
+            )
             self.runtime_candidate_status.setToolTip("")
+        else:
+            candidate = self.runtime_layout_candidate
+            lines = [
+                self.t("Loaded Layout Candidate V2"),
+                f"path: {candidate.path}",
+                f"schema_version: {candidate.schema_version}",
+                f"profile_id: {candidate.profile_id}",
+                f"projection: {candidate.projection.source.value}",
+                (
+                    "left_pair: "
+                    f"shift={candidate.left_pair.side_shift_px}, "
+                    f"side={candidate.left_pair.side_visible_fraction:.2f}, "
+                    f"feather={candidate.left_pair.feather_width_px}"
+                ),
+                (
+                    "right_pair: "
+                    f"shift={candidate.right_pair.side_shift_px}, "
+                    f"side={candidate.right_pair.side_visible_fraction:.2f}, "
+                    f"feather={candidate.right_pair.feather_width_px}"
+                ),
+                (
+                    "camera_adjust: "
+                    f"front scale={candidate.camera_adjust['front'].scale:.2f}, "
+                    f"x={candidate.camera_adjust['front'].x_offset_px}, "
+                    f"y={candidate.camera_adjust['front'].y_offset_px}"
+                ),
+            ]
+            if candidate.warnings:
+                lines.append("warnings: " + "; ".join(candidate.warnings))
+            self.runtime_candidate_status.setText(" · ".join(lines[2:5]))
+            self.runtime_candidate_status.setToolTip("\n".join(lines))
+        self.stitch_runtime_mode_panel.set_source_context(
+            self.selected_runtime_view_preset()
+        )
+        self.refresh_runtime_workflow_labels()
+
+    def refresh_runtime_workflow_labels(self) -> None:
+        if not hasattr(self, "runtime_effective_status_label"):
             return
-        candidate = self.runtime_layout_candidate
-        lines = [
-            self.t("Loaded Layout Candidate V2"),
-            f"path: {candidate.path}",
-            f"schema_version: {candidate.schema_version}",
-            f"profile_id: {candidate.profile_id}",
-            f"projection: {candidate.projection.source.value}",
-            (
-                "left_pair: "
-                f"shift={candidate.left_pair.side_shift_px}, "
-                f"side={candidate.left_pair.side_visible_fraction:.2f}, "
-                f"feather={candidate.left_pair.feather_width_px}"
+        descriptions = {
+            RuntimeViewPreset.FAR_DEFAULT: self.t(
+                "Far Default uses the current formal profile and perspective pipeline."
             ),
-            (
-                "right_pair: "
-                f"shift={candidate.right_pair.side_shift_px}, "
-                f"side={candidate.right_pair.side_visible_fraction:.2f}, "
-                f"feather={candidate.right_pair.feather_width_px}"
+            RuntimeViewPreset.B2_VIEW: self.t(
+                "B-2 View is an advanced diagnostic view of the B-2 per-camera candidate."
             ),
-            (
-                "camera_adjust: "
-                f"front scale={candidate.camera_adjust['front'].scale:.2f}, "
-                f"x={candidate.camera_adjust['front'].x_offset_px}, "
-                f"y={candidate.camera_adjust['front'].y_offset_px}"
+            RuntimeViewPreset.FAR_CUSTOM: self.t(
+                "Far Custom uses B-2 per-camera projection plus the loaded Far Custom layout."
             ),
-        ]
-        if candidate.warnings:
-            lines.append("warnings: " + "; ".join(candidate.warnings))
-        visible_lines = lines[:6]
-        if candidate.warnings:
-            visible_lines.append("warnings: " + "; ".join(candidate.warnings))
-        self.runtime_candidate_status.setText("\n".join(visible_lines))
-        self.runtime_candidate_status.setToolTip("\n".join(lines))
+            RuntimeViewPreset.NEAR_CURRENT: self.t(
+                "Near Current uses the loaded Near layout with current perspective projection."
+            ),
+            RuntimeViewPreset.NEAR_FISHEYE: self.t(
+                "Near Fisheye uses the loaded Near layout, fisheye intrinsics, and rectilinear projection."
+            ),
+        }
+        selected = self.selected_runtime_view_preset()
+        effective = preset_for_effective_status(self.effective_runtime_status())
+        self.runtime_selection_summary.setText(descriptions[selected])
+        label_key = (
+            "Selected, not applied: {view}"
+            if self._runtime_view_selection_dirty
+            else "Effective: {view}"
+        )
+        label_preset = selected if self._runtime_view_selection_dirty else effective
+        self.runtime_effective_status_label.setText(
+            self.t(label_key, view=self.runtime_view_display_name(label_preset))
+        )
+        if self.live_candidate_directory is None:
+            self.stitch_runtime_mode_panel.b2_candidate_status.setText(
+                self.t(
+                    "No B-2 candidate available. Create one in Calibration & Candidates."
+                )
+            )
+            self.stitch_runtime_mode_panel.b2_candidate_status.setToolTip("")
+        else:
+            self.stitch_runtime_mode_panel.b2_candidate_status.setText(
+                self.t(
+                    "B-2 candidate available: {path}",
+                    path=self.live_candidate_directory.name,
+                )
+            )
+            self.stitch_runtime_mode_panel.b2_candidate_status.setToolTip(
+                str(self.live_candidate_directory)
+            )
+
+    def runtime_view_display_name(self, preset: RuntimeViewPreset) -> str:
+        return {
+            RuntimeViewPreset.FAR_DEFAULT: self.t("Far Default"),
+            RuntimeViewPreset.B2_VIEW: self.t("B-2 View"),
+            RuntimeViewPreset.FAR_CUSTOM: self.t("Far Custom"),
+            RuntimeViewPreset.NEAR_CURRENT: self.t("Near Current"),
+            RuntimeViewPreset.NEAR_FISHEYE: self.t("Near Fisheye"),
+        }[preset]
+
+    def projection_source_display_name(self, source: str) -> str:
+        if source in {
+            "b2_candidate_projection",
+            B2_FAR_FIELD_PROJECTION_SOURCE,
+        }:
+            return self.t("B-2 per-camera projection")
+        if source == ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value:
+            return self.t("Fisheye Rectilinear")
+        if source == ProjectionSource.CURRENT_PERSPECTIVE.value:
+            return self.t("Current Perspective")
+        return str(source)
+
+    def calibration_candidate_state_display_name(self) -> str:
+        return {
+            "initial_template": self.t("Initial profile template"),
+            "applied": self.t("Applied calibration"),
+            "recommended": self.t("Recommended candidate"),
+            "experimental": self.t("Experimental candidate"),
+            "none": self.t("No candidate"),
+        }.get(self.calibration_candidate_state(), self.t("No candidate"))
 
     def process_frames_with_runtime_controller(
         self,
@@ -2941,12 +3299,54 @@ class MainWindow(QMainWindow):
         central_layout.addLayout(language_bar)
 
         self.root_tabs = QTabWidget()
-        self.root_tabs.addTab(self._build_preview_workspace(), self.t("Realtime Monitor"))
-        self.root_tabs.addTab(self._build_layout_tuner_workspace(), self.t("Layout Tuning"))
-        self.root_tabs.addTab(self._build_calibration_workspace(), self.t("Calibration & Candidates"))
-        self.root_tabs.addTab(self._build_projection_research_workspace(), self.t("Projection Research"))
-        self.root_tabs.addTab(self._build_project_management_workspace(), self.t("Project Management"))
-        self.root_tabs.addTab(self._build_diagnostics_workspace(), self.t("Diagnostics & Logs"))
+        self.root_tabs.tabBar().setUsesScrollButtons(True)
+        self.root_tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
+        root_pages = [
+            (
+                "realtime_monitor",
+                self._build_preview_workspace(),
+                self.t("Realtime Monitor"),
+                self.t(
+                    "Realtime monitor controls capture, display layout, and the effective runtime view."
+                ),
+            ),
+            (
+                "layout_lab",
+                self._build_layout_tuner_workspace(),
+                self.t("Layout Lab"),
+                self.t(
+                    "Layout Lab creates preview-only layout and projection candidates; it never edits formal calibration."
+                ),
+            ),
+            (
+                "calibration_candidates",
+                self._build_calibration_workspace(),
+                self.t("Calibration & Candidates"),
+                self.t(
+                    "Calibration & Candidates guides sample capture and B-2 candidate generation; advanced diagnostics remain secondary."
+                ),
+            ),
+            (
+                "project_management",
+                self._build_project_management_workspace(),
+                self.t("Project Management"),
+                self.t(
+                    "Project Management handles portable transfer, local configuration, and advanced output settings."
+                ),
+            ),
+            (
+                "diagnostics_logs",
+                self._build_diagnostics_workspace(),
+                self.t("Diagnostics & Logs"),
+                self.t(
+                    "Diagnostics & Logs is read-only operational evidence and troubleshooting output."
+                ),
+            ),
+        ]
+        for object_name, page, title, tooltip in root_pages:
+            page.setObjectName(object_name)
+            index = self.root_tabs.addTab(page, title)
+            self.root_tabs.setTabToolTip(index, tooltip)
         self.root_tabs.currentChanged.connect(self.on_root_tab_changed)
         central_layout.addWidget(self.root_tabs, 1)
         self.setCentralWidget(central)
@@ -2975,6 +3375,7 @@ class MainWindow(QMainWindow):
         self.camera_rows.clear()
         self.camera_views.clear()
         self.warped_views.clear()
+        self._runtime_view_selection_dirty = False
         self._build_ui()
         self.refresh_camera_count()
         self.statusBar().showMessage(self.t("Ready"))
@@ -3007,22 +3408,6 @@ class MainWindow(QMainWindow):
         )
         self.grid_view_button.setCheckable(True)
         self.stitched_view_button.setCheckable(True)
-        self.candidate_stitch_button = QPushButton(
-            self.t("B-2 Candidate View [Advanced]")
-        )
-        self.template_stitch_button = QPushButton(
-            self.t("Current Profile Template")
-        )
-        self.candidate_stitch_button.setCheckable(True)
-        self.template_stitch_button.setCheckable(True)
-        self.stitch_strategy_group = QButtonGroup(self)
-        self.stitch_strategy_group.setExclusive(True)
-        self.stitch_strategy_group.addButton(self.candidate_stitch_button)
-        self.stitch_strategy_group.addButton(self.template_stitch_button)
-        self.stitch_strategy_label = QLabel()
-        self.stitch_strategy_label.setStyleSheet(
-            "QLabel { color: #9a3412; font-weight: 600; padding: 0 8px; }"
-        )
         self.choose_input_dir_button.clicked.connect(self.choose_input_dir)
         self.load_images_button.clicked.connect(self.run_still_preview)
         self.start_live_button.clicked.connect(self.start_live_preview)
@@ -3037,12 +3422,6 @@ class MainWindow(QMainWindow):
         self.back_to_grid_button.clicked.connect(
             lambda: self.set_preview_layout_mode(PreviewLayoutMode.GRID)
         )
-        self.candidate_stitch_button.clicked.connect(
-            lambda: self.set_live_stitch_mode("candidate")
-        )
-        self.template_stitch_button.clicked.connect(
-            lambda: self.set_live_stitch_mode("template")
-        )
         source_toolbar.addWidget(self.choose_input_dir_button)
         source_toolbar.addWidget(self.load_images_button)
         source_toolbar.addWidget(self.start_live_button)
@@ -3050,9 +3429,8 @@ class MainWindow(QMainWindow):
         source_toolbar.addWidget(self.save_results_button)
         source_toolbar.addStretch(1)
         view_toolbar.addWidget(self.back_to_grid_button)
-        view_toolbar.addWidget(self.candidate_stitch_button)
-        view_toolbar.addWidget(self.template_stitch_button)
-        view_toolbar.addWidget(self.stitch_strategy_label)
+        view_toolbar.addWidget(self.grid_view_button)
+        view_toolbar.addWidget(self.stitched_view_button)
         view_toolbar.addWidget(self.preview_mode_label)
         view_toolbar.addWidget(self.input_path_label, 1)
         root.addLayout(source_toolbar)
@@ -3122,33 +3500,15 @@ class MainWindow(QMainWindow):
     def _build_layout_tuner_workspace(self) -> QWidget:
         return self._build_layout_tuner_page()
 
-    def _build_projection_research_workspace(self) -> QWidget:
-        page = QWidget()
-        root = QVBoxLayout(page)
-        root.setContentsMargins(6, 6, 6, 6)
-        overview = QGroupBox(self.t("Projection Research Overview"))
-        layout = QVBoxLayout(overview)
-        note = QLabel(self.t("Projection Research Note"))
-        note.setWordWrap(True)
-        note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(note)
-        location_note = QLabel(
-            self.t(
-                "Runtime projection controls remain in Realtime Monitor for current preview switching; layout-specific projection controls are in Layout Tuning."
-            )
-        )
-        location_note.setWordWrap(True)
-        location_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(location_note)
-        root.addWidget(overview)
-        root.addStretch(1)
-        return page
-
     def _build_project_management_workspace(self) -> QWidget:
         tabs = QTabWidget()
-        tabs.addTab(self._build_camera_config_workspace(), self.t("Camera & Runtime Config"))
-        tabs.addTab(self._build_project_workspace(), self.t("Project Files"))
-        tabs.addTab(self._build_qgc_video_output_workspace(), self.t("QGC Video Output"))
+        tabs.tabBar().setUsesScrollButtons(True)
+        tabs.addTab(self._build_project_workspace(), self.t("Project & Portability"))
+        tabs.addTab(self._build_camera_config_workspace(), self.t("Camera Setup"))
+        tabs.addTab(
+            self._build_qgc_video_output_workspace(),
+            self.t("QGC Video Output [Advanced]"),
+        )
         return tabs
 
     def _build_diagnostics_workspace(self) -> QWidget:
@@ -3162,16 +3522,14 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self.stitch_runtime_mode_panel = panel
-        self.runtime_mode_combo = panel.runtime_mode_combo
-        self.runtime_projection_label = panel.runtime_projection_label
-        self.runtime_projection_note = panel.runtime_projection_note
-        self.runtime_projection_combo = panel.runtime_projection_combo
+        self.runtime_view_combo = panel.runtime_view_combo
+        self.runtime_selection_summary = panel.runtime_selection_summary
+        self.runtime_effective_status_label = panel.runtime_effective_status_label
         self.runtime_fisheye_balance = panel.runtime_fisheye_balance
         self.runtime_fisheye_fov_scale = panel.runtime_fisheye_fov_scale
         self.runtime_load_fisheye_button = panel.runtime_load_fisheye_button
         self.runtime_clear_fisheye_button = panel.runtime_clear_fisheye_button
         self.runtime_fisheye_source_status = panel.runtime_fisheye_source_status
-        self.far_field_custom_layout_check = panel.far_field_custom_layout_check
         self.far_field_layout_candidate_status = panel.far_field_layout_candidate_status
         self.far_field_load_candidate_button = panel.far_field_load_candidate_button
         self.far_field_clear_candidate_button = panel.far_field_clear_candidate_button
@@ -3180,8 +3538,11 @@ class MainWindow(QMainWindow):
         self.runtime_clear_candidate_button = panel.runtime_clear_candidate_button
         self.runtime_open_candidate_button = panel.runtime_open_candidate_button
         self.runtime_apply_button = panel.runtime_apply_button
-        self.runtime_mode_combo.currentIndexChanged.connect(
-            lambda _index: self.refresh_stitch_runtime_controls(sync_selection=False)
+        self.runtime_apply_button.setVisible(
+            not self.auto_preview_on_view_change
+        )
+        self.runtime_view_combo.currentIndexChanged.connect(
+            self.on_runtime_view_preset_changed
         )
         self.runtime_load_candidate_button.clicked.connect(
             self.choose_runtime_layout_candidate
@@ -3204,12 +3565,61 @@ class MainWindow(QMainWindow):
         self.far_field_clear_candidate_button.clicked.connect(
             self.clear_far_field_layout_candidate
         )
-        self.far_field_custom_layout_check.toggled.connect(
-            lambda _checked: self.refresh_stitch_runtime_controls(sync_selection=False)
-        )
         self.runtime_apply_button.clicked.connect(self.apply_stitch_runtime_config)
         self.refresh_stitch_runtime_controls()
         return panel
+
+    def selected_runtime_view_preset(self) -> RuntimeViewPreset:
+        if not hasattr(self, "runtime_view_combo"):
+            return preset_for_runtime(
+                self.runtime_stitch_config,
+                self.live_stitch_mode,
+            )
+        return RuntimeViewPreset(str(self.runtime_view_combo.currentData()))
+
+    def on_runtime_view_preset_changed(self, _index: int) -> None:
+        selection = selection_for_preset(self.selected_runtime_view_preset())
+        self._runtime_view_selection_dirty = True
+        self.stitch_runtime_mode_panel.set_source_context(selection.preset)
+        if (
+            selection.requires_b2_candidate
+            or selection.requires_far_layout_candidate
+            or selection.requires_near_layout_candidate
+            or selection.requires_fisheye_intrinsics
+        ):
+            self.stitch_runtime_mode_panel.runtime_details_toggle.setChecked(True)
+        self.refresh_stitch_runtime_controls(sync_selection=False)
+        if self.auto_preview_on_view_change:
+            self.schedule_selected_runtime_view_preview()
+
+    def schedule_selected_runtime_view_preview(self) -> None:
+        """Coalesce selector changes and apply the latest choice on the UI loop."""
+
+        if self._auto_preview_request_pending:
+            return
+        self._auto_preview_request_pending = True
+        QTimer.singleShot(0, self._run_scheduled_runtime_view_preview)
+
+    def _run_scheduled_runtime_view_preview(self) -> None:
+        self._auto_preview_request_pending = False
+        if not self.auto_preview_on_view_change or not self.isVisible():
+            return
+        self.ensure_selected_runtime_view_live()
+
+    def ensure_selected_runtime_view_live(self) -> bool:
+        """Apply the selected runtime view and ensure capture is running once."""
+
+        if (
+            self._runtime_view_selection_dirty
+            and not self.apply_stitch_runtime_config()
+        ):
+            return False
+        if (
+            self.preview_content_mode == PreviewContentMode.LIVE
+            and self.stream_manager.has_active_workers()
+        ):
+            return True
+        return self.start_live_preview()
 
     def _build_layout_tuner_page(self) -> QWidget:
         page = QWidget()
@@ -4286,58 +4696,53 @@ class MainWindow(QMainWindow):
         return page
 
     def _build_project_workspace(self) -> QWidget:
-        page = QWidget()
-        root = QVBoxLayout(page)
+        panel = ProjectManagementPanel(self.t, parent=self)
+        self.project_management_panel = panel
+        if self.active_project_manifest_path is not None:
+            panel.active_project_status.setText(
+                self.t(
+                    "Active portable package: {path}",
+                    path=self.active_project_manifest_path,
+                )
+            )
+        self.project_status = panel.project_status
+        self.project_package_export_button = panel.project_package_export_button
+        self.project_package_import_button = panel.project_package_import_button
+        self.project_package_validate_button = panel.project_package_validate_button
 
-        group = QGroupBox(self.t("Project Management"))
-        layout = QVBoxLayout(group)
-        self.project_status = QLabel(self.t("No project file loaded. Current configs are stored in configs/*.yaml."))
-        self.project_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.project_status)
-
-        buttons = QHBoxLayout()
-        save_project_button = QPushButton(self.t("Save Project As"))
-        open_project_button = QPushButton(self.t("Open Project"))
-        backup_button = QPushButton(self.t("Backup Current Configs"))
-        export_runtime_button = QPushButton(self.t("Export Runtime Config"))
-        self.project_package_export_button = QPushButton(self.t("Export Project Package"))
-        self.project_package_import_button = QPushButton(self.t("Import Project Package"))
-        self.project_package_validate_button = QPushButton(self.t("Validate Project Package"))
-        export_runtime_button.setText(
-            f"{self.t('Export Runtime Config')} [{self.t('Experimental')}]"
+        panel.save_legacy_project_button.clicked.connect(self.save_project_as)
+        panel.open_legacy_project_button.clicked.connect(self.open_project_file)
+        panel.backup_configs_button.clicked.connect(self.backup_current_configs)
+        panel.export_runtime_button.clicked.connect(self.export_runtime_config_file)
+        self.project_package_export_button.clicked.connect(
+            self.export_project_package_file
         )
-        export_runtime_button.setToolTip(
-            "高级/实验性入口：用于未来服务或 QGC 桥接，"
-            "不会自动部署或应用到运行设备。"
+        self.project_package_import_button.clicked.connect(
+            self.import_project_package_file
         )
-        save_project_button.clicked.connect(self.save_project_as)
-        open_project_button.clicked.connect(self.open_project_file)
-        backup_button.clicked.connect(self.backup_current_configs)
-        export_runtime_button.clicked.connect(self.export_runtime_config_file)
-        self.project_package_export_button.clicked.connect(self.export_project_package_file)
-        self.project_package_import_button.clicked.connect(self.import_project_package_file)
-        self.project_package_validate_button.clicked.connect(self.validate_project_package_file)
-        buttons.addWidget(save_project_button)
-        buttons.addWidget(open_project_button)
-        buttons.addWidget(backup_button)
-        buttons.addWidget(self.project_package_export_button)
-        buttons.addWidget(self.project_package_import_button)
-        buttons.addWidget(self.project_package_validate_button)
-        buttons.addWidget(export_runtime_button)
-        buttons.addStretch(1)
-        layout.addLayout(buttons)
+        self.project_package_validate_button.clicked.connect(
+            self.validate_project_package_file
+        )
+        self.project_management_scroll_area = QScrollArea()
+        self.project_management_scroll_area.setWidgetResizable(True)
+        self.project_management_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.project_management_scroll_area.setWidget(panel)
+        return self.project_management_scroll_area
 
-        root.addWidget(group)
-        notes = QTextEdit()
-        notes.setReadOnly(True)
-        notes.setText(self.t(
-            "Project files bundle calibration.yaml, cameras.yaml, and network.yaml into one portable .dsvs.yaml file.\n\n"
-            "Use backups before large calibration or seam edits. Runtime export is the compact configuration intended for a future service/QGC bridge."
-        ) + "\n\n" + self.t(
-            "Project Package exports configs and active candidates into a folder with package-relative paths. Import validates first; activation backs up current configs before replacing them."
-        ))
-        root.addWidget(notes, 1)
-        return page
+    def refresh_project_active_status(self) -> None:
+        if not hasattr(self, "project_management_panel"):
+            return
+        text = (
+            self.t(
+                "Active portable package: {path}",
+                path=self.active_project_manifest_path,
+            )
+            if self.active_project_manifest_path is not None
+            else self.t("Using local configs; no portable package is active.")
+        )
+        self.project_management_panel.active_project_status.setText(text)
 
     @staticmethod
     def _default_qgc_output_url(kind: str) -> str:
@@ -4435,8 +4840,12 @@ class MainWindow(QMainWindow):
         note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(note)
 
-        save_button = QPushButton(self.t("Save QGC Output Settings"))
-        save_button.clicked.connect(self.save_qgc_video_output_settings)
+        self.qgc_output_save_button = QPushButton(
+            self.t("Save QGC Output Settings")
+        )
+        self.qgc_output_save_button.clicked.connect(
+            self.save_qgc_video_output_settings
+        )
         self.qgc_output_start_button = QPushButton(self.t("Start QGC Output Service"))
         self.qgc_output_start_button.setToolTip(
             self.t(
@@ -4451,7 +4860,7 @@ class MainWindow(QMainWindow):
         self.qgc_output_start_button.clicked.connect(self.start_qgc_output_service)
         self.qgc_output_stop_button.clicked.connect(self.stop_qgc_output_service)
         row = QHBoxLayout()
-        row.addWidget(save_button)
+        row.addWidget(self.qgc_output_save_button)
         row.addWidget(self.qgc_output_start_button)
         row.addWidget(self.qgc_output_stop_button)
         row.addStretch(1)
@@ -5068,21 +5477,36 @@ class MainWindow(QMainWindow):
         prepare_page = QWidget()
         prepare_layout = QVBoxLayout(prepare_page)
         prepare_text = QLabel(
-            "开始前请完成以下检查。本步骤只确认现场条件，不会修改相机或运行配置。\n\n"
-            "• 固定三台相机，整个采集过程中不要移动支架。\n"
-            "• 保持 1920×1080，不改焦距、电子防抖或画面裁切。\n"
-            "• 标定板必须平整，避免反光、运动模糊和剧烈光照变化。"
+            self.bt(
+                "Complete these checks before starting. This step only confirms site conditions; it does not change camera or runtime configuration.\n\n"
+                "• Secure all three cameras and do not move the rig during capture.\n"
+                "• Keep 1920×1080 and do not change focus, electronic stabilization or cropping.\n"
+                "• Keep the calibration board flat and avoid glare, motion blur and major lighting changes.",
+                "开始前请完成以下检查。本步骤只确认现场条件，不会修改相机或运行配置。\n\n"
+                "• 固定三台相机，整个采集过程中不要移动支架。\n"
+                "• 保持 1920×1080，不改焦距、电子防抖或画面裁切。\n"
+                "• 标定板必须平整，避免反光、运动模糊和剧烈光照变化。",
+            )
         )
         prepare_text.setWordWrap(True)
         prepare_layout.addWidget(prepare_text)
         self.wizard_camera_fixed_check = QCheckBox(
-            "三台相机和支架已经固定"
+            self.bt(
+                "All three cameras and the rig are secured",
+                "三台相机和支架已经固定",
+            )
         )
         self.wizard_resolution_check = QCheckBox(
-            "已确认三路原始画面均为 1920×1080"
+            self.bt(
+                "All three raw camera feeds are confirmed at 1920×1080",
+                "已确认三路原始画面均为 1920×1080",
+            )
         )
         self.wizard_board_ready_check = QCheckBox(
-            "标定板平整、清晰，现场光线稳定"
+            self.bt(
+                "The board is flat and sharp, and lighting is stable",
+                "标定板平整、清晰，现场光线稳定",
+            )
         )
         prepare_layout.addWidget(self.wizard_camera_fixed_check)
         prepare_layout.addWidget(self.wizard_resolution_check)
@@ -5093,13 +5517,18 @@ class MainWindow(QMainWindow):
         board_page = QWidget()
         board_layout = QVBoxLayout(board_page)
         board_intro = QLabel(
-            "请选择实际使用的标定板并填写实测参数。程序不会根据画面猜测尺寸或字典。"
+            self.bt(
+                "Select the physical calibration board and enter its measured parameters. The application will not infer dimensions or dictionaries from the image.",
+                "请选择实际使用的标定板并填写实测参数。程序不会根据画面猜测尺寸或字典。",
+            )
         )
         board_intro.setWordWrap(True)
         board_layout.addWidget(board_intro)
         self.wizard_board_hint = QLabel(
-            "实验室棋盘默认：总格 12×9，对应内角点 11×8，"
-            "方格边长 25mm。请按实物核对后再确认。"
+            self.bt(
+                "Lab chessboard default: 12×9 total squares, 11×8 inner corners, 25 mm square size. Verify against the physical board before confirming.",
+                "实验室棋盘默认：总格 12×9，对应内角点 11×8，方格边长 25mm。请按实物核对后再确认。",
+            )
         )
         self.wizard_board_hint.setWordWrap(True)
         self.wizard_board_hint.setStyleSheet(
@@ -5135,14 +5564,17 @@ class MainWindow(QMainWindow):
         self.wizard_dictionary = NoWheelComboBox()
         self.wizard_dictionary.addItems(supported_aruco_dictionaries())
         self.wizard_board_confirmed = QCheckBox(
-            "我已核对标定板类型、行列数、尺寸和字典"
+            self.bt(
+                "I verified the board type, rows, columns, dimensions and dictionary",
+                "我已核对标定板类型、行列数、尺寸和字典",
+            )
         )
-        self.wizard_columns_label = QLabel("内角点列数")
-        self.wizard_rows_label = QLabel("内角点行数")
-        self.wizard_square_label = QLabel("方格边长")
-        self.wizard_marker_label = QLabel("Charuco Marker 边长")
-        self.wizard_separation_label = QLabel("Marker 间距")
-        board_form.addRow("标定板类型", self.wizard_board_type)
+        self.wizard_columns_label = QLabel(self.bt("Inner corner columns", "内角点列数"))
+        self.wizard_rows_label = QLabel(self.bt("Inner corner rows", "内角点行数"))
+        self.wizard_square_label = QLabel(self.bt("Square size", "方格边长"))
+        self.wizard_marker_label = QLabel(self.bt("Charuco marker length", "Charuco Marker 边长"))
+        self.wizard_separation_label = QLabel(self.bt("Marker separation", "Marker 间距"))
+        board_form.addRow(self.bt("Board type", "标定板类型"), self.wizard_board_type)
         board_form.addRow(
             self.wizard_columns_label,
             self.wizard_board_columns,
@@ -5163,12 +5595,16 @@ class MainWindow(QMainWindow):
             self.wizard_separation_label,
             self.wizard_marker_separation,
         )
-        board_form.addRow("ArUco 字典", self.wizard_dictionary)
+        board_form.addRow(self.bt("ArUco dictionary", "ArUco 字典"), self.wizard_dictionary)
         board_form.addRow(self.wizard_board_confirmed)
         board_layout.addLayout(board_form)
         board_actions = QHBoxLayout()
-        self.wizard_create_session_button = QPushButton("创建新采集会话")
-        self.wizard_load_session_button = QPushButton("继续已有会话")
+        self.wizard_create_session_button = QPushButton(
+            self.bt("Create Capture Session", "创建新采集会话")
+        )
+        self.wizard_load_session_button = QPushButton(
+            self.bt("Resume Existing Session", "继续已有会话")
+        )
         self.wizard_create_session_button.clicked.connect(
             self.wizard_create_session
         )
@@ -5179,7 +5615,9 @@ class MainWindow(QMainWindow):
         board_actions.addWidget(self.wizard_load_session_button)
         board_actions.addStretch(1)
         board_layout.addLayout(board_actions)
-        self.wizard_session_label = QLabel("尚未创建或加载采集会话")
+        self.wizard_session_label = QLabel(
+            self.bt("No capture session created or loaded", "尚未创建或加载采集会话")
+        )
         self.wizard_session_label.setWordWrap(True)
         board_layout.addWidget(self.wizard_session_label)
         board_layout.addStretch(1)
@@ -5191,10 +5629,14 @@ class MainWindow(QMainWindow):
         intrinsic_page = QWidget()
         intrinsic_layout = QVBoxLayout(intrinsic_page)
         intrinsic_intro = QLabel(
-            "按 front_left → front → front_right 的顺序采集。一次只需要一台相机看见板。\n"
-            "这里采集的是“每台相机自己的镜头畸变参数”。"
-            "把板移动到画面中心、四边和四角，同时改变距离和倾斜方向。\n"
-            "若样本被拒绝，请按进度框中的“建议”调整后再次主动采集。"
+            self.bt(
+                "Capture in front_left → front → front_right order. Only one camera needs to see the board at a time.\n"
+                "This captures each camera's own lens-distortion parameters. Move the board through the center, edges and corners while varying distance and tilt.\n"
+                "If a sample is rejected, follow the recommendation in the progress box and capture again.",
+                "按 front_left → front → front_right 的顺序采集。一次只需要一台相机看见板。\n"
+                "这里采集的是“每台相机自己的镜头畸变参数”。把板移动到画面中心、四边和四角，同时改变距离和倾斜方向。\n"
+                "若样本被拒绝，请按进度框中的“建议”调整后再次主动采集。",
+            )
         )
         intrinsic_intro.setWordWrap(True)
         intrinsic_layout.addWidget(intrinsic_intro)
@@ -5202,8 +5644,12 @@ class MainWindow(QMainWindow):
         self.wizard_intrinsic_camera = NoWheelComboBox()
         for camera in ("front_left", "front", "front_right"):
             self.wizard_intrinsic_camera.addItem(camera, camera)
-        self.wizard_capture_intrinsic_button = QPushButton("采集当前相机样本")
-        self.wizard_next_camera_button = QPushButton("下一台相机")
+        self.wizard_capture_intrinsic_button = QPushButton(
+            self.bt("Capture Current Camera Sample", "采集当前相机样本")
+        )
+        self.wizard_next_camera_button = QPushButton(
+            self.bt("Next Camera", "下一台相机")
+        )
         self.wizard_capture_intrinsic_button.clicked.connect(
             self.wizard_capture_intrinsic
         )
@@ -5223,11 +5669,14 @@ class MainWindow(QMainWindow):
         pair_page = QWidget()
         pair_layout = QVBoxLayout(pair_page)
         pair_intro = QLabel(
-            "先采 front_left ↔ front，再采 front ↔ front_right。\n"
-            "Pair 用于求出“相邻两台相机之间的位置和朝向关系”。"
-            "每次必须让同一块物理标定板同时出现在所选两路中。两个 pair "
-            "可以使用不同标定板，也不要求两块板之间位置固定。\n"
-            "采集前让板停稳约 1 秒，并覆盖重叠区域的不同位置、距离和倾角。"
+            self.bt(
+                "Capture front_left ↔ front first, then front ↔ front_right.\n"
+                "A pair determines the relative position and orientation of adjacent cameras. The same physical board must appear in both selected feeds for each capture. The two pairs may use different boards.\n"
+                "Hold the board still for about one second and cover varied positions, distances and tilts within the overlap.",
+                "先采 front_left ↔ front，再采 front ↔ front_right。\n"
+                "Pair 用于求出“相邻两台相机之间的位置和朝向关系”。每次必须让同一块物理标定板同时出现在所选两路中。两个 pair 可以使用不同标定板，也不要求两块板之间位置固定。\n"
+                "采集前让板停稳约 1 秒，并覆盖重叠区域的不同位置、距离和倾角。",
+            )
         )
         pair_intro.setWordWrap(True)
         pair_layout.addWidget(pair_intro)
@@ -5246,10 +5695,13 @@ class MainWindow(QMainWindow):
         )
         self.wizard_pair_board_id = QLineEdit("board_1")
         self.wizard_pair_board_confirmed = QCheckBox(
-            "确认两路看到的是同一块物理板"
+            self.bt(
+                "Both feeds show the same physical board",
+                "确认两路看到的是同一块物理板",
+            )
         )
         pair_controls.addWidget(self.wizard_pair)
-        pair_controls.addWidget(QLabel("标定板编号"))
+        pair_controls.addWidget(QLabel(self.bt("Board ID", "标定板编号")))
         pair_controls.addWidget(self.wizard_pair_board_id)
         pair_controls.addWidget(self.wizard_pair_board_confirmed)
         pair_layout.addLayout(pair_controls)
@@ -5257,8 +5709,12 @@ class MainWindow(QMainWindow):
         self.wizard_inspect_pair_button = QPushButton(
             self.t("Check Current Pair")
         )
-        self.wizard_capture_pair_button = QPushButton("保存这组 Pair 样本")
-        self.wizard_next_pair_button = QPushButton("下一个 Pair")
+        self.wizard_capture_pair_button = QPushButton(
+            self.bt("Save This Pair Sample", "保存这组 Pair 样本")
+        )
+        self.wizard_next_pair_button = QPushButton(
+            self.bt("Next Pair", "下一个 Pair")
+        )
         self.wizard_inspect_pair_button.clicked.connect(
             self.wizard_inspect_pair
         )
@@ -5274,7 +5730,10 @@ class MainWindow(QMainWindow):
         pair_actions.addStretch(1)
         pair_layout.addLayout(pair_actions)
         self.wizard_pair_detection_status = QLabel(
-            "尚未检查当前两路画面。检查不会保存图片。"
+            self.bt(
+                "The current pair has not been checked. Checking does not save images.",
+                "尚未检查当前两路画面。检查不会保存图片。",
+            )
         )
         self.wizard_pair_detection_status.setWordWrap(True)
         pair_layout.addWidget(self.wizard_pair_detection_status)
@@ -5297,7 +5756,7 @@ class MainWindow(QMainWindow):
         self.wizard_review_summary = QTextEdit()
         self.wizard_review_summary.setReadOnly(True)
         review_layout.addWidget(self.wizard_review_summary, 1)
-        self.wizard_details_group = QGroupBox("详细信息")
+        self.wizard_details_group = QGroupBox(self.bt("Details", "详细信息"))
         self.wizard_details_group.setCheckable(True)
         self.wizard_details_group.setChecked(False)
         details_layout = QVBoxLayout(self.wizard_details_group)
@@ -5310,8 +5769,10 @@ class MainWindow(QMainWindow):
         details_layout.addWidget(self.wizard_details_text)
         review_layout.addWidget(self.wizard_details_group)
         note = QLabel(
-            "本阶段只确认样本是否足够。B-2 将读取本 session 生成候选标定，"
-            "当前不会修改正式拼接参数。"
+            self.bt(
+                "This phase only checks whether samples are sufficient. B-2 reads this session to generate a calibration candidate; formal stitch parameters are not changed here.",
+                "本阶段只确认样本是否足够。B-2 将读取本 session 生成候选标定，当前不会修改正式拼接参数。",
+            )
         )
         note.setWordWrap(True)
         review_layout.addWidget(note)
@@ -5533,16 +5994,34 @@ class MainWindow(QMainWindow):
     def preview_warning_messages(self) -> list[str]:
         warnings: list[str] = []
         if self.source_contract_log_messages:
-            warnings.append("source 坐标存在警告，请查看日志和拓扑诊断")
+            warnings.append(
+                self.t(
+                    "Source-coordinate warnings are present; see Diagnostics & Logs."
+                )
+            )
         seam_errors = validate_overlap_seams(self.current_stitch_profile())
         if seam_errors:
-            warnings.append("当前 profile 的 overlap/seam 校验未通过")
+            warnings.append(
+                self.t("The current profile failed overlap/seam validation.")
+            )
         if self.last_stitch_ui_error:
-            warnings.append(f"最近一次拼接失败：{self.last_stitch_ui_error}")
-        warnings.extend(self.last_runtime_warnings)
-        warnings.extend(self.runtime_stitch_config.runtime_warnings())
+            warnings.append(
+                self.t(
+                    "The latest stitch failed: {error}",
+                    error=self.last_stitch_ui_error,
+                )
+            )
+        warnings.extend(self.t(message) for message in self.last_runtime_warnings)
+        warnings.extend(
+            self.t(message)
+            for message in self.runtime_stitch_config.runtime_warnings()
+        )
         if self.runtime_configuration_pending():
-            warnings.append("运行配置有待应用；当前结果仍来自已配置 worker")
+            warnings.append(
+                self.t(
+                    "Runtime configuration is pending; the current result still comes from the configured worker."
+                )
+            )
         state = self.stitch_processor.state()
         if (
             self.last_runtime_result_session_id == self.preview_session_id
@@ -5551,56 +6030,83 @@ class MainWindow(QMainWindow):
             and state.session_id == self.preview_session_id
             and state.runtime_status != self.last_runtime_stitch_status
         ):
-            warnings.append("worker 配置状态与最近结果状态不一致")
+            warnings.append(
+                self.t("Worker configuration and the latest result disagree.")
+            )
         candidate = self.current_candidate_metadata()
         if self.calibration_candidate_state() == "experimental":
-            warnings.append("当前候选为 experimental，仅供诊断")
+            warnings.append(
+                self.t(
+                    "The active candidate is experimental and intended for diagnostics only."
+                )
+            )
         readiness = candidate.get("readiness", {})
         quality_issues = readiness.get("quality_issues", [])
         if quality_issues:
-            warnings.append(f"候选仍有 {len(quality_issues)} 项采样质量风险")
+            warnings.append(
+                self.t(
+                    "The candidate still has {count} sampling-quality risks.",
+                    count=len(quality_issues),
+                )
+            )
         panorama = candidate.get("virtual_panorama") or {}
         if (
             self.effective_runtime_status() == "b2_candidate_view"
             and "rotation_only" in str(panorama.get("projection", ""))
         ):
-            warnings.append("三台相机非共光心：远景优先，近景可能重影")
+            warnings.append(
+                self.t(
+                    "The cameras are not co-located: this view prioritizes distance and may ghost nearby objects."
+                )
+            )
         if self.calibration_session is not None:
             readiness = self.calibration_session.readiness()
             if readiness["blocking_reasons"]:
-                warnings.append("当前采集 session 尚未满足 B-2 最低门槛")
+                warnings.append(
+                    self.t(
+                        "The current capture session has not reached the minimum B-2 gate."
+                    )
+                )
             elif readiness["quality_issues"]:
-                warnings.append("当前采集 session 的 Pair/姿态覆盖仍需补充")
+                warnings.append(
+                    self.t(
+                        "The current capture session still needs more pair/pose coverage."
+                    )
+                )
         return list(dict.fromkeys(warnings))
 
     def stitched_view_notice_text(self) -> str:
         if self.preview_content_mode == PreviewContentMode.STOPPED:
-            return "实时预览已停止。当前布局偏好已保留，启动后才会继续刷新。"
+            return self.t(
+                "Live preview is stopped. The selected display layout is preserved for the next start."
+            )
         if self.preview_content_mode == PreviewContentMode.STILL:
-            return "静态拼接画面：用于检查图片，不代表实时流状态。"
+            return self.t(
+                "Static stitch view checks loaded images and does not represent live-stream health."
+            )
         runtime_status = self.effective_runtime_status()
         if runtime_status == "near_field_current_perspective":
-            return (
-                "近景优先拼接：使用只读 Layout Candidate V2、当前 perspective warp、"
-                "front-priority layout。适合近景物体靠近接缝时手动对比。"
+            return self.t(
+                "Near Current uses the read-only Near layout, current perspective warp, and front-priority composition."
             )
         if runtime_status == "near_field_fisheye_rectilinear":
-            return (
-                "近景优先拼接：使用只读 Layout Candidate V2 与 Fisheye "
-                "Rectilinear 投影。请重点检查边缘拉伸与接缝近物体。"
+            return self.t(
+                "Near Fisheye uses the read-only Near layout and Fisheye Rectilinear projection; inspect edge stretching and nearby seams."
             )
         if runtime_status == "far_field_custom":
-            return "远景自定义布局：使用候选声明的投影与只读布局参数。"
-        if runtime_status == "auto_fallback_far_field":
-            return "Auto 拼接算法仍是占位；当前回退 Far-field，不会自动切换。"
-        if runtime_status == "b2_candidate_view":
-            return (
-                "实验性候选（rotation-only）：远景优先，近景可能重影。"
-                "检查近处人物或物体时，建议切换到多路视图或单路查看。"
+            return self.t(
+                "Far Custom uses the loaded candidate projection and read-only custom layout."
             )
-        return (
-            "初始模板拼接：当前结果不是已正式应用的候选标定。"
-            "近景目标建议切换到多路视图或单路查看。"
+        if runtime_status == "auto_fallback_far_field":
+            return self.t(
+                "Auto is not implemented; the worker is explicitly using Far Default."
+            )
+        if runtime_status == "b2_candidate_view":
+            return self.t(
+                "B-2 View is a rotation-only distance-priority diagnostic; nearby objects may ghost."
+            )
+        return self.t(
+            "Far Default uses the current formal profile. It is not an applied B-2 candidate. For nearby objects, use Multi-camera View or choose Near Current."
         )
 
     def update_preview_status_summary(self) -> None:
@@ -5636,38 +6142,57 @@ class MainWindow(QMainWindow):
             self.calibration_config.get("stitch_topology", "未设置")
         )
         layout = {
-            PreviewLayoutMode.GRID: "Grid",
+            PreviewLayoutMode.GRID: self.t("Grid"),
             PreviewLayoutMode.FOCUS: (
-                f"Focus({self.focused_camera_id or '-'})"
+                f"{self.t('Focus')}({self.focused_camera_id or '-'})"
             ),
-            PreviewLayoutMode.STITCHED: "Stitched",
+            PreviewLayoutMode.STITCHED: self.t("Stitched"),
         }[self.preview_layout_mode]
         content = {
-            PreviewContentMode.STOPPED: "Stopped",
-            PreviewContentMode.LIVE: "Live",
-            PreviewContentMode.STILL: "Still",
+            PreviewContentMode.STOPPED: self.t("Stopped"),
+            PreviewContentMode.LIVE: self.t("Live"),
+            PreviewContentMode.STILL: self.t("Still"),
         }[self.preview_content_mode]
-        health = self.update_live_health_state().value
-        runtime = self.effective_runtime_status()
-        projection = self.effective_projection_source()
-        qgc = "Running" if self.qgc_output_active else "Stopped"
+        health = self.t(self.update_live_health_state().value)
+        runtime = self.runtime_view_display_name(
+            preset_for_effective_status(self.effective_runtime_status())
+        )
+        projection = self.projection_source_display_name(
+            self.effective_projection_source()
+        )
+        if self.qgc_output_active:
+            self.refresh_qgc_output_status()
+        if self.qgc_output_state == "restarting":
+            qgc = self.t("Restarting")
+        elif self.qgc_output_state == "failed":
+            qgc = self.t("Failed")
+        else:
+            qgc = (
+                self.t("Running")
+                if self.qgc_output_active
+                else self.t("Stopped")
+            )
         warnings = self.preview_warning_messages()
         summary = (
-            f"Topology: {topology}  |  相机: {len(active_keys)} 路 "
-            f"(Live {status_counts[STREAM_LIVE]} / "
-            f"Connecting {status_counts[STREAM_CONNECTING]} / "
-            f"Failed {status_counts[STREAM_FAILED]} / "
-            f"Stopped {status_counts[STREAM_STOPPED]})  |  "
-            f"布局: {layout}  |  内容: {content}  |  "
-            f"健康: {health}  |  实际拼接链路: {runtime}  |  "
-            f"投影: {projection}  |  "
+            f"{self.t('Topology')}: {topology}  |  "
+            f"{self.t('Cameras')}: {len(active_keys)} "
+            f"({self.t('Live')} {status_counts[STREAM_LIVE]} / "
+            f"{self.t('Connecting')} {status_counts[STREAM_CONNECTING]} / "
+            f"{self.t('Failed')} {status_counts[STREAM_FAILED]} / "
+            f"{self.t('Stopped')} {status_counts[STREAM_STOPPED]})  |  "
+            f"{self.t('Layout')}: {layout}  |  "
+            f"{self.t('Content')}: {content}  |  "
+            f"{self.t('Health')}: {health}  |  "
+            f"{self.t('Effective View')}: {runtime}  |  "
+            f"{self.t('Projection')}: {projection}  |  "
             f"QGC: {qgc}  |  "
-            f"标定状态: {self.calibration_candidate_state()}"
+            f"{self.t('Calibration')}: "
+            f"{self.calibration_candidate_state_display_name()}"
         )
         if warnings:
-            summary += f"  |  警告: {len(warnings)} 项"
+            summary += f"  |  {self.t('Warnings')}: {len(warnings)}"
         else:
-            summary += "  |  警告: 无"
+            summary += f"  |  {self.t('Warnings')}: {self.t('None')}"
         self.preview_status_summary.setText(summary)
         self.preview_status_summary.setToolTip("\n".join(warnings))
         self.preview_status_summary.setStyleSheet(
@@ -5685,15 +6210,15 @@ class MainWindow(QMainWindow):
             if runtime_status == "near_field_current_perspective":
                 return self.t("Near-field stitched view")
             if runtime_status == "near_field_fisheye_rectilinear":
-                return "Near-field Fisheye stitched view"
+                return self.t("Near Fisheye stitched view")
             if runtime_status == "far_field_custom":
-                return "Far-field Custom stitched view"
+                return self.t("Far Custom stitched view")
             if runtime_status == "far_field_default":
                 return self.t("Far-field stitched view")
             if runtime_status == "b2_candidate_view":
-                return f"B-2 {self.t('Experimental candidate live view')}"
+                return self.t("B-2 View stitched view")
             if runtime_status == "auto_fallback_far_field":
-                return "Auto fallback Far-field stitched view"
+                return self.t("Auto fallback Far Default stitched view")
             return self.t("Live stitched view")
         if self.preview_content_mode == PreviewContentMode.STILL:
             return self.t("Static stitched view")
@@ -5706,44 +6231,12 @@ class MainWindow(QMainWindow):
         self.canvas_view.set_image(self.canvas, self.t("stitched canvas"))
 
     def apply_live_stitch_mode_controls(self) -> None:
-        if not hasattr(self, "candidate_stitch_button"):
-            return
-        candidate_available = self.live_candidate_directory is not None
-        if self.live_stitch_mode == "candidate" and not candidate_available:
-            self.live_stitch_mode = "template"
-        self.candidate_stitch_button.blockSignals(True)
-        self.template_stitch_button.blockSignals(True)
-        self.candidate_stitch_button.setEnabled(candidate_available)
-        self.candidate_stitch_button.setToolTip(
-            (
-                "B-2 候选实时视图，仅供高级诊断；不会写入正式 calibration.yaml。"
-                if candidate_available
-                else "当前 topology 没有可用候选，请先完成采样和 B-2 候选求解。"
-            )
-        )
-        self.template_stitch_button.setToolTip(
-            "初始模板/正式 profile 的当前几何配置；不代表候选标定已应用。"
-        )
-        self.candidate_stitch_button.setChecked(
+        if (
             self.live_stitch_mode == "candidate"
-        )
-        self.template_stitch_button.setChecked(
-            self.live_stitch_mode == "template"
-        )
-        self.candidate_stitch_button.blockSignals(False)
-        self.template_stitch_button.blockSignals(False)
-        if self.live_stitch_mode == "candidate":
-            self.stitch_strategy_label.setText(
-                self.t("B-2 candidate view")
-            )
-            self.stitch_strategy_label.setToolTip(
-                str(self.live_candidate_directory)
-            )
-        else:
-            self.stitch_strategy_label.setText(
-                self.t("Current Profile Template")
-            )
-            self.stitch_strategy_label.setToolTip("")
+            and self.live_candidate_directory is None
+        ):
+            self.live_stitch_mode = "template"
+        self.refresh_runtime_workflow_labels()
 
     def set_live_stitch_mode(self, mode: str) -> None:
         if mode not in {"candidate", "template"}:
@@ -5983,7 +6476,17 @@ class MainWindow(QMainWindow):
         self.set_preview_content_mode(PreviewContentMode.STILL)
         self._process_and_render_frames("Loaded image directory")
 
-    def start_live_preview(self) -> None:
+    def start_live_preview(self) -> bool:
+        if (
+            self._runtime_view_selection_dirty
+            and not self.apply_stitch_runtime_config()
+        ):
+            return False
+        if (
+            self.preview_content_mode == PreviewContentMode.LIVE
+            and self.stream_manager.has_active_workers()
+        ):
+            return True
         self.collect_camera_config_from_widgets()
         self.performance_config = self.camera_config.get("performance", {})
         self.stop_live_preview()
@@ -5996,7 +6499,7 @@ class MainWindow(QMainWindow):
             self.log(f"Live stitch processor failed to start: {exc}", level="ERROR")
             self.update_preview_status_summary()
             self.statusBar().showMessage(self.last_stitch_ui_error)
-            return
+            return False
         self.frame_counts.clear()
         self.stream_error_log_counts.clear()
         self.stream_manager.start(self.live_stream_configs())
@@ -6029,12 +6532,14 @@ class MainWindow(QMainWindow):
             self.last_qgc_output_status_time = 0.0
             self.preview_timer.start()
             self.statusBar().showMessage(self.t("Live preview running"))
+            return True
         else:
             self.live_health_state = LiveHealthState.FAILED
             self.update_preview_status_summary()
             self.statusBar().showMessage(
                 self.t("Video stream unavailable")
             )
+            return False
 
     def stop_live_preview(self) -> bool:
         self.preview_timer.stop()
@@ -6603,6 +7108,7 @@ class MainWindow(QMainWindow):
         active_runtime_logs = self.restore_active_project_runtime_defaults(
             discovered_b2_candidate=self.live_candidate_directory,
         )
+        self._runtime_view_selection_dirty = False
         self.apply_live_stitch_mode_controls()
         self.refresh_stitch_runtime_controls()
         self.sync_camera_config_widgets()
@@ -6612,6 +7118,7 @@ class MainWindow(QMainWindow):
         self.refresh_seam_editor()
         self.update_topology_diagnostics()
         self.refresh_pairwise_pair_choices()
+        self.refresh_project_active_status()
         for level, message in active_runtime_logs:
             self.log(message, level=level)
 
@@ -6714,7 +7221,27 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "qgc_rtsp_transport"):
             return
         kind = str(self.qgc_output_kind.currentData() or "udp_mpegts")
-        self.qgc_rtsp_transport.setEnabled(kind == "rtsp")
+        self.qgc_rtsp_transport.setEnabled(
+            kind == "rtsp" and not self.qgc_output_active
+        )
+
+    def set_qgc_output_controls_active(self, active: bool) -> None:
+        """Lock the editable draft while an effective output is running."""
+        editable = not active
+        for name in (
+            "qgc_output_kind",
+            "qgc_output_url",
+            "qgc_output_fps",
+            "qgc_output_bitrate",
+            "qgc_ffmpeg_path",
+            "qgc_output_save_button",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(editable)
+        if hasattr(self, "qgc_rtsp_transport"):
+            kind = str(self.qgc_output_kind.currentData() or "udp_mpegts")
+            self.qgc_rtsp_transport.setEnabled(editable and kind == "rtsp")
 
     def save_qgc_video_output_settings(self) -> None:
         if config_revision("cameras.yaml") != self._camera_config_revision:
@@ -6731,14 +7258,37 @@ class MainWindow(QMainWindow):
 
     def start_qgc_output_service(self) -> None:
         if self.qgc_output_active:
+            self.refresh_qgc_output_status(force=True)
+        if self.qgc_output_active:
             QMessageBox.information(
                 self,
                 self.t("QGC output service"),
                 self.t("QGC output service already running."),
             )
             return
+        if self.canvas is None:
+            error = (
+                "QGC output requires a current stitched canvas. Start Live "
+                "preview and wait for a stitched frame first."
+            )
+            self.qgc_output_last_error = error
+            self.qgc_output_state = "failed"
+            self.qgc_output_active = False
+            if hasattr(self, "qgc_output_service_status"):
+                self.qgc_output_service_status.setText(
+                    self.t(
+                        "QGC output failed: {error}",
+                        error=self.t(error),
+                    )
+                )
+            self.qgc_output_start_button.setEnabled(True)
+            self.qgc_output_stop_button.setEnabled(False)
+            self.statusBar().showMessage(self.t(error))
+            self.log(error, level="ERROR")
+            self.update_preview_status_summary()
+            return
         output = self.qgc_video_output_config_from_widgets()
-        self.qgc_video_sink = FfmpegVideoSink(
+        sink = FfmpegVideoSink(
             VideoOutputConfig(
                 kind=output["kind"],
                 url=output["url"],
@@ -6750,9 +7300,45 @@ class MainWindow(QMainWindow):
                 output_height=output.get("output_height") or None,
             )
         )
+        canvas_height, canvas_width = self.canvas.shape[:2]
+        try:
+            preflight = getattr(sink, "preflight", None)
+            if callable(preflight):
+                preflight()
+            open_sink = getattr(sink, "open", None)
+            if callable(open_sink):
+                open_sink(canvas_width, canvas_height, float(output["fps"]))
+            accepted = sink.write(self.canvas)
+            if accepted is False:
+                raise RuntimeError("FFmpeg writer rejected the first frame.")
+        except Exception as exc:
+            try:
+                sink.close()
+            except Exception:
+                pass
+            error = f"{type(exc).__name__}: {exc}"
+            self.qgc_video_sink = None
+            self.qgc_output_active = False
+            self.qgc_output_state = "failed"
+            self.qgc_output_last_error = error
+            self.qgc_output_effective_config = None
+            self.set_qgc_output_controls_active(False)
+            self.qgc_output_start_button.setEnabled(True)
+            self.qgc_output_stop_button.setEnabled(False)
+            message = self.t("QGC output failed: {error}", error=error)
+            self.qgc_output_service_status.setText(message)
+            self.statusBar().showMessage(message)
+            self.log(message, level="ERROR")
+            self.update_preview_status_summary()
+            return
+        self.qgc_video_sink = sink
         self.qgc_output_active = True
+        self.qgc_output_state = "running"
         self.qgc_output_frames_written = 0
         self.qgc_output_last_error = ""
+        self.qgc_output_last_exit_code = None
+        self.qgc_output_effective_config = dict(output)
+        self._qgc_last_reported_failure = ""
         self.last_qgc_output_status_time = 0.0
         status = self.t(
             "QGC output service started: {url}",
@@ -6762,17 +7348,43 @@ class MainWindow(QMainWindow):
             self.qgc_output_service_status.setText(status)
         self.qgc_output_start_button.setEnabled(False)
         self.qgc_output_stop_button.setEnabled(True)
+        self.set_qgc_output_controls_active(True)
         self.statusBar().showMessage(status)
         self.log(status)
-        self.write_qgc_output_frame(self.canvas)
+        self.refresh_qgc_output_status(force=True)
         self.update_preview_status_summary()
 
     def stop_qgc_output_service(self) -> None:
         sink = self.qgc_video_sink
         self.qgc_video_sink = None
         self.qgc_output_active = False
+        self.qgc_output_state = "stopping" if sink is not None else "stopped"
         if sink is not None:
-            sink.close()
+            try:
+                sink.close()
+                status_fn = getattr(sink, "status", None)
+                if callable(status_fn):
+                    final_status = status_fn()
+                    self.qgc_output_frames_written = int(
+                        getattr(
+                            final_status,
+                            "frames_written",
+                            self.qgc_output_frames_written,
+                        )
+                    )
+                    self.qgc_output_last_exit_code = getattr(
+                        final_status,
+                        "exit_code",
+                        self.qgc_output_last_exit_code,
+                    )
+            except Exception as exc:
+                self.qgc_output_last_error = f"{type(exc).__name__}: {exc}"
+                self.log(
+                    f"QGC output shutdown error: {self.qgc_output_last_error}",
+                    level="ERROR",
+                )
+        self.qgc_output_state = "stopped"
+        self.set_qgc_output_controls_active(False)
         message = self.t("QGC output service stopped.")
         if hasattr(self, "qgc_output_service_status"):
             self.qgc_output_service_status.setText(message)
@@ -6784,60 +7396,182 @@ class MainWindow(QMainWindow):
         self.log(message)
         self.update_preview_status_summary()
 
+    def refresh_qgc_output_status(self, *, force: bool = False) -> None:
+        """Reflect the encoder process, not editable widgets, in the UI."""
+        sink = self.qgc_video_sink
+        if sink is None:
+            return
+        status_fn = getattr(sink, "status", None)
+        if not callable(status_fn):
+            return
+        status = status_fn()
+        now = time.perf_counter()
+        state = str(getattr(status, "state", "unknown"))
+        terminal = state in {"failed", "stopped"}
+        if (
+            not force
+            and not terminal
+            and now - self.last_qgc_output_status_time < 1.0
+        ):
+            return
+        self.last_qgc_output_status_time = now
+        self.qgc_output_state = state
+        self.qgc_output_frames_written = int(
+            getattr(status, "frames_written", self.qgc_output_frames_written)
+        )
+        self.qgc_output_last_error = str(
+            getattr(status, "last_error", "") or self.qgc_output_last_error
+        )
+        self.qgc_output_last_exit_code = getattr(
+            status,
+            "exit_code",
+            self.qgc_output_last_exit_code,
+        )
+        effective = self.qgc_output_effective_config or {}
+        safe_url = redact_log_message(effective.get("url", ""))
+        if state == "running":
+            heading = self.t(
+                "QGC output service started: {url}",
+                url=safe_url,
+            )
+        elif state == "restarting":
+            heading = self.bt(
+                "QGC output restarting: {url}",
+                "QGC 输出正在重启：{url}",
+                url=safe_url,
+            )
+        else:
+            error = (
+                self.qgc_output_last_error
+                or str(getattr(status, "last_stderr_line", ""))
+                or f"FFmpeg state is {state}"
+            )
+            heading = self.t("QGC output failed: {error}", error=error)
+        details = (
+            f"state {state} | pid {getattr(status, 'pid', None) or '-'}"
+            f" | submitted {int(getattr(status, 'frames_submitted', 0))}"
+            f" | written {int(getattr(status, 'frames_written', 0))}"
+            f" | dropped {int(getattr(status, 'frames_dropped', 0))}"
+            f" | pending {int(getattr(status, 'pending_frames', 0))}"
+            f" | restarts {int(getattr(status, 'restart_count', 0))}"
+        )
+        if self.qgc_output_last_exit_code is not None:
+            details += f" | exit {self.qgc_output_last_exit_code}"
+        runtime = (
+            f"runtime {self.effective_runtime_status()}"
+            f" | projection {self.effective_projection_source()}"
+            f" | health {self.live_health_state.value}"
+        )
+        lines = [heading, details, runtime]
+        stderr_line = str(getattr(status, "last_stderr_line", ""))
+        if self.qgc_output_last_error:
+            lines.append(
+                "last error: "
+                + redact_log_message(self.qgc_output_last_error)
+            )
+        if stderr_line:
+            lines.append(
+                "last stderr: " + redact_log_message(stderr_line)
+            )
+        text = "\n".join(lines)
+        if hasattr(self, "qgc_output_service_status"):
+            self.qgc_output_service_status.setText(text)
+        if terminal:
+            self.qgc_output_active = False
+            self.qgc_output_start_button.setEnabled(True)
+            self.qgc_output_stop_button.setEnabled(False)
+            self.set_qgc_output_controls_active(False)
+            failure_key = f"{state}:{self.qgc_output_last_error}:{stderr_line}"
+            if failure_key != self._qgc_last_reported_failure:
+                self._qgc_last_reported_failure = failure_key
+                self.log(text, level="ERROR")
+            self.qgc_video_sink = None
+            try:
+                sink.close()
+            except Exception:
+                pass
+
     def write_qgc_output_frame(self, canvas: np.ndarray | None) -> None:
         if not self.qgc_output_active or self.qgc_video_sink is None or canvas is None:
             return
         try:
-            self.qgc_video_sink.write(canvas)
+            accepted = self.qgc_video_sink.write(canvas)
+            if accepted is False:
+                raise RuntimeError("FFmpeg writer rejected the frame.")
         except Exception as exc:
-            self.qgc_output_last_error = str(exc)
+            self.qgc_output_last_error = f"{type(exc).__name__}: {exc}"
             self.log(f"QGC output service error: {exc}", level="ERROR")
-            self.stop_qgc_output_service()
+            sink = self.qgc_video_sink
+            self.qgc_video_sink = None
+            self.qgc_output_active = False
+            self.qgc_output_state = "failed"
+            if sink is not None:
+                try:
+                    sink.close()
+                except Exception:
+                    pass
+            self.set_qgc_output_controls_active(False)
+            self.qgc_output_start_button.setEnabled(True)
+            self.qgc_output_stop_button.setEnabled(False)
+            if hasattr(self, "qgc_output_service_status"):
+                self.qgc_output_service_status.setText(
+                    self.t(
+                        "QGC output failed: {error}",
+                        error=self.qgc_output_last_error,
+                    )
+                )
             return
-        self.qgc_output_frames_written += 1
-        now = time.perf_counter()
-        if (
-            hasattr(self, "qgc_output_service_status")
-            and (
-                self.qgc_output_frames_written == 1
-                or now - self.last_qgc_output_status_time >= 1.0
+        status_fn = getattr(self.qgc_video_sink, "status", None)
+        if callable(status_fn):
+            self.refresh_qgc_output_status()
+        else:
+            self.qgc_output_frames_written += 1
+            effective = (
+                self.qgc_output_effective_config
+                or self.qgc_video_output_config_from_widgets()
             )
-        ):
-            self.last_qgc_output_status_time = now
-            output = self.qgc_video_output_config_from_widgets()
-            timing_suffix = self.runtime_timing_status_suffix(self.last_runtime_metrics)
-            self.qgc_output_service_status.setText(
-                f"{self.t('QGC output service started: {url}', url=output['url'])}\n"
-                f"Frames: {self.qgc_output_frames_written} | stitch {self.last_stitch_ms:.1f} ms"
-                f" | runtime {self.effective_runtime_status()}"
-                f" | projection {self.effective_projection_source()}"
-                f" | health {self.live_health_state.value}"
-                f"{timing_suffix}"
-            )
+            if hasattr(self, "qgc_output_service_status"):
+                self.qgc_output_service_status.setText(
+                    f"{self.t('QGC output service started: {url}', url=redact_log_message(effective['url']))}\n"
+                    f"written {self.qgc_output_frames_written}"
+                    f" | runtime {self.effective_runtime_status()}"
+                    f" | projection {self.effective_projection_source()}"
+                    f" | health {self.live_health_state.value}"
+                )
 
     def save_project_as(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Save DeepShark View Studio project",
+            self.t("Save legacy project file"),
             str(PROJECT_ROOT / "projects" / "project.dsvs.yaml"),
-            "DeepShark Project (*.yaml *.yml)",
+            self.t(
+                "Legacy Project File (*.dsvs.yaml *.yaml *.yml);;All Files (*)"
+            ),
         )
         if not path:
             return
         try:
             saved_path = save_project(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Save project failed", str(exc))
+            QMessageBox.critical(
+                self,
+                self.t("Save legacy project failed"),
+                str(exc),
+            )
             return
-        self.project_status.setText(f"Saved project: {saved_path}")
+        self.project_status.setText(
+            self.t("Legacy project saved: {path}", path=saved_path)
+        )
         self.log(f"Saved project: {saved_path}")
 
     def open_project_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open DeepShark View Studio project",
+            self.t("Open legacy project file"),
             str(PROJECT_ROOT / "projects"),
-            "DeepShark Project (*.yaml *.yml);;All Files (*)",
+            self.t(
+                "Legacy Project File (*.dsvs.yaml *.yaml *.yml);;All Files (*)"
+            ),
         )
         if not path:
             return
@@ -6847,24 +7581,32 @@ class MainWindow(QMainWindow):
             payload = load_project(path)
             self.reload_runtime_state()
         except Exception as exc:
-            QMessageBox.critical(self, "Open project failed", str(exc))
+            QMessageBox.critical(
+                self,
+                self.t("Open legacy project failed"),
+                str(exc),
+            )
             return
-        self.project_status.setText(f"Loaded project: {path}")
+        self.project_status.setText(
+            self.t("Legacy project loaded: {path}", path=path)
+        )
         self.log(f"Loaded project version {payload.get('version')} from {path}")
 
     def backup_current_configs(self) -> None:
         try:
             path = backup_configs()
         except Exception as exc:
-            QMessageBox.critical(self, "Backup failed", str(exc))
+            QMessageBox.critical(self, self.t("Config backup failed"), str(exc))
             return
-        self.project_status.setText(f"Backup created: {path}")
+        self.project_status.setText(
+            self.t("Config backup created: {path}", path=path)
+        )
         self.log(f"Backup created: {path}")
 
     def export_runtime_config_file(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "Export runtime config",
+            self.t("Export runtime snapshot"),
             str(PROJECT_ROOT / "projects" / "runtime_config.yaml"),
             "YAML (*.yaml *.yml)",
         )
@@ -6873,9 +7615,11 @@ class MainWindow(QMainWindow):
         try:
             saved_path = export_runtime_config(path)
         except Exception as exc:
-            QMessageBox.critical(self, "Export failed", str(exc))
+            QMessageBox.critical(self, self.t("Runtime snapshot failed"), str(exc))
             return
-        self.project_status.setText(f"Runtime config exported: {saved_path}")
+        self.project_status.setText(
+            self.t("Runtime snapshot exported: {path}", path=saved_path)
+        )
         self.log(f"Runtime config exported: {saved_path}")
 
     def export_project_package_file(self) -> None:
@@ -6945,13 +7689,13 @@ class MainWindow(QMainWindow):
         try:
             validation = validate_project_package(path)
         except Exception as exc:
-            QMessageBox.critical(self, self.t("Import project package failed"), str(exc))
+            QMessageBox.critical(self, self.t("Activate project package failed"), str(exc))
             return
         if not validation.valid:
             message = "; ".join(validation.errors)
             QMessageBox.critical(
                 self,
-                self.t("Import project package failed"),
+                self.t("Activate project package failed"),
                 self.t("Project package invalid: {errors}", errors=message),
             )
             self.project_status.setText(
@@ -6981,7 +7725,7 @@ class MainWindow(QMainWindow):
             )
             QMessageBox.critical(
                 self,
-                self.t("Import project package failed"),
+                self.t("Activate project package failed"),
                 message,
             )
             self.log(message, level="ERROR")
@@ -6990,7 +7734,7 @@ class MainWindow(QMainWindow):
             result = activate_project_package(path)
             self.reload_runtime_state(workers_already_stopped=True)
         except Exception as exc:
-            QMessageBox.critical(self, self.t("Import project package failed"), str(exc))
+            QMessageBox.critical(self, self.t("Activate project package failed"), str(exc))
             return
         self.project_status.setText(
             self.t("Project package activated: {path}", path=result.package_root)
@@ -7409,25 +8153,25 @@ class MainWindow(QMainWindow):
         is_chessboard = board_type == "chessboard"
         is_aruco = board_type == "aruco_grid"
         self.wizard_columns_label.setText(
-            "内角点列数"
+            self.bt("Inner corner columns", "内角点列数")
             if is_chessboard
-            else "Marker 列数"
+            else self.bt("Marker columns", "Marker 列数")
             if is_aruco
-            else "Charuco 方格列数"
+            else self.bt("Charuco squares X", "Charuco 方格列数")
         )
         self.wizard_rows_label.setText(
-            "内角点行数"
+            self.bt("Inner corner rows", "内角点行数")
             if is_chessboard
-            else "Marker 行数"
+            else self.bt("Marker rows", "Marker 行数")
             if is_aruco
-            else "Charuco 方格行数"
+            else self.bt("Charuco squares Y", "Charuco 方格行数")
         )
         self.wizard_square_label.setText(
-            "方格边长"
+            self.bt("Square size", "方格边长")
             if is_chessboard
-            else "Marker 边长"
+            else self.bt("Marker length", "Marker 边长")
             if is_aruco
-            else "Charuco 方格边长"
+            else self.bt("Charuco square length", "Charuco 方格边长")
         )
         self.wizard_marker_length.setEnabled(board_type == "charuco")
         self.wizard_marker_label.setEnabled(board_type == "charuco")
@@ -7435,11 +8179,15 @@ class MainWindow(QMainWindow):
         self.wizard_separation_label.setEnabled(is_aruco)
         self.wizard_dictionary.setEnabled(not is_chessboard)
         self.wizard_board_hint.setText(
-            "实验室棋盘默认：总格 12×9，对应内角点 11×8，"
-            "方格边长 25mm。请按实物核对后再确认。"
+            self.bt(
+                "Lab chessboard default: 12×9 total squares, 11×8 inner corners, 25 mm square size. Verify against the physical board before confirming.",
+                "实验室棋盘默认：总格 12×9，对应内角点 11×8，方格边长 25mm。请按实物核对后再确认。",
+            )
             if is_chessboard
-            else "请按标定板实物填写行列、物理尺寸和字典；"
-            "程序不会自动猜测这些参数。"
+            else self.bt(
+                "Enter rows, columns, physical dimensions and dictionary from the actual board; the application will not infer these values.",
+                "请按标定板实物填写行列、物理尺寸和字典；程序不会自动猜测这些参数。",
+            )
         )
 
     def sync_wizard_board_to_session_controls(self) -> None:
@@ -7511,8 +8259,11 @@ class MainWindow(QMainWindow):
             bool(session.data.get("board_confirmed"))
         )
         self.wizard_session_label.setText(
-            f"当前 session：{session.directory}\n"
-            "已加载已有进度；继续采集不会覆盖旧样本。"
+            self.bt(
+                "Current session: {path}\nExisting progress is loaded; continued capture will not overwrite previous samples.",
+                "当前 session：{path}\n已加载已有进度；继续采集不会覆盖旧样本。",
+                path=session.directory,
+            )
         )
         self.update_wizard_board_controls()
 
@@ -7521,7 +8272,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请先核对并确认标定板参数。",
+                self.bt(
+                    "Verify and confirm the calibration-board parameters first.",
+                    "请先核对并确认标定板参数。",
+                ),
             )
             return
         self.sync_wizard_board_to_session_controls()
@@ -7543,11 +8297,11 @@ class MainWindow(QMainWindow):
         index = min(4, max(0, int(index)))
         self.calibration_wizard_stack.setCurrentIndex(index)
         titles = (
-            "步骤 1/5：准备设备",
-            "步骤 2/5：确认标定板",
-            "步骤 3/5：采集单相机画面",
-            "步骤 4/5：采集相邻相机 Pair",
-            "步骤 5/5：检查与下一步",
+            self.bt("Step 1/5: Prepare Equipment", "步骤 1/5：准备设备"),
+            self.bt("Step 2/5: Confirm Board", "步骤 2/5：确认标定板"),
+            self.bt("Step 3/5: Capture Individual Cameras", "步骤 3/5：采集单相机画面"),
+            self.bt("Step 4/5: Capture Adjacent Camera Pairs", "步骤 4/5：采集相邻相机 Pair"),
+            self.bt("Step 5/5: Review and Continue", "步骤 5/5：检查与下一步"),
         )
         self.wizard_step_title.setText(titles[index])
         self.wizard_back_button.setEnabled(index > 0)
@@ -7578,7 +8332,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请完成并勾选三项现场准备检查。",
+                self.bt(
+                    "Complete and check all three site-preparation items.",
+                    "请完成并勾选三项现场准备检查。",
+                ),
             )
             return
         if step == 1 and (
@@ -7588,21 +8345,30 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请确认标定板参数并创建或加载 session。",
+                self.bt(
+                    "Confirm the board parameters and create or load a session.",
+                    "请确认标定板参数并创建或加载 session。",
+                ),
             )
             return
         if step == 2 and not self._wizard_intrinsics_minimum_met():
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "三台相机都达到至少 20 张合格样本后，才能进入 Pair 采集。",
+                self.bt(
+                    "Each camera needs at least 20 accepted samples before pair capture.",
+                    "三台相机都达到至少 20 张合格样本后，才能进入 Pair 采集。",
+                ),
             )
             return
         if step == 3 and not self._wizard_pairs_minimum_met():
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "两个 Pair 都达到至少 15 组合格样本后，才能进入最终检查。",
+                self.bt(
+                    "Both pairs need at least 15 accepted samples before final review.",
+                    "两个 Pair 都达到至少 15 组合格样本后，才能进入最终检查。",
+                ),
             )
             return
         self.set_calibration_wizard_step(step + 1)
@@ -7662,7 +8428,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请先创建或加载 session。",
+                self.bt(
+                    "Create or load a session first.",
+                    "请先创建或加载 session。",
+                ),
             )
             return
         selected_index = self.wizard_intrinsic_camera.currentIndex()
@@ -7674,7 +8443,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请先完成前一台相机的 20 张最低样本。",
+                self.bt(
+                    "Complete the previous camera's minimum 20 samples first.",
+                    "请先完成前一台相机的 20 张最低样本。",
+                ),
             )
             return
         camera = str(self.wizard_intrinsic_camera.currentData())
@@ -7697,8 +8469,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                f"{camera} 还需要 "
-                f"{MINIMUM_INTRINSIC_SAMPLES - accepted} 张合格样本。",
+                self.bt(
+                    "{camera} needs {count} more accepted samples.",
+                    "{camera} 还需要 {count} 张合格样本。",
+                    camera=camera,
+                    count=MINIMUM_INTRINSIC_SAMPLES - accepted,
+                ),
             )
             return
         self.wizard_intrinsic_camera.setCurrentIndex(
@@ -7710,7 +8486,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请先创建或加载 session。",
+                self.bt("Create or load a session first.", "请先创建或加载 session。"),
             )
             return
         frames, timestamps = self._current_session_frames()
@@ -7719,7 +8495,11 @@ class MainWindow(QMainWindow):
         missing = [key for key in (left, right) if key not in frames]
         if missing:
             self.wizard_pair_detection_status.setText(
-                f"缺少当前画面：{', '.join(missing)}"
+                self.bt(
+                    "Missing current feeds: {cameras}",
+                    "缺少当前画面：{cameras}",
+                    cameras=", ".join(missing),
+                )
             )
             return
         try:
@@ -7735,16 +8515,22 @@ class MainWindow(QMainWindow):
             self.wizard_pair_detection_status.setText(str(exc))
             return
         self.wizard_pair_detection_status.setText(
-            f"{left}："
-            f"{'已识别' if inspection['left_detected'] else '未识别'}"
-            f"（{inspection['left_point_count']} 点）；"
-            f"{right}："
-            f"{'已识别' if inspection['right_detected'] else '未识别'}"
-            f"（{inspection['right_point_count']} 点）\n"
-            f"共同点：{inspection['common_point_count']} / "
-            f"{inspection['minimum_common_points']}，"
-            f"{'足够' if inspection['common_points_sufficient'] else '不足'}；"
-            f"{inspection['time_status']}"
+            self.bt(
+                "{left}: {left_status} ({left_points} points); {right}: {right_status} ({right_points} points)\n"
+                "Common points: {common} / {minimum}, {sufficient}; {time_status}",
+                "{left}：{left_status}（{left_points} 点）；{right}：{right_status}（{right_points} 点）\n"
+                "共同点：{common} / {minimum}，{sufficient}；{time_status}",
+                left=left,
+                left_status=self.bt("detected", "已识别") if inspection["left_detected"] else self.bt("not detected", "未识别"),
+                left_points=inspection["left_point_count"],
+                right=right,
+                right_status=self.bt("detected", "已识别") if inspection["right_detected"] else self.bt("not detected", "未识别"),
+                right_points=inspection["right_point_count"],
+                common=inspection["common_point_count"],
+                minimum=inspection["minimum_common_points"],
+                sufficient=self.bt("sufficient", "足够") if inspection["common_points_sufficient"] else self.bt("insufficient", "不足"),
+                time_status=inspection["time_status"],
+            )
         )
 
     def wizard_inspect_pair_if_visible(self) -> None:
@@ -7760,7 +8546,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请先创建或加载 session。",
+                self.bt("Create or load a session first.", "请先创建或加载 session。"),
             )
             return
         selected_index = self.wizard_pair.currentIndex()
@@ -7772,14 +8558,20 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请先完成 front_left ↔ front 的 15 组最低样本。",
+                self.bt(
+                    "Complete the minimum 15 front_left ↔ front samples first.",
+                    "请先完成 front_left ↔ front 的 15 组最低样本。",
+                ),
             )
             return
         if not self.wizard_pair_board_confirmed.isChecked():
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "请确认两路画面中是同一块物理标定板。",
+                self.bt(
+                    "Confirm that both feeds show the same physical calibration board.",
+                    "请确认两路画面中是同一块物理标定板。",
+                ),
             )
             return
         pair_key = str(self.wizard_pair.currentData())
@@ -7805,8 +8597,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                f"当前 Pair 还需要 "
-                f"{MINIMUM_PAIR_SAMPLES - accepted} 组合格样本。",
+                self.bt(
+                    "The current pair needs {count} more accepted samples.",
+                    "当前 Pair 还需要 {count} 组合格样本。",
+                    count=MINIMUM_PAIR_SAMPLES - accepted,
+                ),
             )
             return
         self.wizard_pair.setCurrentIndex(
@@ -7817,22 +8612,40 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "wizard_intrinsic_progress"):
             return
         if self.calibration_session is None:
-            self.wizard_session_label.setText("尚未创建或加载采集会话")
+            self.wizard_session_label.setText(
+                self.bt("No capture session created or loaded", "尚未创建或加载采集会话")
+            )
             self.wizard_intrinsic_progress.setPlainText(
-                "请先在步骤 2 创建或加载 session。"
+                self.bt(
+                    "Create or load a session in step 2 first.",
+                    "请先在步骤 2 创建或加载 session。",
+                )
             )
             self.wizard_pair_progress.setPlainText(
-                "请先完成三台相机的单独采集。"
+                self.bt(
+                    "Complete individual capture for all three cameras first.",
+                    "请先完成三台相机的单独采集。",
+                )
             )
-            self.wizard_readiness_label.setText("暂不建议求解")
+            self.wizard_readiness_label.setText(
+                self.bt("Solve Not Recommended Yet", "暂不建议求解")
+            )
             self.wizard_b2_mode_label.setText(
-                "尚无 session，B-2 入口不可用。"
+                self.bt(
+                    "No session is available; the B-2 entry is disabled.",
+                    "尚无 session，B-2 入口不可用。",
+                )
             )
             if self.calibration_wizard_stack.currentIndex() == 4:
-                self.wizard_next_button.setText("暂不可进入 B-2")
+                self.wizard_next_button.setText(
+                    self.bt("B-2 Not Available Yet", "暂不可进入 B-2")
+                )
                 self.wizard_next_button.setEnabled(False)
             self.wizard_review_summary.setPlainText(
-                "当前没有可检查的采集会话。"
+                self.bt(
+                    "There is no capture session to review.",
+                    "当前没有可检查的采集会话。",
+                )
             )
             self.wizard_details_text.clear()
             return
@@ -7841,13 +8654,26 @@ class MainWindow(QMainWindow):
         intrinsic_lines = []
         for camera in ("front_left", "front", "front_right"):
             item = summary["intrinsics"][camera]
-            missing = "、".join(item["missing_coverage_zones"][:5]) or "无"
+            missing = ", ".join(item["missing_coverage_zones"][:5]) or self.bt("none", "无")
             intrinsic_lines.append(
-                f"{camera}：已接受 {item['accepted']} / 目标 {item['target']}，"
-                f"最低 {MINIMUM_INTRINSIC_SAMPLES}；拒绝 {item['rejected']}\n"
-                f"  覆盖不足：{missing}\n"
-                f"  最近拒绝：{item['last_rejection_reason'] or '无'}\n"
-                f"  建议：{rejection_advice(item['last_rejection_reason'])}"
+                self.bt(
+                    "{camera}: accepted {accepted} / target {target}, minimum {minimum}; rejected {rejected}\n"
+                    "  Missing coverage: {missing}\n  Latest rejection: {reason}\n  Recommendation: {advice}",
+                    "{camera}：已接受 {accepted} / 目标 {target}，最低 {minimum}；拒绝 {rejected}\n"
+                    "  覆盖不足：{missing}\n  最近拒绝：{reason}\n  建议：{advice}",
+                    camera=camera,
+                    accepted=item["accepted"],
+                    target=item["target"],
+                    minimum=MINIMUM_INTRINSIC_SAMPLES,
+                    rejected=item["rejected"],
+                    missing=missing,
+                    reason=quality_reason_text(
+                        item["last_rejection_reason"],
+                        self.language,
+                    )
+                    or self.bt("none", "无"),
+                    advice=rejection_advice(item["last_rejection_reason"], self.language),
+                )
             )
         self.wizard_intrinsic_progress.setPlainText(
             "\n\n".join(intrinsic_lines)
@@ -7860,13 +8686,26 @@ class MainWindow(QMainWindow):
         for pair_key in ("front_left__front", "front__front_right"):
             item = summary["stereo_pairs"][pair_key]
             display = pair_key.replace("__", " ↔ ")
-            missing = "、".join(item["missing_coverage_zones"][:5]) or "无"
+            missing = ", ".join(item["missing_coverage_zones"][:5]) or self.bt("none", "无")
             pair_lines.append(
-                f"{display}：已接受 {item['accepted']} / 目标 {item['target']}，"
-                f"最低 {MINIMUM_PAIR_SAMPLES}；拒绝 {item['rejected']}\n"
-                f"  位置/距离覆盖不足：{missing}\n"
-                f"  最近拒绝：{item['last_rejection_reason'] or '无'}\n"
-                f"  建议：{rejection_advice(item['last_rejection_reason'])}"
+                self.bt(
+                    "{pair}: accepted {accepted} / target {target}, minimum {minimum}; rejected {rejected}\n"
+                    "  Missing position/distance coverage: {missing}\n  Latest rejection: {reason}\n  Recommendation: {advice}",
+                    "{pair}：已接受 {accepted} / 目标 {target}，最低 {minimum}；拒绝 {rejected}\n"
+                    "  位置/距离覆盖不足：{missing}\n  最近拒绝：{reason}\n  建议：{advice}",
+                    pair=display,
+                    accepted=item["accepted"],
+                    target=item["target"],
+                    minimum=MINIMUM_PAIR_SAMPLES,
+                    rejected=item["rejected"],
+                    missing=missing,
+                    reason=quality_reason_text(
+                        item["last_rejection_reason"],
+                        self.language,
+                    )
+                    or self.bt("none", "无"),
+                    advice=rejection_advice(item["last_rejection_reason"], self.language),
+                )
             )
         self.wizard_pair_progress.setPlainText("\n\n".join(pair_lines))
         first_pair = self._first_incomplete_pair_index()
@@ -7884,46 +8723,81 @@ class MainWindow(QMainWindow):
             f"QLabel {{ font-size: 16px; font-weight: 700; "
             f"padding: 8px; color: {color}; }}"
         )
-        self.wizard_readiness_label.setText(readiness["label"])
+        readiness_labels = {
+            "ready": self.bt("Ready for B-2 Solve", "可进入 B-2 求解"),
+            "try_with_risk": self.bt(
+                "Can Try, but Sample Quality Is Insufficient",
+                "可尝试，但样本质量不足",
+            ),
+            "not_recommended": self.bt("Solve Not Recommended Yet", "暂不建议求解"),
+        }
+        self.wizard_readiness_label.setText(readiness_labels[readiness["status"]])
         review_lines = [
-            f"Session：{session.directory}",
-            f"标定板参数：{'已确认' if session.data.get('board_confirmed') else '未确认'}",
-            f"分辨率：{session.data.get('resolution')}",
+            self.bt("Session: {path}", "Session：{path}", path=session.directory),
+            self.bt(
+                "Board parameters: {state}",
+                "标定板参数：{state}",
+                state=self.bt("confirmed", "已确认") if session.data.get("board_confirmed") else self.bt("not confirmed", "未确认"),
+            ),
+            self.bt("Resolution: {value}", "分辨率：{value}", value=session.data.get("resolution")),
         ]
         review_lines.extend(
-            f"阻塞：{reason}\n  下一步：{rejection_advice(reason)}"
+            self.bt(
+                "Blocker: {reason}\n  Next step: {advice}",
+                "阻塞：{reason}\n  下一步：{advice}",
+                reason=quality_reason_text(reason, self.language),
+                advice=rejection_advice(reason, self.language),
+            )
             for reason in readiness["blocking_reasons"]
         )
         review_lines.extend(
-            f"风险：{reason}\n  下一步：{rejection_advice(reason)}"
+            self.bt(
+                "Risk: {reason}\n  Next step: {advice}",
+                "风险：{reason}\n  下一步：{advice}",
+                reason=quality_reason_text(reason, self.language),
+                advice=rejection_advice(reason, self.language),
+            )
             for reason in readiness["quality_issues"]
         )
         if readiness["status"] == "ready":
             review_lines.append(
-                "数量与基础质量门控均满足，可以在 B-2 中生成候选标定。"
+                self.bt(
+                    "Sample count and baseline quality gates are satisfied. A calibration candidate can be generated in B-2.",
+                    "数量与基础质量门控均满足，可以在 B-2 中生成候选标定。",
+                )
             )
-            mode_text = (
-                "正式候选模式：可进入 B-2；候选通过复核后才可申请应用。"
+            mode_text = self.bt(
+                "Candidate mode: B-2 is available. A candidate must pass review before it can be considered for application.",
+                "正式候选模式：可进入 B-2；候选通过复核后才可申请应用。",
             )
-            entry_text = "进入 B-2 候选求解"
+            entry_text = self.bt("Enter B-2 Candidate Solve", "进入 B-2 候选求解")
         elif readiness["status"] == "try_with_risk":
             review_lines.extend(
                 (
-                    "[experimental] 仅允许生成候选与诊断报告，"
-                    "禁止应用候选标定。",
-                    "请补充 Pair 的位置、距离和倾角覆盖，"
-                    "通过正式质量门槛后再申请应用。",
+                    self.bt(
+                        "[experimental] Candidate and diagnostic report generation only; applying the candidate is disabled.",
+                        "[experimental] 仅允许生成候选与诊断报告，禁止应用候选标定。",
+                    ),
+                    self.bt(
+                        "Add pair coverage across position, distance and tilt, then meet the formal quality gate before requesting application.",
+                        "请补充 Pair 的位置、距离和倾角覆盖，通过正式质量门槛后再申请应用。",
+                    ),
                 )
             )
-            mode_text = (
-                "[experimental] 实验性候选求解（仅报告）："
-                "可查看候选内外参、RMS、异常样本、Pair-only 与"
-                "候选全景预览；禁止应用。"
+            mode_text = self.bt(
+                "[experimental] Report-only candidate solve: inspect intrinsics, extrinsics, RMS, outliers, pair-only and panorama previews. Applying is disabled.",
+                "[experimental] 实验性候选求解（仅报告）：可查看候选内外参、RMS、异常样本、Pair-only 与候选全景预览；禁止应用。",
             )
-            entry_text = "实验性候选求解（仅报告）"
+            entry_text = self.bt(
+                "Experimental Candidate Solve (Report Only)",
+                "实验性候选求解（仅报告）",
+            )
         else:
-            mode_text = "当前样本不满足求解前提，B-2 入口已锁定。"
-            entry_text = "暂不可进入 B-2"
+            mode_text = self.bt(
+                "Current samples do not meet solve prerequisites; the B-2 entry is locked.",
+                "当前样本不满足求解前提，B-2 入口已锁定。",
+            )
+            entry_text = self.bt("B-2 Not Available Yet", "暂不可进入 B-2")
         self.wizard_b2_mode_label.setText(mode_text)
         if self.calibration_wizard_stack.currentIndex() == 4:
             self.wizard_next_button.setText(entry_text)
@@ -7963,9 +8837,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 self.t("Calibration Wizard"),
-                "当前采样结论为“暂不建议求解”，不能进入 B-2。\n\n"
-                "发生了什么：标定板确认、分辨率或最低样本数量尚未满足。\n"
-                "下一步：查看本页的“阻塞”和“下一步”提示，补拍后再检查。",
+                self.bt(
+                    "The current capture result is 'Solve Not Recommended Yet', so B-2 cannot start.\n\n"
+                    "What happened: board confirmation, resolution or minimum sample counts are incomplete.\n"
+                    "Next step: follow the Blocker and Next step guidance on this page, add samples, then review again.",
+                    "当前采样结论为“暂不建议求解”，不能进入 B-2。\n\n"
+                    "发生了什么：标定板确认、分辨率或最低样本数量尚未满足。\n"
+                    "下一步：查看本页的“阻塞”和“下一步”提示，补拍后再检查。",
+                ),
             )
             return
         if self.b2_candidate_solver_launcher is not None:
@@ -7987,11 +8866,15 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(
                 self,
                 self.t("Calibration Wizard"),
-                f"实验性候选求解失败：\n{exc}\n\n"
-                "可能原因：某台相机有效样本不足、某个 Pair 无法求出稳定关系，"
-                "或候选输出文件不完整。\n"
-                "下一步：保留当前 session，查看日志与拒绝原因，补拍后重试；"
-                "正式 calibration.yaml 未被应用。",
+                self.bt(
+                    "Experimental candidate solve failed:\n{error}\n\n"
+                    "Possible cause: insufficient valid samples for a camera, an unstable pair relationship, or incomplete candidate output.\n"
+                    "Next step: keep the current session, review logs and rejection reasons, add samples and retry. Formal calibration.yaml was not applied.",
+                    "实验性候选求解失败：\n{error}\n\n"
+                    "可能原因：某台相机有效样本不足、某个 Pair 无法求出稳定关系，或候选输出文件不完整。\n"
+                    "下一步：保留当前 session，查看日志与拒绝原因，补拍后重试；正式 calibration.yaml 未被应用。",
+                    error=exc,
+                ),
             )
             return
         finally:
@@ -8353,7 +9236,7 @@ class MainWindow(QMainWindow):
             f"{record['sample_id']}: "
             f"{'ACCEPTED' if record['accepted'] else 'REJECTED'}\n"
             f"Reasons: {reasons}\nWarnings: {warnings}\n"
-            f"下一步建议：{rejection_advice(reasons if reasons != 'none' else '')}"
+            + self.bt("Next recommendation: {advice}", "下一步建议：{advice}", advice=rejection_advice(reasons if reasons != "none" else "", self.language))
         )
         self.calibration_session_log.append(message)
         self.refresh_calibration_session_status()
@@ -9057,7 +9940,7 @@ class MainWindow(QMainWindow):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindow(auto_preview_on_view_change=True)
     window.show()
     return app.exec()
 

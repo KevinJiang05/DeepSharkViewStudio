@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import yaml
@@ -369,20 +369,26 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        self.logger_patch = patch(
+            "deep_shark_studio.gui.main_window.create_application_logger",
+            return_value=MagicMock(),
+        )
+        self.logger_patch.start()
         self.window = MainWindow()
 
     def tearDown(self) -> None:
         self.window.close()
+        self.logger_patch.stop()
 
     def test_runtime_mode_controls_exist(self) -> None:
         self.assertIsInstance(
             self.window.stitch_runtime_mode_panel,
             StitchRuntimeModePanel,
         )
-        self.assertTrue(hasattr(self.window, "runtime_mode_combo"))
-        self.assertTrue(hasattr(self.window, "runtime_projection_label"))
+        self.assertTrue(hasattr(self.window, "runtime_view_combo"))
+        self.assertFalse(hasattr(self.window, "runtime_mode_combo"))
+        self.assertFalse(hasattr(self.window, "runtime_projection_combo"))
         self.assertTrue(hasattr(self.window, "runtime_candidate_status"))
-        self.assertTrue(hasattr(self.window, "far_field_custom_layout_check"))
         self.assertTrue(hasattr(self.window, "far_field_load_candidate_button"))
         self.assertTrue(hasattr(self.window, "far_field_layout_candidate_status"))
         self.assertTrue(hasattr(self.window, "runtime_apply_button"))
@@ -404,12 +410,38 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         class FakeSink:
             def __init__(self, config):
                 self.config = config
+                self.opened = False
+                self.frames_written = 0
+
+            def preflight(self):
+                return "fake ffmpeg"
+
+            def open(self, width, height, fps):
+                self.opened = True
 
             def write(self, frame):
                 writes.append(np.asarray(frame).copy())
+                self.frames_written += 1
+                return True
+
+            def status(self):
+                return SimpleNamespace(
+                    state="running",
+                    running=True,
+                    pid=1234,
+                    frames_submitted=self.frames_written,
+                    frames_written=self.frames_written,
+                    frames_dropped=0,
+                    pending_frames=0,
+                    restart_count=0,
+                    last_restart_reason="",
+                    last_error="",
+                    last_stderr_line="",
+                    exit_code=None,
+                )
 
             def close(self):
-                pass
+                self.opened = False
 
         with patch("deep_shark_studio.gui.main_window.FfmpegVideoSink", FakeSink):
             self.window.start_qgc_output_service()
@@ -419,6 +451,135 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         self.assertTrue(self.window.qgc_output_stop_button.isEnabled())
         self.assertEqual(1, len(writes))
         self.assertTrue(np.array_equal(self.window.canvas, writes[0]))
+
+    def test_qgc_output_does_not_claim_running_without_a_canvas(self) -> None:
+        self.window.canvas = None
+
+        class FakeSink:
+            def __init__(self, config):
+                self.config = config
+
+            def close(self):
+                return None
+
+        with patch(
+            "deep_shark_studio.gui.main_window.FfmpegVideoSink",
+            FakeSink,
+        ):
+            self.window.start_qgc_output_service()
+
+        self.assertFalse(self.window.qgc_output_active)
+        self.assertTrue(self.window.qgc_output_start_button.isEnabled())
+        self.assertFalse(self.window.qgc_output_stop_button.isEnabled())
+        self.assertIn("canvas", self.window.qgc_output_last_error.lower())
+
+    def test_qgc_status_uses_effective_start_config_and_locks_widgets(self) -> None:
+        self.window.canvas = np.zeros((24, 32, 3), dtype=np.uint8)
+        self.window.qgc_output_url.setText(
+            "udp://127.0.0.1:5600?pkt_size=1316"
+        )
+
+        class FakeSink:
+            def __init__(self, config):
+                self.config = config
+
+            def preflight(self):
+                return "fake ffmpeg"
+
+            def open(self, width, height, fps):
+                return None
+
+            def write(self, frame):
+                return True
+
+            def status(self):
+                return SimpleNamespace(
+                    state="running",
+                    running=True,
+                    pid=4321,
+                    frames_submitted=4,
+                    frames_written=3,
+                    frames_dropped=1,
+                    pending_frames=0,
+                    restart_count=0,
+                    last_restart_reason="",
+                    last_error="",
+                    last_stderr_line="",
+                    exit_code=None,
+                )
+
+            def close(self):
+                return None
+
+        with patch(
+            "deep_shark_studio.gui.main_window.FfmpegVideoSink",
+            FakeSink,
+        ):
+            self.window.start_qgc_output_service()
+
+        self.window.qgc_output_url.setText("udp://127.0.0.1:9999")
+        self.window.refresh_qgc_output_status(force=True)
+
+        status_text = self.window.qgc_output_service_status.text()
+        self.assertIn("127.0.0.1:5600", status_text)
+        self.assertNotIn("127.0.0.1:9999", status_text)
+        self.assertFalse(self.window.qgc_output_url.isEnabled())
+        self.assertIn("written 3", status_text)
+        self.assertIn("dropped 1", status_text)
+
+        self.window.stop_qgc_output_service()
+        self.assertTrue(self.window.qgc_output_url.isEnabled())
+
+    def test_qgc_async_failure_updates_actual_ui_state(self) -> None:
+        self.window.canvas = np.zeros((24, 32, 3), dtype=np.uint8)
+        state = {"value": "running"}
+
+        class FakeSink:
+            def __init__(self, config):
+                self.config = config
+
+            def preflight(self):
+                return "fake ffmpeg"
+
+            def open(self, width, height, fps):
+                return None
+
+            def write(self, frame):
+                return True
+
+            def status(self):
+                failed = state["value"] == "failed"
+                return SimpleNamespace(
+                    state=state["value"],
+                    running=not failed,
+                    pid=None if failed else 5678,
+                    frames_submitted=2,
+                    frames_written=1,
+                    frames_dropped=1,
+                    pending_frames=0,
+                    restart_count=3 if failed else 0,
+                    last_restart_reason="broken pipe" if failed else "",
+                    last_error="receiver unavailable" if failed else "",
+                    last_stderr_line="connection refused" if failed else "",
+                    exit_code=1 if failed else None,
+                )
+
+            def close(self):
+                return None
+
+        with patch(
+            "deep_shark_studio.gui.main_window.FfmpegVideoSink",
+            FakeSink,
+        ):
+            self.window.start_qgc_output_service()
+
+        state["value"] = "failed"
+        self.window.refresh_qgc_output_status(force=True)
+
+        self.assertFalse(self.window.qgc_output_active)
+        self.assertTrue(self.window.qgc_output_start_button.isEnabled())
+        self.assertIn("receiver unavailable", self.window.qgc_output_service_status.text())
+        self.assertIn("exit 1", self.window.qgc_output_service_status.text())
 
     def test_qgc_output_writes_current_canvas_after_stitch_result(self) -> None:
         writes: list[np.ndarray] = []
@@ -477,13 +638,20 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
             for index in range(self.window.root_tabs.count())
         ]
 
-        self.assertEqual(6, len(tab_texts))
-        self.assertTrue(any("实时" in text or "Realtime" in text for text in tab_texts))
-        self.assertTrue(any("布局" in text or "Layout" in text for text in tab_texts))
-        self.assertTrue(any("标定" in text or "Calibration" in text for text in tab_texts))
-        self.assertTrue(any("投影" in text or "Projection" in text for text in tab_texts))
-        self.assertTrue(any("项目" in text or "Project" in text for text in tab_texts))
-        self.assertTrue(any("诊断" in text or "Diagnostics" in text for text in tab_texts))
+        self.assertEqual(5, len(tab_texts))
+        self.assertEqual(
+            [
+                "realtime_monitor",
+                "layout_lab",
+                "calibration_candidates",
+                "project_management",
+                "diagnostics_logs",
+            ],
+            [
+                self.window.root_tabs.widget(index).objectName()
+                for index in range(self.window.root_tabs.count())
+            ],
+        )
 
     def test_project_package_buttons_exist(self) -> None:
         self.assertTrue(hasattr(self.window, "project_package_export_button"))
@@ -502,56 +670,60 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
             self.window.preview_tabs.tabText(index)
             for index in range(self.window.preview_tabs.count())
         ]
-        root_tab_texts = [
-            self.window.root_tabs.tabText(index)
-            for index in range(self.window.root_tabs.count())
-        ]
-
         self.assertFalse(any("Layout" in text or "布局调参" in text for text in preview_tab_texts))
-        self.assertTrue(any("Layout" in text or "布局调参" in text for text in root_tab_texts))
+        self.assertIn(
+            "layout_lab",
+            [
+                self.window.root_tabs.widget(index).objectName()
+                for index in range(self.window.root_tabs.count())
+            ],
+        )
 
     def test_runtime_ui_copy_is_not_misleading(self) -> None:
-        auto_item = self.window.runtime_mode_combo.model().item(2)
-
-        self.assertIsNotNone(auto_item)
-        self.assertFalse(auto_item.isEnabled())
-        projection_sources = [
-            self.window.runtime_projection_combo.itemData(index)
-            for index in range(self.window.runtime_projection_combo.count())
+        view_presets = [
+            self.window.runtime_view_combo.itemData(index)
+            for index in range(self.window.runtime_view_combo.count())
         ]
-        self.assertIn(ProjectionSource.CURRENT_PERSPECTIVE.value, projection_sources)
-        self.assertIn(
-            ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value,
-            projection_sources,
-        )
-        self.assertNotIn(ProjectionSource.EQUIRECTANGULAR_CANDIDATE.value, projection_sources)
         self.assertEqual(
-            ProjectionSource.CURRENT_PERSPECTIVE.value,
-            self.window.runtime_projection_combo.currentData(),
+            [
+                "far_default",
+                "b2_view",
+                "far_custom",
+                "near_current",
+                "near_fisheye",
+            ],
+            view_presets,
         )
-        self.assertIn("Layout", self.window.runtime_load_candidate_button.text())
-        self.assertNotIn("Runtime", self.window.runtime_apply_button.text())
+        self.assertEqual(
+            "far_default",
+            self.window.runtime_view_combo.currentData(),
+        )
+        self.assertTrue(
+            "Layout" in self.window.runtime_load_candidate_button.text()
+            or "布局" in self.window.runtime_load_candidate_button.text()
+        )
         self.assertIn("calibration.yaml", self.window.runtime_apply_button.toolTip())
-        self.assertIn("B-2", self.window.candidate_stitch_button.text())
-        self.assertFalse(self.window.template_stitch_button.isHidden())
+        self.assertFalse(hasattr(self.window, "candidate_stitch_button"))
+        self.assertFalse(hasattr(self.window, "template_stitch_button"))
         far_text = self.window.far_field_load_candidate_button.text()
         near_text = self.window.runtime_load_candidate_button.text()
-        self.assertTrue("Far-field" in far_text or "远景" in far_text)
-        self.assertTrue("Near-field" in near_text or "近景" in near_text)
+        self.assertTrue("Far" in far_text or "远景" in far_text)
+        self.assertTrue("Near" in near_text or "近景" in near_text)
 
-    def test_runtime_mode_combo_can_select_near_field_before_apply(self) -> None:
-        near_index = self.window.runtime_mode_combo.findData(
-            StitchRuntimeMode.NEAR_FIELD.value
-        )
+    def test_runtime_view_can_select_near_field_before_apply(self) -> None:
+        near_index = self.window.runtime_view_combo.findData("near_current")
 
         self.assertGreaterEqual(near_index, 0)
-        self.window.runtime_mode_combo.setCurrentIndex(near_index)
+        self.window.runtime_view_combo.setCurrentIndex(near_index)
 
         self.assertEqual(
             StitchRuntimeMode.NEAR_FIELD,
             self.window.selected_runtime_mode(),
         )
-        self.assertTrue(self.window.runtime_projection_combo.isEnabled())
+        self.assertEqual(
+            ProjectionSource.CURRENT_PERSPECTIVE,
+            self.window.selected_projection_source(),
+        )
 
     def test_canvas_overlay_uses_current_runtime_mode(self) -> None:
         self.window.preview_content_mode = PreviewContentMode.LIVE
@@ -597,9 +769,11 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
             self.window.load_runtime_layout_candidate_path(path)
 
             text = self.window.runtime_candidate_status.text()
+            details = self.window.runtime_candidate_status.toolTip()
             self.assertIn("schema_version: 2", text)
             self.assertIn("profile_id: triple_front_panorama", text)
-            self.assertIn("left_pair:", text)
+            self.assertIn("left_pair:", details)
+            self.assertIn("right_pair:", details)
         after = file_revision(CONFIG_DIR / "calibration.yaml")
         self.assertEqual(before, after)
 

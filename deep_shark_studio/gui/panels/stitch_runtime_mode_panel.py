@@ -1,25 +1,27 @@
-"""Stitch runtime mode controls."""
+"""Compact runtime workflow panel."""
 
 from __future__ import annotations
 
 from typing import Callable, Type
 
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QPushButton,
     QSizePolicy,
+    QVBoxLayout,
+    QWidget,
 )
 
-from deep_shark_studio.stitch_runtime_modes import ProjectionSource, StitchRuntimeMode
+from deep_shark_studio.gui.runtime_workflow import RuntimeViewPreset
 
 
 class StitchRuntimeModePanel(QGroupBox):
-    """UI-only panel for selecting runtime stitch modes and candidates."""
+    """Expose five supported runtime views and collapse their source assets."""
 
     def __init__(
         self,
@@ -28,10 +30,12 @@ class StitchRuntimeModePanel(QGroupBox):
         double_spin_box_class: Type[QDoubleSpinBox] = QDoubleSpinBox,
         parent=None,
     ):
-        super().__init__(translate("Stitch Runtime Mode"), parent)
+        super().__init__(translate("Runtime View"), parent)
         self.t = translate
         self.setToolTip(
-            self.t("Runtime stitching algorithm, independent from Grid / Focus / Stitched layout.")
+            self.t(
+                "Choose one concrete processing view. Grid, Focus, and Stitched only change display layout."
+            )
         )
         self._build(combo_box_class, double_spin_box_class)
 
@@ -40,39 +44,126 @@ class StitchRuntimeModePanel(QGroupBox):
         combo_box_class: Type[QComboBox],
         double_spin_box_class: Type[QDoubleSpinBox],
     ) -> None:
-        layout = QGridLayout(self)
-        self.runtime_mode_combo = combo_box_class()
-        self.runtime_mode_combo.addItem(
-            self.t("Far-field / distance priority"),
-            StitchRuntimeMode.FAR_FIELD.value,
-        )
-        self.runtime_mode_combo.addItem(
-            self.t("Near-field / front priority"),
-            StitchRuntimeMode.NEAR_FIELD.value,
-        )
-        self.runtime_mode_combo.addItem(
-            self.t("Auto / experimental disabled"),
-            StitchRuntimeMode.AUTO.value,
-        )
-        auto_item = self.runtime_mode_combo.model().item(2)
-        if auto_item is not None:
-            auto_item.setEnabled(False)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 6, 8, 7)
+        root.setSpacing(5)
 
-        self.runtime_projection_label = QLabel(self.t("Near-field Projection Source"))
-        self.runtime_projection_note = QLabel(self.t("Far-field uses current runtime projection."))
-        self.runtime_projection_note.setWordWrap(True)
-        self.runtime_projection_combo = combo_box_class()
-        self.runtime_projection_combo.addItem(
-            self.t("Current Perspective"),
-            ProjectionSource.CURRENT_PERSPECTIVE.value,
+        primary = QGridLayout()
+        primary.setHorizontalSpacing(8)
+        self.runtime_view_combo = combo_box_class()
+        self.runtime_view_combo.addItem(
+            self.t("Far Default — current profile"),
+            RuntimeViewPreset.FAR_DEFAULT.value,
         )
-        self.runtime_projection_combo.addItem(
-            self.t("Fisheye Rectilinear [Experimental]"),
-            ProjectionSource.FISHEYE_RECTILINEAR_CANDIDATE.value,
+        self.runtime_view_combo.addItem(
+            self.t("B-2 View — candidate diagnostics [Advanced]"),
+            RuntimeViewPreset.B2_VIEW.value,
         )
-        self.runtime_projection_combo.setToolTip(
-            self.t("Fisheye Rectilinear is experimental and only affects Near-field preview/runtime.")
+        self.runtime_view_combo.addItem(
+            self.t("Far Custom — B-2 projection + custom layout"),
+            RuntimeViewPreset.FAR_CUSTOM.value,
         )
+        self.runtime_view_combo.addItem(
+            self.t("Near Current — current perspective"),
+            RuntimeViewPreset.NEAR_CURRENT.value,
+        )
+        self.runtime_view_combo.addItem(
+            self.t("Near Fisheye — rectilinear [Experimental]"),
+            RuntimeViewPreset.NEAR_FISHEYE.value,
+        )
+        self.runtime_view_combo.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.runtime_apply_button = QPushButton(self.t("Apply Runtime View"))
+        self.runtime_apply_button.setToolTip(
+            self.t(
+                "Apply to the current preview worker only. This does not write calibration.yaml."
+            )
+        )
+        primary.addWidget(QLabel(self.t("View")), 0, 0)
+        primary.addWidget(self.runtime_view_combo, 0, 1)
+        primary.addWidget(self.runtime_apply_button, 0, 2)
+
+        self.runtime_selection_summary = QLabel()
+        self.runtime_selection_summary.setWordWrap(True)
+        self.runtime_selection_summary.setStyleSheet(
+            "QLabel { color: #475569; padding: 1px 0; }"
+        )
+        primary.addWidget(self.runtime_selection_summary, 1, 1, 1, 2)
+        root.addLayout(primary)
+
+        status_row = QHBoxLayout()
+        self.runtime_effective_status_label = QLabel()
+        self.runtime_effective_status_label.setWordWrap(True)
+        self.runtime_effective_status_label.setStyleSheet(
+            "QLabel { color: #9a3412; font-weight: 600; }"
+        )
+        self.runtime_details_toggle = QPushButton(
+            self.t("Candidate & Projection Sources")
+        )
+        self.runtime_details_toggle.setCheckable(True)
+        self.runtime_details_toggle.setChecked(False)
+        self.runtime_details_toggle.toggled.connect(self.set_details_visible)
+        status_row.addWidget(self.runtime_effective_status_label, 1)
+        status_row.addWidget(self.runtime_details_toggle)
+        root.addLayout(status_row)
+
+        self.runtime_details_container = QWidget()
+        details = QGridLayout(self.runtime_details_container)
+        details.setContentsMargins(8, 6, 8, 4)
+        details.setHorizontalSpacing(8)
+        details.setVerticalSpacing(5)
+
+        self.b2_source_label = QLabel(self.t("B-2 Projection Candidate"))
+        self.b2_candidate_status = QLabel()
+        self.b2_candidate_status.setWordWrap(True)
+        details.addWidget(self.b2_source_label, 0, 0)
+        details.addWidget(self.b2_candidate_status, 0, 1, 1, 3)
+
+        self.far_source_label = QLabel(self.t("Far Custom Layout"))
+        self.far_field_layout_candidate_status = QLabel(
+            self.t("No Far-field Layout Candidate loaded.")
+        )
+        self.far_field_layout_candidate_status.setWordWrap(True)
+        self.far_field_load_candidate_button = QPushButton(
+            self.t("Load Far Custom Layout...")
+        )
+        self.far_field_clear_candidate_button = QPushButton(self.t("Clear"))
+        details.addWidget(self.far_source_label, 1, 0)
+        details.addWidget(self.far_field_layout_candidate_status, 1, 1)
+        details.addWidget(self.far_field_load_candidate_button, 1, 2)
+        details.addWidget(self.far_field_clear_candidate_button, 1, 3)
+
+        self.near_source_label = QLabel(self.t("Near Layout Candidate"))
+        self.runtime_candidate_status = QLabel(
+            self.t("No Near Layout Candidate loaded.")
+        )
+        self.runtime_candidate_status.setWordWrap(True)
+        self.runtime_load_candidate_button = QPushButton(
+            self.t("Load Near Layout...")
+        )
+        self.runtime_clear_candidate_button = QPushButton(self.t("Clear"))
+        self.runtime_open_candidate_button = QPushButton(self.t("Open Folder"))
+        details.addWidget(self.near_source_label, 2, 0)
+        details.addWidget(self.runtime_candidate_status, 2, 1)
+        details.addWidget(self.runtime_load_candidate_button, 2, 2)
+        details.addWidget(self.runtime_clear_candidate_button, 2, 3)
+        details.addWidget(self.runtime_open_candidate_button, 3, 3)
+
+        self.fisheye_source_label = QLabel(self.t("Near Fisheye Intrinsics"))
+        self.runtime_fisheye_source_status = QLabel(
+            self.t("No fisheye intrinsics source loaded.")
+        )
+        self.runtime_fisheye_source_status.setWordWrap(True)
+        self.runtime_load_fisheye_button = QPushButton(
+            self.t("Load Fisheye Intrinsics...")
+        )
+        self.runtime_clear_fisheye_button = QPushButton(self.t("Clear"))
+        details.addWidget(self.fisheye_source_label, 4, 0)
+        details.addWidget(self.runtime_fisheye_source_status, 4, 1)
+        details.addWidget(self.runtime_load_fisheye_button, 4, 2)
+        details.addWidget(self.runtime_clear_fisheye_button, 4, 3)
 
         self.runtime_fisheye_balance = double_spin_box_class()
         self.runtime_fisheye_balance.setRange(0.0, 1.0)
@@ -84,75 +175,75 @@ class StitchRuntimeModePanel(QGroupBox):
         self.runtime_fisheye_fov_scale.setSingleStep(0.05)
         self.runtime_fisheye_fov_scale.setDecimals(2)
         self.runtime_fisheye_fov_scale.setValue(1.0)
+        self.fisheye_params_widget = QWidget()
+        fisheye_params = QHBoxLayout(self.fisheye_params_widget)
+        fisheye_params.setContentsMargins(0, 0, 0, 0)
+        fisheye_params.addWidget(QLabel(self.t("Balance")))
+        fisheye_params.addWidget(self.runtime_fisheye_balance)
+        fisheye_params.addWidget(QLabel(self.t("FOV Scale")))
+        fisheye_params.addWidget(self.runtime_fisheye_fov_scale)
+        fisheye_params.addStretch(1)
+        details.addWidget(self.fisheye_params_widget, 5, 1, 1, 3)
 
-        self.runtime_load_fisheye_button = QPushButton(
-            self.t("Load Fisheye Intrinsics Source...")
-        )
-        self.runtime_clear_fisheye_button = QPushButton(
-            self.t("Clear Fisheye Intrinsics Source")
-        )
-        self.runtime_fisheye_source_status = QLabel(
-            self.t("No fisheye intrinsics source loaded.")
-        )
-        self.runtime_fisheye_source_status.setWordWrap(True)
-        self.runtime_fisheye_source_status.setMaximumHeight(48)
-        self.runtime_fisheye_source_status.setSizePolicy(
-            QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Preferred,
-        )
+        self.runtime_details_container.setVisible(False)
+        root.addWidget(self.runtime_details_container)
+        self.set_source_context(RuntimeViewPreset.FAR_DEFAULT)
 
-        self.far_field_custom_layout_check = QCheckBox(
-            self.t("Use Far-field Custom Layout")
-        )
-        self.far_field_layout_candidate_status = QLabel(
-            self.t("No Far-field Layout Candidate loaded.")
-        )
-        self.far_field_layout_candidate_status.setWordWrap(True)
-        self.far_field_layout_candidate_status.setMaximumHeight(70)
-        self.far_field_layout_candidate_status.setSizePolicy(
-            QSizePolicy.Policy.Ignored,
-            QSizePolicy.Policy.Preferred,
-        )
-        self.far_field_load_candidate_button = QPushButton(
-            self.t("Load Far-field Layout Candidate")
-        )
-        self.far_field_clear_candidate_button = QPushButton(
-            self.t("Clear Far-field Layout Candidate")
+    def set_details_visible(self, visible: bool) -> None:
+        self.runtime_details_container.setVisible(visible)
+        self.runtime_details_toggle.setText(
+            self.t("Hide Candidate & Projection Sources")
+            if visible
+            else self.t("Candidate & Projection Sources")
         )
 
-        self.runtime_candidate_status = QLabel(self.t("No Layout Candidate V2 loaded."))
-        self.runtime_candidate_status.setWordWrap(True)
-        self.runtime_load_candidate_button = QPushButton(
-            self.t("Load Near-field Layout Candidate")
-        )
-        self.runtime_clear_candidate_button = QPushButton(self.t("Clear Near-field Layout Candidate"))
-        self.runtime_open_candidate_button = QPushButton(self.t("Open Candidate Folder"))
-        self.runtime_apply_button = QPushButton(self.t("Use for Current Preview Only"))
-        self.runtime_apply_button.setToolTip(
-            self.t(
-                "Only applies to the current preview worker; does not write calibration.yaml or the formal profile."
-            )
-        )
+    def set_selected_preset(self, preset: RuntimeViewPreset | str) -> None:
+        value = preset.value if isinstance(preset, RuntimeViewPreset) else str(preset)
+        index = self.runtime_view_combo.findData(value)
+        if index >= 0:
+            self.runtime_view_combo.setCurrentIndex(index)
 
-        layout.addWidget(QLabel(self.t("Mode")), 0, 0)
-        layout.addWidget(self.runtime_mode_combo, 0, 1)
-        layout.addWidget(self.runtime_projection_note, 0, 2, 1, 2)
-        layout.addWidget(self.runtime_projection_label, 1, 0)
-        layout.addWidget(self.runtime_projection_combo, 1, 1)
-        layout.addWidget(QLabel(self.t("Fisheye Balance")), 1, 2)
-        layout.addWidget(self.runtime_fisheye_balance, 1, 3)
-        layout.addWidget(QLabel(self.t("Fisheye FOV Scale")), 2, 2)
-        layout.addWidget(self.runtime_fisheye_fov_scale, 2, 3)
-        layout.addWidget(self.runtime_load_fisheye_button, 2, 0)
-        layout.addWidget(self.runtime_clear_fisheye_button, 2, 1)
-        layout.addWidget(self.runtime_fisheye_source_status, 3, 0, 1, 4)
-        layout.addWidget(self.far_field_custom_layout_check, 4, 0, 1, 2)
-        layout.addWidget(self.far_field_layout_candidate_status, 4, 2, 1, 2)
-        layout.addWidget(self.far_field_load_candidate_button, 5, 0)
-        layout.addWidget(self.far_field_clear_candidate_button, 5, 1)
-        layout.addWidget(QLabel(self.t("Near-field Layout Candidate")), 6, 0)
-        layout.addWidget(self.runtime_candidate_status, 6, 1, 1, 3)
-        layout.addWidget(self.runtime_load_candidate_button, 7, 0)
-        layout.addWidget(self.runtime_clear_candidate_button, 7, 1)
-        layout.addWidget(self.runtime_open_candidate_button, 7, 2)
-        layout.addWidget(self.runtime_apply_button, 7, 3)
+    def set_source_context(self, preset: RuntimeViewPreset | str) -> None:
+        if not isinstance(preset, RuntimeViewPreset):
+            preset = RuntimeViewPreset(str(preset))
+        show_b2 = preset in {
+            RuntimeViewPreset.B2_VIEW,
+            RuntimeViewPreset.FAR_CUSTOM,
+        }
+        show_far = preset == RuntimeViewPreset.FAR_CUSTOM
+        show_near = preset in {
+            RuntimeViewPreset.NEAR_CURRENT,
+            RuntimeViewPreset.NEAR_FISHEYE,
+        }
+        show_fisheye = preset == RuntimeViewPreset.NEAR_FISHEYE
+
+        for widget in (self.b2_source_label, self.b2_candidate_status):
+            widget.setVisible(show_b2)
+        for widget in (
+            self.far_source_label,
+            self.far_field_layout_candidate_status,
+            self.far_field_load_candidate_button,
+            self.far_field_clear_candidate_button,
+        ):
+            widget.setVisible(show_far)
+        for widget in (
+            self.near_source_label,
+            self.runtime_candidate_status,
+            self.runtime_load_candidate_button,
+            self.runtime_clear_candidate_button,
+            self.runtime_open_candidate_button,
+        ):
+            widget.setVisible(show_near)
+        for widget in (
+            self.fisheye_source_label,
+            self.runtime_fisheye_source_status,
+            self.runtime_load_fisheye_button,
+            self.runtime_clear_fisheye_button,
+            self.fisheye_params_widget,
+        ):
+            widget.setVisible(show_fisheye)
+
+        has_sources = preset != RuntimeViewPreset.FAR_DEFAULT
+        self.runtime_details_toggle.setEnabled(has_sources)
+        if not has_sources:
+            self.runtime_details_toggle.setChecked(False)

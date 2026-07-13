@@ -119,16 +119,23 @@ class PreviewStateTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        self.logger_patch = patch(
+            "deep_shark_studio.gui.main_window.create_application_logger",
+            return_value=MagicMock(),
+        )
+        self.logger_patch.start()
         self.window = MainWindow()
         self.window.show()
         self.app.processEvents()
 
     def tearDown(self) -> None:
+        self.window.stop_qgc_output_service()
         self.window.preview_timer.stop()
         self.window.stream_manager.stop()
         self.window.stitch_processor.shutdown()
         self.window.deleteLater()
         self.app.processEvents()
+        self.logger_patch.stop()
 
     def test_layout_changes_do_not_touch_capture_or_session(self) -> None:
         session_id = self.window.preview_session_id
@@ -326,12 +333,13 @@ class PreviewStateTests(unittest.TestCase):
                 "Near-field must not expose the B-2 candidate processor as active",
             )
             self.assertEqual(
-                "near_field",
-                window.runtime_mode_combo.currentData(),
+                "near_fisheye",
+                window.runtime_view_combo.currentData(),
             )
-            self.assertEqual(
-                "fisheye_rectilinear_candidate",
-                window.runtime_projection_combo.currentData(),
+            self.assertEqual(defaults.manifest_path, window.active_project_manifest_path)
+            self.assertIn(
+                str(defaults.manifest_path),
+                window.project_management_panel.active_project_status.text(),
             )
         finally:
             window.close()
@@ -679,8 +687,8 @@ class PreviewStateTests(unittest.TestCase):
         submitted_frames = submit.call_args.args[1]
         self.assertEqual({live_key}, set(submitted_frames))
         summary = self.window.preview_status_summary.text()
-        self.assertTrue(
-            "健康: Degraded" in summary or "Health: Degraded" in summary,
+        self.assertIn(
+            f"{self.window.t('Health')}: {self.window.t('Degraded')}",
             summary,
         )
 
@@ -728,8 +736,8 @@ class PreviewStateTests(unittest.TestCase):
         submit.assert_not_called()
         self.assertFalse(self.window.preview_timer.isActive())
         summary = self.window.preview_status_summary.text()
-        self.assertTrue(
-            "健康: Failed" in summary or "Health: Failed" in summary,
+        self.assertIn(
+            f"{self.window.t('Health')}: {self.window.t('Failed')}",
             summary,
         )
 
@@ -870,6 +878,72 @@ class PreviewStateTests(unittest.TestCase):
             self.app.processEvents()
 
         persist.assert_not_called()
+
+    def test_auto_preview_applies_selected_view_and_starts_when_stopped(self) -> None:
+        self.window._runtime_view_selection_dirty = True
+        self.window.set_preview_content_mode(PreviewContentMode.STOPPED)
+
+        with (
+            patch.object(
+                self.window,
+                "apply_stitch_runtime_config",
+                return_value=True,
+            ) as apply_runtime,
+            patch.object(
+                self.window,
+                "start_live_preview",
+                return_value=True,
+            ) as start_live,
+        ):
+            result = self.window.ensure_selected_runtime_view_live()
+
+        self.assertTrue(result)
+        apply_runtime.assert_called_once_with()
+        start_live.assert_called_once_with()
+
+    def test_auto_preview_does_not_restart_capture_when_live(self) -> None:
+        self.window._runtime_view_selection_dirty = True
+        self.window.set_preview_content_mode(PreviewContentMode.LIVE)
+
+        with (
+            patch.object(
+                self.window,
+                "apply_stitch_runtime_config",
+                return_value=True,
+            ) as apply_runtime,
+            patch.object(
+                self.window.stream_manager,
+                "has_active_workers",
+                return_value=True,
+            ),
+            patch.object(self.window, "start_live_preview") as start_live,
+        ):
+            result = self.window.ensure_selected_runtime_view_live()
+
+        self.assertTrue(result)
+        apply_runtime.assert_called_once_with()
+        start_live.assert_not_called()
+
+    def test_start_live_aborts_when_selected_runtime_view_cannot_apply(self) -> None:
+        self.window._runtime_view_selection_dirty = True
+
+        with (
+            patch.object(
+                self.window,
+                "apply_stitch_runtime_config",
+                return_value=False,
+            ) as apply_runtime,
+            patch.object(self.window, "configure_live_stitch_processor") as configure,
+            patch.object(self.window.stream_manager, "start") as capture_start,
+            patch.object(self.window, "stop_live_preview") as capture_stop,
+        ):
+            result = self.window.start_live_preview()
+
+        self.assertFalse(result)
+        apply_runtime.assert_called_once_with()
+        configure.assert_not_called()
+        capture_start.assert_not_called()
+        capture_stop.assert_not_called()
 
     def test_language_change_stops_live_and_qgc_before_ui_rebuild(self) -> None:
         self.window.preview_content_mode = PreviewContentMode.LIVE
@@ -1183,7 +1257,10 @@ class PreviewStateTests(unittest.TestCase):
         self.assertIn("front_left <-> front", text)
         self.assertIn("front <-> front_right", text)
         self.assertIn("initial_template", text)
-        self.assertEqual(160, self.window.feather_width.value())
+        self.assertEqual(
+            self.window.current_feather_width(),
+            self.window.feather_width.value(),
+        )
 
     def test_geometry_diagnostics_do_not_touch_profile_or_lifecycle(self) -> None:
         self.window.frames = {
@@ -1510,6 +1587,28 @@ class PreviewStateTests(unittest.TestCase):
         )
         dialog.deleteLater()
 
+        self.window.language = "en"
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch(
+                "deep_shark_studio.gui.main_window."
+                "load_calibration_candidate",
+                return_value=(candidate, {}),
+            ),
+        ):
+            english_dialog = CalibrationCandidateDialog(directory, self.window)
+
+        notice = english_dialog.candidate_safety_notice.text()
+        self.assertEqual(
+            "B-2 Experimental Calibration Candidate",
+            english_dialog.windowTitle(),
+        )
+        self.assertIn("Why it cannot be applied", notice)
+        self.assertIn("Pair coverage is insufficient", notice)
+        self.assertIn("optical centers", notice)
+        self.assertNotIn("为什么不能应用", notice)
+        english_dialog.deleteLater()
+
     def test_preview_status_summary_reports_modes_and_health(self) -> None:
         active = self.window.active_camera_keys()
         self.assertTrue(active)
@@ -1533,12 +1632,15 @@ class PreviewStateTests(unittest.TestCase):
         self.window.update_preview_status_summary()
 
         text = self.window.preview_status_summary.text()
-        self.assertIn("Topology:", text)
-        self.assertIn("布局:", text)
-        self.assertIn("内容: Live", text)
-        self.assertIn("Live 1", text)
+        self.assertIn(f"{self.window.t('Topology')}:", text)
+        self.assertIn(f"{self.window.t('Layout')}:", text)
+        self.assertIn(
+            f"{self.window.t('Content')}: {self.window.t('Live')}",
+            text,
+        )
+        self.assertIn(f"{self.window.t('Live')} 1", text)
         if len(active) > 1:
-            self.assertIn("Failed 1", text)
+            self.assertIn(f"{self.window.t('Failed')} 1", text)
 
     def test_stitch_result_drives_effective_runtime_summary_and_overlay(
         self,
@@ -1584,11 +1686,10 @@ class PreviewStateTests(unittest.TestCase):
             "b2_candidate_view",
             self.window.effective_runtime_status(),
         )
-        self.assertIn(
-            "b2_candidate_view",
-            self.window.preview_status_summary.text(),
-        )
-        self.assertIn("QGC: Running", self.window.preview_status_summary.text())
+        summary = self.window.preview_status_summary.text()
+        self.assertIn("B-2 View", summary)
+        self.assertNotIn("b2_candidate_view", summary)
+        self.assertIn(f"QGC: {self.window.t('Running')}", summary)
         self.assertIn("B-2", self.window.canvas_view.overlay_text)
         self.assertEqual(1, len(qgc_frames))
         qgc_status = self.window.qgc_output_service_status.text()
@@ -1604,7 +1705,7 @@ class PreviewStateTests(unittest.TestCase):
         self.window.set_preview_layout_mode(PreviewLayoutMode.STITCHED)
 
         self.assertTrue(self.window.stitched_view_notice.isVisible())
-        self.assertIn("近景", self.window.stitched_view_notice.text())
+        self.assertIn("Near Current", self.window.stitched_view_notice.text())
 
         key = active[0]
         self.window.set_preview_layout_mode(PreviewLayoutMode.FOCUS, key)
@@ -1756,10 +1857,8 @@ class PreviewStateTests(unittest.TestCase):
             )
             self.assertEqual(initial_session, self.window.preview_session_id)
 
-            near_index = self.window.runtime_mode_combo.findData(
-                StitchRuntimeMode.NEAR_FIELD.value
-            )
-            self.window.runtime_mode_combo.setCurrentIndex(near_index)
+            near_index = self.window.runtime_view_combo.findData("near_current")
+            self.window.runtime_view_combo.setCurrentIndex(near_index)
             self.window.apply_stitch_runtime_config()
             applied_session = self.window.preview_session_id
             self.assertGreater(applied_session, initial_session)
