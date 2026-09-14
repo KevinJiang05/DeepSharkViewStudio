@@ -32,5 +32,8 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements-dev.txt
 
+      - name: Initialize safe local configs
+        run: python app.py --initialize-configs --preflight-only
+
       - name: Run tests
         run: python -m pytest -q
