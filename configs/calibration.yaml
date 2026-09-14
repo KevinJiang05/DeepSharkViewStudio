@@ -55,10 +55,10 @@ topologies:
           - 600.0
     stitch_points:
       front_left_front_right:
-      - - 1132.143
-        - 97.479
-      - - 1575.84
-        - 81.513
+      - - 800.0
+        - 0.0
+      - - 800.0
+        - 600.0
     overlaps:
     - name: front_left_front_right
       cameras:

@@ -1,211 +1,159 @@
-# DeepShark View Studio
+<p align="center">
+  <img src="docs/assets/deepshark-view-studio.svg" alt="DeepShark View Studio" width="100%">
+</p>
 
-DeepShark View Studio is a standalone surround-view development tool extracted from the legacy `Code_End` prototype. It is intended to become the lab tool for camera preview, camera-source configuration, chessboard calibration, perspective tuning, and surround-view stitching before any QGC integration. The legacy source tree is not required to install or run this repository.
+<p align="center">
+  <a href="https://github.com/KevinJiang05/DeepSharkViewStudio/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/KevinJiang05/DeepSharkViewStudio/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-4cbb87.svg"></a>
+  <img alt="Python 3.12" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&amp;logoColor=white">
+  <img alt="PySide6" src="https://img.shields.io/badge/UI-PySide6-41CD52?logo=qt&amp;logoColor=white">
+  <img alt="OpenCV 4" src="https://img.shields.io/badge/Vision-OpenCV%204-5C3EE8?logo=opencv&amp;logoColor=white">
+</p>
 
-## Current Features
+DeepShark View Studio is a standalone desktop workbench for developing and validating multi-camera surround-view systems. It brings camera preview, source configuration, calibration, projection experiments, seam tuning, stitching, diagnostics, and QGC-oriented video output into one PySide6 application.
 
-- Loads camera calibration from `configs/calibration.yaml`
-- Supports 2, 3, 4, or 5 active camera channels
-- Supports English and Chinese UI language switching
-- Warps five camera views into a shared bird's-eye canvas
-- Applies seam masks based on the legacy AVM stitching rules
-- Produces a stitched surround-view canvas
-- Provides a PySide6 GUI with five task-oriented workspaces
-- Detects the lab chessboard calibration board
-- Keeps advanced QGC/video output separate from the normal preview workflow
+**中文简介：** DeepShark View Studio 是面向水下机器人多相机系统的独立桌面开发工具，覆盖相机预览、标定、投影实验、接缝调优、环视拼接、诊断和 QGC 视频输出。它可以独立安装运行，不依赖旧原型工程。
 
-## Workspaces
+> [!IMPORTANT]
+> This is an engineering and research tool. The tracked calibration is hardware-specific, and experimental candidates are deliberately kept separate from active runtime configuration.
 
-### Realtime Monitor
+## What it does
 
-- Load a still-image directory for quick stitching checks
-- Start live preview from configured USB, RTSP, or video-file sources
-- Display raw camera frames, warped bird's-eye frames, and final stitched canvas
-- Show per-camera enabled state, source, status, and frame counts
-- Select one explicit runtime view: Far Default, B-2 View, Far Custom, Near
-  Current, or Near Fisheye
-- Distinguish a staged selection from the effective worker state
+| Workspace | Capabilities |
+| --- | --- |
+| **Realtime Monitor** | Preview image directories, USB cameras, video files, or RTSP streams; inspect raw, warped, and stitched views; track camera health and effective runtime state. |
+| **Layout & Projection Lab** | Author Near and Far layout candidates, compare perspective and fisheye paths, and preview changes without mutating the active calibration. |
+| **Calibration** | Detect chessboard, ArUco, and ChArUco targets; estimate intrinsics; edit perspective points and seams; export quality reports. |
+| **Project Management** | Export, validate, and activate portable project packages; create backups before risky calibration or seam edits. |
+| **Diagnostics & Output** | Inspect redacted logs, runtime provenance, latency and health; publish an optional low-latency FFmpeg stream for QGC integration. |
 
-### Layout & Projection Lab
+Supported camera topologies range from 2 to 5 active channels. The current application exposes five explicit runtime views: Far Default, B-2 View, Far Custom, Near Current, and Near Fisheye.
 
-- Author Near front-priority and Far B-2-backed layout candidates
-- Compare Current Perspective and experimental Near Fisheye projection
-- Keep projection research and candidate authoring out of runtime operation
-- Save candidate files without changing `configs/calibration.yaml`
+## Architecture
 
-### Camera Setup
+```mermaid
+flowchart LR
+    A[Camera sources<br/>USB · RTSP · files] --> B[CameraStreamManager]
+    B --> C[Projection providers<br/>Perspective · B-2 · Fisheye]
+    C --> D[Layout and seam compositors]
+    D --> E[Stitched surround canvas]
+    E --> F[PySide6 realtime monitor]
+    E --> G[FFmpeg video output]
+    G --> H[QGroundControl]
 
-- Set active camera count from 2 to 5
-- Configure each channel name, source type, and source value
-- Supported source types: `image_dir`, `usb`, `video_file`, `rtsp`
-- Tune realtime performance:
-  - `Stitch FPS`: how often the surround canvas is recomputed
-  - `Preview FPS`: how often raw preview thumbnails are refreshed
-  - `Max input width`: downscale high-resolution RTSP frames before stitching
-  - `Refresh warped previews`: disable during live testing for smoother UI
-  - `Use undistort live`: disable during link testing, enable later for final quality
-- Save camera settings to `configs/cameras.yaml`
-- Save canvas size to `configs/calibration.yaml`
-
-### Calibration
-
-- Lab board defaults:
-  - Total squares: `12 x 9`
-  - Square size: `25 mm`
-  - OpenCV inner-corner pattern: `11 x 8`
-- Load a calibration image and run chessboard detection
-- Calibrate camera intrinsics from a folder of chessboard images
-- Save camera matrix, distortion coefficients, RMS, detection summary, and reprojection errors
-- Preview undistortion using saved camera intrinsics
-- Export a Markdown calibration quality report
-- Drag the four source perspective points directly on the calibration image
-- Edit source and target perspective points in the synchronized table
-- Use `Preview Warp` to inspect the current perspective transform before saving
-- Drag seam endpoints directly on the stitched surround canvas
-- Capture calibration frames from the currently selected preview camera
-- Manage a calibration image folder and scan chessboard detection status
-- Save calibration data to `configs/calibration.yaml`
-
-### Project Management
-
-- Export, read-only validate, and activate a Portable Project Package containing
-  configs plus active candidates
-- Use legacy `.dsvs.yaml` config-only files only from the collapsed compatibility
-  section
-- Create timestamped backups before risky calibration or seam edits
-- Export an explicitly experimental Runtime Snapshot for a future service bridge
-
-### Diagnostics & Logs
-
-- Inspect and copy the application log without changing runtime state
-- Keep effective view, projection, health, and warnings beside the realtime view
-
-## Project Layout
-
-```text
-DeepSharkViewStudio/
-  app.py
-  StartDeepSharkViewStudio.cmd
-  requirements.txt
-  configs/
-    calibration.yaml
-    cameras.example.yaml
-    network.example.yaml
-    cameras.yaml          # local, initialized explicitly and ignored by Git
-    network.yaml          # local, initialized explicitly and ignored by Git
-  deep_shark_studio/
-    config.py
-    camera.py
-    masks.py
-    stitcher.py
-    streaming.py
-    gui/
-      main_window.py
-      runtime_workflow.py
-      panels/
-  tools/
-    run_image_demo.py
-  samples/
-    input/
-    output/
+    I[Calibration and candidate labs] -. staged artifacts .-> C
+    J[Portable project packages] -. validated activation .-> I
 ```
 
-## Install
+The runtime keeps experimental candidates separate from the formal configuration. A selected view, an applied worker configuration, and the effective output state are tracked independently so the UI does not silently claim that an unapplied experiment is active.
 
-From a fresh checkout, create a repository-local environment and install the tracked dependencies:
+## Quick start
+
+Windows is the primary development target.
 
 ```powershell
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-The launcher first honors an optional `DEEP_SHARK_PYTHON` interpreter path, then tries `.venv\Scripts\python.exe`, a shared workspace environment at `..\..\envs\deep-shark-view-studio`, `py -3`, and `python`. Every candidate must provide the full runtime dependency set. It contains no machine-specific drive path, and a failed no-argument launch keeps the error window open.
-
-## Local Configuration And First Start
-
-`configs/calibration.yaml` is tracked because it contains device-specific calibration data. Local camera and network settings are deliberately not tracked. Initialize only the missing local files from the safe examples:
-
-```powershell
 .\.venv\Scripts\python.exe app.py --initialize-configs --preflight-only
+.\.venv\Scripts\python.exe app.py
 ```
 
-Initialization is explicit and transactional: it creates missing `cameras.yaml` and `network.yaml`, never overwrites an existing file, and never generates or replaces `calibration.yaml`. Review camera sources before starting live preview. Re-run the read-only preflight at any time with:
+The explicit initialization step creates only missing local `cameras.yaml` and `network.yaml` files from safe examples. It never overwrites an existing local configuration or replaces the tracked calibration.
 
-```powershell
-.\.venv\Scripts\python.exe app.py --preflight-only
-```
-
-Both commands can also be passed through `StartDeepSharkViewStudio.cmd`. A normal launch remains read-only and reports a clear error when required local configs are absent or invalid.
-
-## Image Demo
-
-Put images into `samples/input`. Filenames should contain these camera keys:
-
-```text
-front_left
-front_right
-behind
-left
-right
-```
-
-Then run:
-
-```powershell
-python tools\run_image_demo.py
-```
-
-Results are written to:
-
-```text
-samples/output/canvas.jpg
-samples/output/*_warped.jpg
-```
-
-You can also point the demo at another image directory:
-
-```powershell
-python tools\run_image_demo.py --input <path-to-images>
-```
-
-## GUI
-
-Run:
+You can also launch the application with:
 
 ```powershell
 StartDeepSharkViewStudio.cmd
 ```
 
-Or, from an activated environment:
+The launcher checks `DEEP_SHARK_PYTHON`, the repository-local `.venv`, the shared workspace environment, and then standard Python launchers. Every candidate interpreter must provide the full runtime dependency set.
 
-```powershell
-python app.py
+## Image-directory demo
+
+Place sample images in `samples/input/` using camera names in the filenames:
+
+```text
+front_left  front_right  front  behind  left  right
 ```
 
-The GUI currently supports:
+Then run:
 
-- English/Chinese language switching from the top language selector
-- Realtime Monitor workspace with one five-view runtime selector
-- Layout & Projection Lab workspace
-- Calibration & Candidates workspace with wizard-first navigation
-- Project Management workspace with portable-first semantics
-- Diagnostics & Logs workspace
-- Image-directory and live-source preview paths
-- Chessboard detection and intrinsics export
-- Calibration quality reports and undistortion preview
-- Portable package export/validate/activate plus collapsed legacy tools
-- Perspective point editing
-- Stitched result saving
+```powershell
+.\.venv\Scripts\python.exe tools\run_image_demo.py
+```
 
-## Development Roadmap
+The stitched canvas and warped camera views are written to `samples/output/`. Both directories are ignored so local camera imagery is not published accidentally.
 
-1. Add robust live camera sources for USB, RTSP, and video files.
-2. Add draggable source and seam points directly on images.
-3. Add frame-rate, latency, camera health, and reconnect status.
-4. Add video recording and snapshot export.
-5. Add RTSP/GStreamer output for QGC consumption.
-6. Consider native C++/Qt integration after the standalone tool is stable.
+## Runtime views
 
-## Notes
+| View | Projection | Composition | Intended use |
+| --- | --- | --- | --- |
+| Far Default | Formal perspective calibration | Horizontal feather | Stable far-field baseline |
+| B-2 View | B-2 per-camera candidate | Candidate weight selection | Experimental projection evaluation |
+| Far Custom | B-2 candidate source | Adjustable far-field layout | Controlled layout experiments |
+| Near Current | Formal perspective calibration | Front-priority near compositor | Stable near-field baseline |
+| Near Fisheye | Rectilinear fisheye remap | Front-priority near compositor | Fisheye comparison and tuning |
 
-The default calibration values are taken from the more complete five-camera legacy prototype in `Code_End\Part12`. They are device-specific and should be recalibrated for a different camera rig or mounting geometry.
+No experimental candidate is promoted to the formal calibration merely by previewing or saving it.
+
+## Configuration boundaries
+
+```text
+configs/
+  calibration.yaml       tracked hardware calibration
+  cameras.example.yaml   safe camera-source example
+  network.example.yaml   safe output example
+  cameras.yaml           local and ignored
+  network.yaml           local and ignored
+  active_project.yaml    local and ignored
+```
+
+Runtime captures, project backups, generated candidates, reports, sample imagery, logs, and UI artifacts are ignored unless deliberately selected for publication. Connection details are redacted before they reach the application log or clipboard.
+
+## Development and tests
+
+Install the development dependencies and run the full suite:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+$env:QT_QPA_PLATFORM = "offscreen"
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+GitHub Actions runs the same suite on Windows with Python 3.12. The OpenCV dependency stays on the supported 4.x line because OpenCV 5 introduced API and detection behavior changes that require a separate compatibility pass.
+
+## Project map
+
+```text
+DeepSharkViewStudio/
+  app.py                         application entry point
+  StartDeepSharkViewStudio.cmd   Windows launcher
+  configs/                       tracked baseline and safe examples
+  deep_shark_studio/
+    gui/                         desktop UI and workflow state
+    projection/                  perspective, B-2, and fisheye providers
+    seam/                        layout, seam, and compositor logic
+    project_package/             portable package validation and activation
+    qgc/                         optional video output service
+  docs/                          workflow and integration documentation
+  tests/                         unit, contract, GUI, and regression tests
+  tools/                         demos, benchmarks, and UI audit helpers
+```
+
+## Documentation
+
+- [Quick start](docs/quick_start.md)
+- [UI workflow](docs/ui_workflow.md)
+- [Runtime view contracts](docs/stitch_runtime_modes.md)
+- [Portable project packages](docs/project_package.md)
+- [QGC video payload service](docs/qgc_video_payload_service.md)
+
+The Chinese engineering reports in the repository are dated audit snapshots. They preserve the evidence and limitations observed at those stages; the current code, tests, and configuration remain authoritative.
+
+## Related project
+
+[QGC_for_GRobot](https://github.com/KevinJiang05/QGC_for_GRobot) is the customized QGroundControl application used by the broader DeepShark underwater robot project. DeepShark View Studio keeps calibration and surround-view development independent from the flight-control application while providing an explicit video-output bridge for integration testing.
+
+## License
+
+DeepShark View Studio is released under the [MIT License](LICENSE).
