@@ -706,6 +706,7 @@ class StitchRuntimeGuiSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(self.window.effective_preview_interval(), 0.2)
 
     def test_qgc_output_priority_throttles_canvas_render_only(self) -> None:
+        self.window.performance_config["preview_fps"] = 30
         self.window.preview_layout_mode = PreviewLayoutMode.STITCHED
         self.window.qgc_output_active = True
         self.window.last_canvas_render_time = time.perf_counter()

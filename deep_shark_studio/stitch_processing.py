@@ -19,6 +19,9 @@ from .stitch_runtime_modes import (
 from .stitcher import SurroundStitcher
 
 
+_RESULT_CLOCK = time.perf_counter
+
+
 @dataclass(frozen=True)
 class StitchRequest:
     session_id: int
@@ -404,7 +407,7 @@ class StitchProcessingWorker:
                     else:
                         self._completed += 1
                         self._rolling_elapsed_ms.append(elapsed_ms)
-                        self._rolling_result_times.append(time.monotonic())
+                        self._rolling_result_times.append(_RESULT_CLOCK())
                     self._condition.notify_all()
         finally:
             with self._condition:
@@ -426,7 +429,7 @@ class StitchProcessingWorker:
     def _rolling_result_fps_locked(self) -> float:
         """Return successful result throughput over the recent rolling window."""
 
-        cutoff = time.monotonic() - self._RESULT_FPS_WINDOW_SECONDS
+        cutoff = _RESULT_CLOCK() - self._RESULT_FPS_WINDOW_SECONDS
         while self._rolling_result_times and self._rolling_result_times[0] < cutoff:
             self._rolling_result_times.popleft()
         if len(self._rolling_result_times) < 2:
