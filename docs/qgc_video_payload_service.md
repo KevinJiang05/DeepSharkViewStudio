@@ -88,10 +88,18 @@ frames
 
 ## Example Commands
 
+Run these commands from the repository root after completing the
+[local environment setup](../README.md#run-locally). The examples use the
+repository-local `.venv`; replace candidate paths and RTSP server addresses
+with your own. The camera configuration and calibration must match your
+inputs. FFmpeg must be available, and RTSP output requires a running RTSP
+server as described above. These commands start camera capture and video
+output.
+
 Far-field Default to local QGC:
 
 ```powershell
-D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
+.\.venv\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
   --mode far_field `
   --output-kind udp_mpegts `
   --output-url "udp://127.0.0.1:5600?pkt_size=1316" `
@@ -102,7 +110,7 @@ D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.q
 Far-field Custom with a saved Far-field Layout Candidate:
 
 ```powershell
-D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
+.\.venv\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
   --mode far_field `
   --far-field-layout-candidate "D:\path\to\far_field_layout\candidate.yaml" `
   --output-kind rtsp `
@@ -112,7 +120,7 @@ D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.q
 Near-field with a saved Layout Candidate:
 
 ```powershell
-D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
+.\.venv\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
   --mode near_field `
   --near-field-layout-candidate "D:\path\to\near_field_layout\candidate.yaml" `
   --output-kind rtsp `
@@ -122,7 +130,7 @@ D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.q
 Near Current to local QGC with explicit freshness/failure bounds:
 
 ```powershell
-D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
+.\.venv\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
   --mode near_field `
   --near-field-layout-candidate ".\projects\layout_candidates\<run>\candidate.yaml" `
   --projection-source current_perspective `
@@ -139,7 +147,7 @@ D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.q
 RTSP service output:
 
 ```powershell
-D:\Develop\envs\deep-shark-view-studio\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
+.\.venv\Scripts\python.exe -m deep_shark_studio.qgc.runtime_service `
   --mode far_field `
   --output-kind rtsp `
   --output-url "rtsp://<rtsp-server-ip>:8554/deepshark"

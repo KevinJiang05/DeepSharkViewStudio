@@ -1,7 +1,14 @@
 # DeepShark View Studio Quick Start
 
-This page is for project members who only need to run the three-camera
-preview, collect calibration samples, and understand common warnings.
+This guide covers the project's three-camera RTSP rig: live preview,
+calibration sample collection, and common warnings. The camera resolution,
+board dimensions, and physical layout below describe that rig and its lab
+setup; they are not general requirements for other camera systems.
+
+For installation, see [Run locally](../README.md#run-locally). To process
+local images without connecting to cameras, see
+[Run with your own images](../README.md#run-with-your-own-images); you will
+need images that match the configured cameras and calibration.
 
 ## 1. Start Three-Camera Live Preview
 
